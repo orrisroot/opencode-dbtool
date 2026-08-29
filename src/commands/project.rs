@@ -4,9 +4,7 @@ use crate::db::db_status;
 use crate::error::{AppError, Result};
 use crate::models::{filter_projects, project_json, ProjectRow};
 use crate::output::print_json;
-use crate::repo::{
-    load_projects, lookup_project, lookup_projects_by_worktree, project_impact,
-};
+use crate::repo::{load_projects, lookup_project, lookup_projects_by_worktree, project_impact};
 use crate::util::{dt, round4};
 use rusqlite::{params, Connection};
 use std::path::Path;
@@ -22,10 +20,7 @@ pub fn cmd_project_list(con: &Connection, args: &[String]) -> Result<()> {
             }
             i += 2;
         } else {
-            return Err(AppError::usage(format!(
-                "unexpected argument: {}",
-                args[i]
-            )));
+            return Err(AppError::usage(format!("unexpected argument: {}", args[i])));
         }
     }
     let projects = load_projects(con)?;
@@ -55,7 +50,11 @@ fn project_detail(
     all: &[ProjectRow],
     proj: ProjectRow,
 ) -> Result<serde_json::Value> {
-    let full = all.iter().find(|p| p.id == proj.id).cloned().unwrap_or(proj);
+    let full = all
+        .iter()
+        .find(|p| p.id == proj.id)
+        .cloned()
+        .unwrap_or(proj);
     let mut out = project_json(&full);
     let sessions: Vec<(String, String, Option<String>, i64, i64, i64, i64, f64)> = {
         let mut stmt = con.prepare(
@@ -82,18 +81,20 @@ fn project_detail(
     };
     let sessions_arr: Vec<serde_json::Value> = sessions
         .iter()
-        .map(|(sid, title, parent_id, updated, msgs, parts, events, cost)| {
-            serde_json::json!({
-                "id": sid,
-                "title": title,
-                "parent_id": parent_id,
-                "updated": dt(*updated),
-                "msgs": msgs,
-                "parts": parts,
-                "events": events,
-                "cost": round4(*cost),
-            })
-        })
+        .map(
+            |(sid, title, parent_id, updated, msgs, parts, events, cost)| {
+                serde_json::json!({
+                    "id": sid,
+                    "title": title,
+                    "parent_id": parent_id,
+                    "updated": dt(*updated),
+                    "msgs": msgs,
+                    "parts": parts,
+                    "events": events,
+                    "cost": round4(*cost),
+                })
+            },
+        )
         .collect();
     out["session_list"] = serde_json::json!(sessions_arr);
     Ok(out)
@@ -218,9 +219,7 @@ pub fn cmd_project_delete(
         ));
     }
     out["deleted"] = serde_json::json!(true);
-    out["note"] = serde_json::json!(
-        "file size is unchanged until `opencode-dbtool vacuum` is run"
-    );
+    out["note"] = serde_json::json!("file size is unchanged until `opencode-dbtool vacuum` is run");
     print_json(&out)
 }
 

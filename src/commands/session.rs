@@ -126,9 +126,7 @@ pub fn cmd_session_delete(
         }
     }
     out["deleted"] = serde_json::json!(true);
-    out["note"] = serde_json::json!(
-        "file size is unchanged until `opencode-dbtool vacuum` is run"
-    );
+    out["note"] = serde_json::json!("file size is unchanged until `opencode-dbtool vacuum` is run");
     print_json(&out)
 }
 
@@ -188,8 +186,13 @@ mod tests {
         testdb::insert_session(&con, "grandchild", "/a", Some("child"));
         testdb::insert_session(&con, "unrelated", "/b", None);
 
-        cmd_session_delete(&mut con, &["parent".to_string()], false, Path::new("/tmp/x.db"))
-            .unwrap();
+        cmd_session_delete(
+            &mut con,
+            &["parent".to_string()],
+            false,
+            Path::new("/tmp/x.db"),
+        )
+        .unwrap();
 
         assert_eq!(testdb::session_count(&con), 1);
         let remaining: String = con
@@ -221,8 +224,13 @@ mod tests {
         testdb::insert_session(&con, "parent", "/a", None);
         testdb::insert_session(&con, "child", "/a", Some("parent"));
 
-        cmd_session_delete(&mut con, &["child".to_string()], false, Path::new("/tmp/x.db"))
-            .unwrap();
+        cmd_session_delete(
+            &mut con,
+            &["child".to_string()],
+            false,
+            Path::new("/tmp/x.db"),
+        )
+        .unwrap();
 
         assert_eq!(testdb::session_count(&con), 1);
         let remaining: String = con
@@ -233,7 +241,11 @@ mod tests {
 
     #[test]
     fn parse_target_args_ok() {
-        let args = vec!["--path".to_string(), "/a/b".to_string(), "ses_1".to_string()];
+        let args = vec![
+            "--path".to_string(),
+            "/a/b".to_string(),
+            "ses_1".to_string(),
+        ];
         let (dir, ids) = parse_target_args(&args).unwrap();
         assert_eq!(dir.as_deref(), Some("/a/b"));
         assert_eq!(ids, vec!["ses_1"]);

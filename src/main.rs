@@ -35,7 +35,9 @@ fn usage() {
     println!("  opencode-dbtool stats                    table sizes + totals (DB overview)");
     println!("  opencode-dbtool doctor                   integrity + consistency checks");
     println!("  opencode-dbtool project list             project overview (counts, sizes)");
-    println!("  opencode-dbtool project list --path <dir>  list only projects at directory (repeatable)");
+    println!(
+        "  opencode-dbtool project list --path <dir>  list only projects at directory (repeatable)"
+    );
     println!("  opencode-dbtool project show <id>        project detail (sessions, breakdown)");
     println!("  opencode-dbtool project delete <id>...   delete project(s) + all related data");
     println!("  opencode-dbtool project delete --path <dir>  delete by directory (repeatable, combinable with ids)");
@@ -86,7 +88,11 @@ fn run() -> Result<()> {
     let db_path = dir.join("opencode.db");
 
     let command = filtered.first().cloned().unwrap_or_default();
-    let rest: &[String] = if command.is_empty() { &[] } else { &filtered[1..] };
+    let rest: &[String] = if command.is_empty() {
+        &[]
+    } else {
+        &filtered[1..]
+    };
 
     match command.as_str() {
         "" => {

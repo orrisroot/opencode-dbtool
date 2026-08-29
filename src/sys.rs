@@ -44,8 +44,8 @@ pub fn running_pids() -> Result<Vec<i32>> {
 
 /// Fail with exit code 1 when an opencode instance is running.
 pub fn require_idle(reason: &str) -> Result<()> {
-    let pids = running_pids()
-        .map_err(|e| AppError::db(format!("cannot detect running opencode: {e}")))?;
+    let pids =
+        running_pids().map_err(|e| AppError::db(format!("cannot detect running opencode: {e}")))?;
     if pids.is_empty() {
         return Ok(());
     }

@@ -73,8 +73,7 @@ pub fn cmd_doctor(con: &Connection, db_path: &Path) -> Result<()> {
              WHERE s.workspace_id IS NOT NULL AND s.workspace_id != '' \
                AND s.workspace_id NOT IN (SELECT id FROM workspace) ORDER BY s.id",
         )?;
-        let rows =
-            stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
         let mut v = Vec::new();
         for r in rows {
             let (id, workspace_id) = r?;
@@ -120,9 +119,7 @@ pub fn cmd_doctor(con: &Connection, db_path: &Path) -> Result<()> {
     out["ok"] = serde_json::json!(ok);
     print_json(&out)?;
     if !ok {
-        return Err(AppError::db(
-            "integrity problems found (see JSON output)",
-        ));
+        return Err(AppError::db("integrity problems found (see JSON output)"));
     }
     Ok(())
 }

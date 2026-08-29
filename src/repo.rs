@@ -203,7 +203,8 @@ pub fn lookup_project(
 
 /// All projects registered at a worktree (duplicates included).
 pub fn lookup_projects_by_worktree(con: &Connection, dir: &str) -> Result<Vec<ProjectRow>> {
-    let mut stmt = con.prepare("SELECT id, worktree, COALESCE(name,'') FROM project WHERE worktree = ?1")?;
+    let mut stmt =
+        con.prepare("SELECT id, worktree, COALESCE(name,'') FROM project WHERE worktree = ?1")?;
     let rows = stmt.query_map(params![dir], project_row_from_row)?;
     Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
 }
