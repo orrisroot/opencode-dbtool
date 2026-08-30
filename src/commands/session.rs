@@ -14,10 +14,61 @@ use rusqlite::{params, Connection};
 use std::collections::HashSet;
 use std::path::Path;
 
-pub fn cmd_session_list(con: &Connection, db_path: &Path) -> Result<()> {
-    let sessions = load_sessions(con, Some(&session_diff_dir(db_path)))?;
-    let arr: Vec<serde_json::Value> = sessions.iter().map(session_json).collect();
-    print_json(&serde_json::json!(arr))
+pub fn cmd_session_list(con: &Connection, db_path: &Path, args: &[String]) -> Result<()> {
+    print_json(&session_list_value(con, db_path, args)?)
+}
+
+/// Build the session list array (exposed for tests).
+pub fn session_list_value(
+    con: &Connection,
+    db_path: &Path,
+    args: &[String],
+) -> Result<serde_json::Value> {
+    let mut limit: Option<usize> = None;
+    let mut sort_size = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--limit" => {
+                let n = args
+                    .get(i + 1)
+                    .ok_or_else(|| AppError::usage("--limit requires a count"))?;
+                let c = parse_count(n)?;
+                limit = Some(c as usize);
+                i += 2;
+            }
+            "--sort" => {
+                let key = args
+                    .get(i + 1)
+                    .ok_or_else(|| AppError::usage("--sort requires a key"))?;
+                match key.as_str() {
+                    "size" => sort_size = true,
+                    other => {
+                        return Err(AppError::usage(format!(
+                            "unknown sort key: {other} (only 'size')"
+                        )))
+                    }
+                }
+                i += 2;
+            }
+            other => return Err(AppError::usage(format!("unknown option: {other}"))),
+        }
+    }
+    let mut sessions = load_sessions(con, Some(&session_diff_dir(db_path)))?;
+    if sort_size {
+        sessions.sort_by(|a, b| {
+            b.size_bytes()
+                .cmp(&a.size_bytes())
+                .then_with(|| a.id.cmp(&b.id))
+        });
+    }
+    if let Some(n) = limit {
+        sessions.truncate(n);
+    }
+    Ok(serde_json::json!(sessions
+        .iter()
+        .map(session_json)
+        .collect::<Vec<_>>()))
 }
 
 pub fn cmd_session_show(con: &Connection, args: &[String], db_path: &Path) -> Result<()> {
@@ -1097,6 +1148,65 @@ mod tests {
 
         let sessions = load_sessions(&con, None).unwrap();
         assert_eq!(sessions[0].diff_bytes, 0);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn session_list_sorts_by_size_and_limits() {
+        let dir = testdb::temp_data_dir("list-sort");
+        let db_path = dir.join("opencode.db");
+        let con = testdb::create_at(&db_path);
+        testdb::insert_session(&con, "small", "/a", None);
+        testdb::insert_part(&con, "small", "x");
+        testdb::insert_session(&con, "big", "/a", None);
+        testdb::insert_part(&con, "big", "xxxxxxxxxxxxxxxx");
+        testdb::insert_session(&con, "medium", "/a", None);
+        testdb::insert_part(&con, "medium", "xxxxxxxx");
+
+        let all = session_list_value(&con, &db_path, &[]).unwrap();
+        let ids: Vec<&str> = all
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids.len(), 3);
+
+        let sized = session_list_value(&con, &db_path, &["--sort".to_string(), "size".to_string()])
+            .unwrap();
+        let ids: Vec<&str> = sized
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, vec!["big", "medium", "small"]);
+
+        let limited = session_list_value(
+            &con,
+            &db_path,
+            &[
+                "--sort".to_string(),
+                "size".to_string(),
+                "--limit".to_string(),
+                "2".to_string(),
+            ],
+        )
+        .unwrap();
+        let ids: Vec<&str> = limited
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, vec!["big", "medium"]);
+
+        assert!(
+            session_list_value(&con, &db_path, &["--sort".to_string(), "nope".to_string()])
+                .is_err()
+        );
+        assert!(session_list_value(&con, &db_path, &["--limit".to_string()]).is_err());
+        assert!(session_list_value(&con, &db_path, &["--unknown".to_string()]).is_err());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

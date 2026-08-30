@@ -24,14 +24,14 @@ cargo build --release   # -> target/release/opencode-dbtool
 ## Commands
 
 ```
-stats                   table sizes + totals (DB overview)
+stats [--detail]        table sizes + totals (DB overview; --detail adds analysis)
 doctor                  integrity + consistency checks
 project list            project overview (counts, sizes)
 project list --path <d> list only projects at a directory (repeatable)
 project show <id>       project detail (sessions, breakdown)
 project delete <id>...  delete project(s) + all related data
 project purge [--older-than <age>] [--path <dir>...]  delete projects matching all filters
-session list            per-session breakdown (full ids)
+session list [--sort size] [--limit <n>]  per-session breakdown (full ids)
 session show <id>       session detail
 session delete <id>...  delete session(s) + cascade
 session purge [--older-than <age>] [--subagents] [--path <dir>...] [--larger-than <size>] [--keep-latest <n>]  delete sessions matching all filters
@@ -72,7 +72,8 @@ commands still proceed; guarded commands fail with exit 3).
   "free_pages": 120,
   "tables": { "session": 6, "message": 640, "part": 5210, "event": 90210, "...": 0 },
   "total_data_bytes": 12345678,
-  "storage": { "session_diff_bytes": 0, "snapshot_bytes": 736000, "tool_output_bytes": 0 }
+  "storage": { "session_diff_bytes": 0, "snapshot_bytes": 736000, "tool_output_bytes": 0 },
+  "part_types": { "reasoning": { "count": 139, "bytes": 400619 }, "text": { "count": 100, "bytes": 10240 } }
 }
 ```
 
@@ -81,7 +82,24 @@ commands still proceed; guarded commands fail with exit 3).
 session_message, ...). `db_bytes` is the file size on disk. `storage`
 reports the sizes of opencode's filesystem storage beside the database:
 session diffs (`storage/session_diff/`), git snapshots (`snapshot/`), and
-tool output (`tool-output/`). Missing directories count as 0.
+tool output (`tool-output/`). Missing directories count as 0. `part_types`
+breaks the `part` table down by its `data.type` (largest first).
+
+`stats --detail` adds:
+
+```json
+{
+  "activity": {
+    "days": 30,
+    "created": [ { "day": "2026-08-01", "parts": 12, "part_bytes": 1000, "msgs": 3, "msg_bytes": 100 } ]
+  },
+  "subagent": { "sessions": 5, "total_sessions": 20, "size_bytes": 500000, "total_size_bytes": 2000000 }
+}
+```
+
+`activity` reports the creation history of `part` and `message` rows over
+the last 30 days (by `time_created`). `subagent` reports the session count
+and data size of subagent sessions relative to all sessions.
 
 ### `doctor`
 
@@ -168,6 +186,9 @@ projects is normal (exit 0).
 ### `session list` / `session show`
 
 `session list` prints an array; `session show <id>` prints one object.
+`session list` accepts `--sort size` (largest first, id as tiebreaker) and
+`--limit <n>` (keep the first n sessions); without them it is ordered by
+`time_updated` descending.
 
 ```json
 {

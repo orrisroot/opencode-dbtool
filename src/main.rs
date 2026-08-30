@@ -32,7 +32,7 @@ fn usage() {
     println!("opencode-dbtool - opencode db maintenance");
     println!();
     println!("USAGE:");
-    println!("  opencode-dbtool stats                    table sizes + totals (DB overview)");
+    println!("  opencode-dbtool stats [--detail]           table sizes + totals (DB overview)");
     println!("  opencode-dbtool doctor                   integrity + consistency checks");
     println!("  opencode-dbtool project list             project overview (counts, sizes)");
     println!(
@@ -41,7 +41,7 @@ fn usage() {
     println!("  opencode-dbtool project show <id>        project detail (sessions, breakdown)");
     println!("  opencode-dbtool project delete <id>...   delete project(s) + all related data");
     println!("  opencode-dbtool project purge [--older-than <age>] [--path <dir>...]  delete projects matching all filters");
-    println!("  opencode-dbtool session list             per-session breakdown (full ids)");
+    println!("  opencode-dbtool session list [--sort size] [--limit <n>]  per-session breakdown (full ids)");
     println!("  opencode-dbtool session show <id>        session detail");
     println!("  opencode-dbtool session delete <id>...   delete session(s) + cascade");
     println!("  opencode-dbtool session purge [--older-than <age>] [--subagents] [--path <dir>...] [--larger-than <size>] [--keep-latest <n>]  delete sessions matching all filters");
@@ -149,7 +149,7 @@ fn run() -> Result<()> {
         }
         "stats" => require_db(&db_path).and_then(|_| {
             let con = db::open_conn(&db_path, true)?;
-            commands::stats::cmd_stats(&con, &db_path)
+            commands::stats::cmd_stats(&con, &db_path, rest)
         }),
         "doctor" => require_db(&db_path).and_then(|_| {
             let con = db::open_conn(&db_path, true)?;
@@ -196,16 +196,10 @@ fn run() -> Result<()> {
             }
         },
         "session" => match rest.first().map(|s| s.as_str()).unwrap_or("") {
-            "list" => {
-                if rest.len() != 1 {
-                    usage();
-                    return Err(AppError::silent(error::EXIT_NOT_FOUND));
-                }
-                require_db(&db_path).and_then(|_| {
-                    let con = db::open_conn(&db_path, true)?;
-                    commands::session::cmd_session_list(&con, &db_path)
-                })
-            }
+            "list" => require_db(&db_path).and_then(|_| {
+                let con = db::open_conn(&db_path, true)?;
+                commands::session::cmd_session_list(&con, &db_path, &rest[1..])
+            }),
             "show" => require_db(&db_path).and_then(|_| {
                 let con = db::open_conn(&db_path, true)?;
                 commands::session::cmd_session_show(&con, &rest[1..], &db_path)

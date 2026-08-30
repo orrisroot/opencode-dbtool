@@ -34,8 +34,8 @@ fn schema(con: &Connection) {
     con.execute_batch(
         "CREATE TABLE project (id TEXT PRIMARY KEY, worktree TEXT, name TEXT);
          CREATE TABLE session (id TEXT PRIMARY KEY, directory TEXT, title TEXT, parent_id TEXT, project_id TEXT REFERENCES project(id) ON DELETE CASCADE, time_updated INTEGER, cost REAL);
-         CREATE TABLE message (session_id TEXT, data BLOB);
-         CREATE TABLE part (session_id TEXT, data TEXT);
+         CREATE TABLE message (session_id TEXT, data BLOB, time_created INTEGER NOT NULL DEFAULT 0);
+         CREATE TABLE part (session_id TEXT, data TEXT, time_created INTEGER NOT NULL DEFAULT 0);
          CREATE TABLE todo (session_id TEXT);
          CREATE TABLE event (aggregate_id TEXT, type TEXT, data BLOB);
          CREATE TABLE event_sequence (aggregate_id TEXT);
@@ -70,9 +70,14 @@ pub fn insert_session_at(
 
 /// Insert a part with a raw JSON `data` payload (e.g. `{"type":"reasoning"}`).
 pub fn insert_part(con: &Connection, session_id: &str, data: &str) {
+    insert_part_at(con, session_id, data, 0);
+}
+
+/// Insert a part with an explicit creation timestamp.
+pub fn insert_part_at(con: &Connection, session_id: &str, data: &str, time_created: i64) {
     con.execute(
-        "INSERT INTO part (session_id, data) VALUES (?1, ?2)",
-        rusqlite::params![session_id, data],
+        "INSERT INTO part (session_id, data, time_created) VALUES (?1, ?2, ?3)",
+        rusqlite::params![session_id, data, time_created],
     )
     .unwrap();
 }
