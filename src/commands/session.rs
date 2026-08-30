@@ -8,7 +8,7 @@ use crate::repo::{
     child_session_ids, load_sessions, reasoning_counts, reasoning_left, resolve_session_ids,
     session_exists, strip_reasoning,
 };
-use crate::util::{now_ms, parse_age_ms};
+use crate::util::{now_ms, parse_age_ms, parse_count, parse_size_bytes};
 use rusqlite::{params, Connection};
 use std::collections::HashSet;
 use std::path::Path;
@@ -79,14 +79,10 @@ pub fn cmd_session_purge(
     let filters = parse_purge_args(args)?;
     if filters.is_empty() {
         return Err(AppError::usage(
-            "usage: opencode-dbtool session purge [--older-than <age>] [--subagents] [--path <dir>...]",
+            "usage: opencode-dbtool session purge [--older-than <age>] [--subagents] [--path <dir>...] [--larger-than <size>] [--keep-latest <n>]",
         ));
     }
-    let mut selected: Vec<String> = load_sessions(con)?
-        .iter()
-        .filter(|s| filters.matches(s))
-        .map(|s| s.id.clone())
-        .collect();
+    let mut selected = select_ids(con, &filters, true)?;
     expand_children(con, &mut selected)?;
 
     let mut out = db_status(db_path);
@@ -116,11 +112,8 @@ pub fn cmd_session_strip_reasoning(
     db_path: &Path,
 ) -> Result<()> {
     let filters = parse_purge_args(args)?;
-    let selected: Vec<String> = load_sessions(con)?
-        .iter()
-        .filter(|s| filters.matches(s))
-        .map(|s| s.id.clone())
-        .collect();
+    // No child expansion for strip: only matching sessions are stripped.
+    let selected = select_ids(con, &filters, false)?;
 
     let mut out = db_status(db_path);
     out["dry_run"] = serde_json::json!(dry_run);
@@ -188,12 +181,7 @@ fn parse_id_args(args: &[String]) -> Result<Vec<String>> {
 /// `--subagents`, `--path <dir>` (repeatable). Positional args are
 /// rejected.
 fn parse_purge_args(args: &[String]) -> Result<PurgeFilter> {
-    let mut f = PurgeFilter {
-        older_than_raw: None,
-        cutoff_ms: None,
-        subagents: false,
-        paths: Vec::new(),
-    };
+    let mut f = PurgeFilter::default();
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -217,10 +205,69 @@ fn parse_purge_args(args: &[String]) -> Result<PurgeFilter> {
                 f.paths.push(p.clone());
                 i += 2;
             }
+            "--larger-than" => {
+                let size = args
+                    .get(i + 1)
+                    .ok_or_else(|| AppError::usage("--larger-than requires a size (e.g. 50M)"))?;
+                let bytes = parse_size_bytes(size)?;
+                f.larger_than_raw = Some(size.clone());
+                f.larger_than_bytes = Some(bytes);
+                i += 2;
+            }
+            "--keep-latest" => {
+                let n = args
+                    .get(i + 1)
+                    .ok_or_else(|| AppError::usage("--keep-latest requires a count"))?;
+                let c = parse_count(n)?;
+                f.keep_latest_raw = Some(n.clone());
+                f.keep_latest = Some(c);
+                i += 2;
+            }
             other => return Err(AppError::usage(format!("unknown option: {other}"))),
         }
     }
     Ok(f)
+}
+
+/// Sessions matching the filters. `keep_latest` keeps the N most recent
+/// matches (by `time_updated`, id as tiebreaker); for purge it also
+/// protects their ancestors so deleting a parent can never orphan a
+/// kept session. `protect_ancestors` is off for strip-reasoning, which
+/// never deletes sessions.
+fn select_ids(
+    con: &Connection,
+    filters: &PurgeFilter,
+    protect_ancestors: bool,
+) -> Result<Vec<String>> {
+    let sessions = load_sessions(con)?;
+    let mut selected: Vec<&crate::models::SessionRow> =
+        sessions.iter().filter(|s| filters.matches(s)).collect();
+    if let Some(n) = filters.keep_latest {
+        let mut kept: HashSet<&str> = HashSet::new();
+        for s in selected.iter().take(n as usize) {
+            kept.insert(s.id.as_str());
+        }
+        if protect_ancestors {
+            // A kept session's ancestors must survive too: deleting a
+            // parent would orphan (or cascade-delete) the kept child.
+            let mut added = true;
+            while added {
+                added = false;
+                for s in &sessions {
+                    if kept.contains(s.id.as_str()) {
+                        if let Some(pid) = &s.parent_id {
+                            if !kept.contains(pid.as_str()) {
+                                kept.insert(pid.as_str());
+                                added = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        selected.retain(|s| !kept.contains(s.id.as_str()));
+    }
+    Ok(selected.iter().map(|s| s.id.clone()).collect())
 }
 
 /// Append all descendant sessions (recursive subagent sessions) of the
@@ -514,6 +561,180 @@ mod tests {
     }
 
     #[test]
+    fn purge_larger_than_selects_big_sessions() {
+        let mut con = testdb::create();
+        testdb::insert_session(&con, "small", "/a", None);
+        testdb::insert_part(&con, "small", "x");
+        testdb::insert_session(&con, "big", "/a", None);
+        testdb::insert_part(&con, "big", "xxxxxxxx");
+
+        cmd_session_purge(
+            &mut con,
+            &["--larger-than".to_string(), "4".to_string()],
+            false,
+            Path::new("/tmp/x.db"),
+        )
+        .unwrap();
+
+        assert_eq!(testdb::session_count(&con), 1);
+        let remaining: String = con
+            .query_row("SELECT id FROM session", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(remaining, "small");
+    }
+
+    #[test]
+    fn purge_keep_latest_keeps_newest() {
+        let mut con = testdb::create();
+        for (i, id) in ["s1", "s2", "s3", "s4", "s5"].iter().enumerate() {
+            testdb::insert_session_at(&con, id, "/a", None, i as i64);
+        }
+
+        cmd_session_purge(
+            &mut con,
+            &["--keep-latest".to_string(), "2".to_string()],
+            false,
+            Path::new("/tmp/x.db"),
+        )
+        .unwrap();
+
+        assert_eq!(testdb::session_count(&con), 2);
+        let remaining: Vec<String> = con
+            .prepare("SELECT id FROM session ORDER BY id")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(remaining, vec!["s4", "s5"]);
+    }
+
+    #[test]
+    fn purge_keep_latest_protects_ancestors() {
+        let mut con = testdb::create();
+        testdb::insert_session_at(&con, "parent", "/a", None, 0);
+        testdb::insert_session_at(&con, "child", "/a", Some("parent"), 1);
+
+        cmd_session_purge(
+            &mut con,
+            &["--keep-latest".to_string(), "1".to_string()],
+            false,
+            Path::new("/tmp/x.db"),
+        )
+        .unwrap();
+
+        // The newest session is the child; its parent must survive too.
+        assert_eq!(testdb::session_count(&con), 2);
+    }
+
+    #[test]
+    fn purge_keep_latest_keeps_parent_deletes_old_child() {
+        let mut con = testdb::create();
+        testdb::insert_session_at(&con, "parent", "/a", None, 1);
+        testdb::insert_session_at(&con, "child", "/a", Some("parent"), 0);
+
+        cmd_session_purge(
+            &mut con,
+            &["--keep-latest".to_string(), "1".to_string()],
+            false,
+            Path::new("/tmp/x.db"),
+        )
+        .unwrap();
+
+        assert_eq!(testdb::session_count(&con), 1);
+        let remaining: String = con
+            .query_row("SELECT id FROM session", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(remaining, "parent");
+    }
+
+    #[test]
+    fn purge_keep_latest_zero_deletes_all() {
+        let mut con = testdb::create();
+        testdb::insert_session(&con, "s1", "/a", None);
+        testdb::insert_session(&con, "s2", "/a", None);
+
+        cmd_session_purge(
+            &mut con,
+            &["--keep-latest".to_string(), "0".to_string()],
+            false,
+            Path::new("/tmp/x.db"),
+        )
+        .unwrap();
+
+        assert_eq!(testdb::session_count(&con), 0);
+    }
+
+    #[test]
+    fn purge_keep_latest_exceeding_count_deletes_nothing() {
+        let mut con = testdb::create();
+        testdb::insert_session(&con, "s1", "/a", None);
+
+        cmd_session_purge(
+            &mut con,
+            &["--keep-latest".to_string(), "5".to_string()],
+            false,
+            Path::new("/tmp/x.db"),
+        )
+        .unwrap();
+
+        assert_eq!(testdb::session_count(&con), 1);
+    }
+
+    #[test]
+    fn purge_keep_latest_composes_with_other_filters() {
+        let mut con = testdb::create();
+        testdb::insert_session_at(&con, "root1", "/a", None, 0);
+        testdb::insert_session_at(&con, "child-old", "/a", Some("root1"), 1);
+        testdb::insert_session_at(&con, "child-new", "/a", Some("root1"), 2);
+
+        cmd_session_purge(
+            &mut con,
+            &[
+                "--subagents".to_string(),
+                "--keep-latest".to_string(),
+                "1".to_string(),
+            ],
+            false,
+            Path::new("/tmp/x.db"),
+        )
+        .unwrap();
+
+        assert_eq!(testdb::session_count(&con), 2);
+        let remaining: Vec<String> = con
+            .prepare("SELECT id FROM session ORDER BY id")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(remaining, vec!["child-new", "root1"]);
+    }
+
+    #[test]
+    fn strip_reasoning_respects_keep_latest() {
+        let mut con = testdb::create();
+        testdb::insert_session_at(&con, "old", "/a", None, 0);
+        testdb::insert_session_at(&con, "new", "/a", None, 1);
+        testdb::insert_part(&con, "old", r#"{"type":"reasoning","text":"o"}"#);
+        testdb::insert_part(&con, "new", r#"{"type":"reasoning","text":"n"}"#);
+
+        cmd_session_strip_reasoning(
+            &mut con,
+            &["--keep-latest".to_string(), "1".to_string()],
+            false,
+            Path::new("/tmp/x.db"),
+        )
+        .unwrap();
+
+        assert_eq!(testdb::reasoning_part_count(&con), 1);
+        let remaining: String = con
+            .query_row("SELECT session_id FROM part", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(remaining, "new");
+    }
+
+    #[test]
     fn strip_reasoning_removes_only_reasoning_parts() {
         let mut con = testdb::create();
         testdb::insert_session(&con, "s1", "/a", None);
@@ -577,12 +798,20 @@ mod tests {
             "/a".to_string(),
             "--path".to_string(),
             "/b".to_string(),
+            "--larger-than".to_string(),
+            "50M".to_string(),
+            "--keep-latest".to_string(),
+            "10".to_string(),
         ])
         .unwrap();
         assert_eq!(f.older_than_raw.as_deref(), Some("30d"));
         assert!(f.cutoff_ms.is_some());
         assert!(f.subagents);
         assert_eq!(f.paths, vec!["/a", "/b"]);
+        assert_eq!(f.larger_than_raw.as_deref(), Some("50M"));
+        assert_eq!(f.larger_than_bytes, Some(50 * 1024 * 1024));
+        assert_eq!(f.keep_latest_raw.as_deref(), Some("10"));
+        assert_eq!(f.keep_latest, Some(10));
     }
 
     #[test]
@@ -592,6 +821,11 @@ mod tests {
             vec!["--older-than".to_string(), "xyz".to_string()],
             vec!["--older-than".to_string(), "0d".to_string()],
             vec!["--path".to_string()],
+            vec!["--larger-than".to_string()],
+            vec!["--larger-than".to_string(), "0".to_string()],
+            vec!["--larger-than".to_string(), "1.5M".to_string()],
+            vec!["--keep-latest".to_string()],
+            vec!["--keep-latest".to_string(), "-1".to_string()],
             vec!["ses_1".to_string()],
             vec!["--unknown".to_string()],
         ] {

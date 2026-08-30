@@ -34,8 +34,8 @@ project purge [--older-than <age>] [--path <dir>...]  delete projects matching a
 session list            per-session breakdown (full ids)
 session show <id>       session detail
 session delete <id>...  delete session(s) + cascade
-session purge [--older-than <age>] [--subagents] [--path <dir>...]  delete sessions matching all filters
-session strip-reasoning [--older-than <age>] [--subagents] [--path <dir>...]  delete only the reasoning parts of matching sessions
+session purge [--older-than <age>] [--subagents] [--path <dir>...] [--larger-than <size>] [--keep-latest <n>]  delete sessions matching all filters
+session strip-reasoning [--older-than <age>] [--subagents] [--path <dir>...] [--larger-than <size>] [--keep-latest <n>]  delete only the reasoning parts of matching sessions
 vacuum                  run VACUUM
 ```
 
@@ -206,10 +206,19 @@ Deletes the sessions selected by filters. All set filters combine with
 | `--older-than <age>` | sessions whose `time_updated` is older than the age |
 | `--subagents` | subagent sessions (`parent_id` set) |
 | `--path <dir>` | sessions in a directory (repeatable, OR, exact match) |
+| `--larger-than <size>` | sessions whose own `size_bytes` (msg+part+event) is larger than the size |
+| `--keep-latest <n>` | keep the newest `<n>` matching sessions, purge the rest (`0` keeps nothing) |
 
 `<age>` is `<N><unit>` with units `h`/`d`/`w`; a bare number means days
-(e.g. `30d`, `12h`, `2w`). The cutoff is strict: a session updated exactly
-at the cutoff is not selected.
+(e.g. `30d`, `12h`, `2w`). `<size>` is `<N><unit>` with units `K`/`M`/`G`
+(1024-based); a bare number means bytes (e.g. `50M`, `500K`, `2G`). The
+cutoffs are strict: a session exactly at the age cutoff is not selected,
+and a session whose size equals the threshold is not selected.
+
+`--keep-latest` applies after the other filters: the `<n>` most recent
+matches by `time_updated` (id as tiebreaker) are kept. For `purge`, the
+ancestors of kept sessions are also kept: deleting a parent would orphan
+its kept child, so protection can exceed `<n>`.
 
 Selection applies per session, then children of selected sessions are
 expanded recursively (same semantics as `session delete`). A child session
@@ -223,7 +232,7 @@ match of zero sessions is normal (exit 0), not an error:
 {
   "dry_run": true,
   "action": "delete",
-  "filters": { "older_than": "30d", "subagents": true, "paths": [] },
+  "filters": { "older_than": "30d", "subagents": true, "paths": [], "larger_than": null, "keep_latest": null },
   "total_rows": 23000,
   "sessions": [ { "id": "ses_...", "rows": { "message": 106 }, "total": 23000 } ],
   "deleted": false
@@ -239,13 +248,15 @@ Conversation text, tool results, messages, and sessions themselves are
 untouched; the `event` table is also left alone (it is an append-only log).
 
 No child expansion is performed: only sessions that match the filters
-themselves are stripped.
+themselves are stripped. `--keep-latest` keeps the newest matches'
+reasoning (no ancestor protection is needed because sessions are never
+deleted).
 
 ```json
 {
   "dry_run": true,
   "action": "strip-reasoning",
-  "filters": { "older_than": null, "subagents": false, "paths": [] },
+  "filters": { "older_than": null, "subagents": false, "paths": [], "larger_than": null, "keep_latest": null },
   "sessions": [ { "id": "ses_...", "reasoning_parts": 33, "reasoning_bytes": 106929 } ],
   "total_sessions": 1,
   "total_reasoning_parts": 33,

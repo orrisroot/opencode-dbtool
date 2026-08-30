@@ -202,8 +202,11 @@ fn parse_purge_args(args: &[String]) -> Result<ProjectFilter> {
                 f.paths.push(p.clone());
                 i += 2;
             }
-            "--subagents" => {
-                return Err(AppError::usage("--subagents does not apply to projects"));
+            "--subagents" | "--larger-than" | "--keep-latest" => {
+                return Err(AppError::usage(format!(
+                    "{} does not apply to projects",
+                    args[i]
+                )));
             }
             other => return Err(AppError::usage(format!("unknown option: {other}"))),
         }

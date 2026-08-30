@@ -36,6 +36,38 @@ pub fn parse_age_ms(s: &str) -> Result<i64> {
         .ok_or_else(|| AppError::usage(format!("age too large: {s}")))
 }
 
+/// Parse a byte size like `50M`, `500K` or `2G` (1024-based); a bare
+/// number means bytes. Invalid or non-positive input is a usage error.
+pub fn parse_size_bytes(s: &str) -> Result<i64> {
+    let s = s.trim();
+    let (num, mult) = match s.as_bytes().last() {
+        Some(b'k' | b'K') => (&s[..s.len() - 1], 1024i64),
+        Some(b'm' | b'M') => (&s[..s.len() - 1], 1024i64 * 1024),
+        Some(b'g' | b'G') => (&s[..s.len() - 1], 1024i64 * 1024 * 1024),
+        _ => (s, 1i64),
+    };
+    let n: i64 = num
+        .parse()
+        .map_err(|_| AppError::usage(format!("invalid size: {s}")))?;
+    if n <= 0 {
+        return Err(AppError::usage(format!("size must be positive: {s}")));
+    }
+    n.checked_mul(mult)
+        .ok_or_else(|| AppError::usage(format!("size too large: {s}")))
+}
+
+/// Parse a non-negative count like `10` for `--keep-latest`.
+pub fn parse_count(s: &str) -> Result<i64> {
+    let n: i64 = s
+        .trim()
+        .parse()
+        .map_err(|_| AppError::usage(format!("invalid count: {s}")))?;
+    if n < 0 {
+        return Err(AppError::usage(format!("count must be non-negative: {s}")));
+    }
+    Ok(n)
+}
+
 /// Format a unix-millis timestamp as UTC ISO-8601; "-" for 0.
 pub fn dt(ms: i64) -> String {
     if ms == 0 {
@@ -101,5 +133,39 @@ mod tests {
     #[test]
     fn parse_age_overflow() {
         assert!(parse_age_ms("999999999999999999999d").is_err());
+    }
+
+    #[test]
+    fn parse_size_units() {
+        assert_eq!(parse_size_bytes("500").unwrap(), 500);
+        assert_eq!(parse_size_bytes("1K").unwrap(), 1024);
+        assert_eq!(parse_size_bytes("1k").unwrap(), 1024);
+        assert_eq!(parse_size_bytes("50M").unwrap(), 50 * 1024 * 1024);
+        assert_eq!(parse_size_bytes("2g").unwrap(), 2 * 1024 * 1024 * 1024);
+    }
+
+    #[test]
+    fn parse_size_rejects_invalid() {
+        for bad in ["", "0", "0K", "-1", "abc", "1.5M", "1MB", "M"] {
+            assert!(parse_size_bytes(bad).is_err(), "should reject: {bad:?}");
+        }
+    }
+
+    #[test]
+    fn parse_size_overflow() {
+        assert!(parse_size_bytes("999999999999999999999G").is_err());
+    }
+
+    #[test]
+    fn parse_count_ok() {
+        assert_eq!(parse_count("0").unwrap(), 0);
+        assert_eq!(parse_count("10").unwrap(), 10);
+    }
+
+    #[test]
+    fn parse_count_rejects_invalid() {
+        for bad in ["", "-1", "abc", "1.5"] {
+            assert!(parse_count(bad).is_err(), "should reject: {bad:?}");
+        }
     }
 }

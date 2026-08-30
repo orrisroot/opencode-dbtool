@@ -42,7 +42,11 @@ pub fn session_json(s: &SessionRow) -> Value {
 }
 
 /// Filters for `session purge` / `session strip-reasoning`; set filters
-/// combine with AND. `older_than` compares against `time_updated`.
+/// combine with AND. `older_than` compares against `time_updated`,
+/// `larger_than` against the session's own `size_bytes`.
+/// `keep_latest` is applied after the other filters (see the purge
+/// commands for the ancestor-protection rules).
+#[derive(Default)]
 pub struct PurgeFilter {
     /// Raw `--older-than` argument as given (for JSON output).
     pub older_than_raw: Option<String>,
@@ -53,11 +57,25 @@ pub struct PurgeFilter {
     pub subagents: bool,
     /// Exact session `directory` matches (repeatable, OR).
     pub paths: Vec<String>,
+    /// Raw `--larger-than` argument as given (for JSON output).
+    pub larger_than_raw: Option<String>,
+    /// Minimum own size in bytes; sessions with `size_bytes <=` this
+    /// value are excluded.
+    pub larger_than_bytes: Option<i64>,
+    /// Raw `--keep-latest` argument as given (for JSON output).
+    pub keep_latest_raw: Option<String>,
+    /// Keep the N most recent matching sessions (and, for purge, their
+    /// ancestors); `0` keeps nothing.
+    pub keep_latest: Option<i64>,
 }
 
 impl PurgeFilter {
     pub fn is_empty(&self) -> bool {
-        self.older_than_raw.is_none() && !self.subagents && self.paths.is_empty()
+        self.older_than_raw.is_none()
+            && !self.subagents
+            && self.paths.is_empty()
+            && self.larger_than_raw.is_none()
+            && self.keep_latest_raw.is_none()
     }
 
     pub fn matches(&self, s: &SessionRow) -> bool {
@@ -75,6 +93,11 @@ impl PurgeFilter {
                 return false;
             }
         }
+        if let Some(min) = self.larger_than_bytes {
+            if s.size_bytes() <= min {
+                return false;
+            }
+        }
         true
     }
 
@@ -84,6 +107,8 @@ impl PurgeFilter {
             "older_than": self.older_than_raw,
             "subagents": self.subagents,
             "paths": self.paths,
+            "larger_than": self.larger_than_raw,
+            "keep_latest": self.keep_latest_raw,
         })
     }
 }
@@ -211,6 +236,7 @@ mod tests {
             cutoff_ms: None,
             subagents: false,
             paths: vec!["/home/okumura/work/misc".to_string()],
+            ..Default::default()
         };
         let sessions = [
             row("/home/okumura/work/misc"),
@@ -232,6 +258,7 @@ mod tests {
             cutoff_ms: None,
             subagents: false,
             paths: vec!["/a/b/".to_string()],
+            ..Default::default()
         };
         assert!(filter(&f, &row("/a/b")));
         assert!(!filter(&f, &row("/a")));
@@ -244,6 +271,7 @@ mod tests {
             cutoff_ms: None,
             subagents: false,
             paths: vec!["/a".to_string(), "/b".to_string()],
+            ..Default::default()
         };
         assert!(filter(&f, &row("/a")));
         assert!(filter(&f, &row("/b")));
@@ -257,6 +285,7 @@ mod tests {
             cutoff_ms: None,
             subagents: false,
             paths: Vec::new(),
+            ..Default::default()
         };
         assert!(filter(&f, &row("/a")));
         assert!(filter(&f, &row("/b")));
@@ -269,6 +298,7 @@ mod tests {
             cutoff_ms: None,
             subagents: true,
             paths: Vec::new(),
+            ..Default::default()
         };
         let mut root = row("/a");
         root.parent_id = None;
@@ -285,6 +315,7 @@ mod tests {
             cutoff_ms: Some(1000),
             subagents: false,
             paths: Vec::new(),
+            ..Default::default()
         };
         let mut old = row("/a");
         old.updated = 999;
@@ -304,6 +335,7 @@ mod tests {
             cutoff_ms: Some(1000),
             subagents: true,
             paths: vec!["/a".to_string()],
+            ..Default::default()
         };
         let mut old_child_in_a = row("/a");
         old_child_in_a.parent_id = Some("p".to_string());
@@ -321,12 +353,28 @@ mod tests {
     }
 
     #[test]
+    fn larger_than_is_strict_on_own_size() {
+        let f = PurgeFilter {
+            larger_than_raw: Some("10".to_string()),
+            larger_than_bytes: Some(10),
+            ..Default::default()
+        };
+        let mut small = row("/a");
+        small.part_bytes = 10;
+        let mut big = row("/a");
+        big.part_bytes = 11;
+        assert!(!filter(&f, &small));
+        assert!(filter(&f, &big));
+    }
+
+    #[test]
     fn empty_filter_matches_all() {
         let f = PurgeFilter {
             older_than_raw: None,
             cutoff_ms: None,
             subagents: false,
             paths: Vec::new(),
+            ..Default::default()
         };
         assert!(f.is_empty());
         assert!(filter(&f, &row("/a")));

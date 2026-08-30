@@ -44,8 +44,8 @@ fn usage() {
     println!("  opencode-dbtool session list             per-session breakdown (full ids)");
     println!("  opencode-dbtool session show <id>        session detail");
     println!("  opencode-dbtool session delete <id>...   delete session(s) + cascade");
-    println!("  opencode-dbtool session purge [--older-than <age>] [--subagents] [--path <dir>...]  delete sessions matching all filters");
-    println!("  opencode-dbtool session strip-reasoning [--older-than <age>] [--subagents] [--path <dir>...]  delete only the reasoning parts of matching sessions");
+    println!("  opencode-dbtool session purge [--older-than <age>] [--subagents] [--path <dir>...] [--larger-than <size>] [--keep-latest <n>]  delete sessions matching all filters");
+    println!("  opencode-dbtool session strip-reasoning [--older-than <age>] [--subagents] [--path <dir>...] [--larger-than <size>] [--keep-latest <n>]  delete only the reasoning parts of matching sessions");
     println!("  opencode-dbtool vacuum                  run VACUUM (as before)");
     println!("  opencode-dbtool [--help]                 show this message");
     println!();

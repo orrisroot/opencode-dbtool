@@ -49,7 +49,7 @@ pub fn load_sessions(con: &Connection) -> Result<Vec<SessionRow>> {
          (SELECT COALESCE(SUM(length(CAST(p.data AS BLOB))),0) FROM part p WHERE p.session_id = s.id), \
          (SELECT COUNT(*) FROM event e WHERE e.aggregate_id = s.id), \
          (SELECT COALESCE(SUM(length(CAST(e.data AS BLOB))),0) FROM event e WHERE e.aggregate_id = s.id) \
-         FROM session s ORDER BY s.time_updated DESC",
+         FROM session s ORDER BY s.time_updated DESC, s.id",
     )?;
     let rows = stmt.query_map([], |r| {
         Ok((
