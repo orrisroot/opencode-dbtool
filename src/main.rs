@@ -46,7 +46,7 @@ fn usage() {
     println!("  opencode-dbtool session delete <id>...   delete session(s) + cascade");
     println!("  opencode-dbtool session purge [--older-than <age>] [--subagents] [--path <dir>...] [--larger-than <size>] [--keep-latest <n>]  delete sessions matching all filters");
     println!("  opencode-dbtool session strip-reasoning [--older-than <age>] [--subagents] [--path <dir>...] [--larger-than <size>] [--keep-latest <n>]  delete only the reasoning parts of matching sessions");
-    println!("  opencode-dbtool vacuum                  run VACUUM (as before)");
+    println!("  opencode-dbtool vacuum [--no-backup]    run VACUUM (backup + verify by default)");
     println!("  opencode-dbtool [--help]                 show this message");
     println!();
     println!("OUTPUT:");
@@ -100,39 +100,51 @@ fn run() -> Result<()> {
             usage();
             Ok(())
         }
-        "vacuum" => require_db(&db_path)
-            .and_then(|_| {
-                if dry_run {
-                    Ok(())
-                } else {
-                    sys::require_idle("VACUUM needs exclusive access")
-                }
-            })
-            .and_then(|_| {
-                let con = db::open_conn(&db_path, dry_run)?;
-                let integrity = db::quick_check(&con);
-                if integrity != "ok" {
-                    return Err(AppError::db(format!(
-                        "integrity check not ok ({integrity}) - abort"
-                    )));
-                }
-                let freelist: i64 = con
-                    .query_row("PRAGMA freelist_count", [], |r| r.get(0))
-                    .unwrap_or(-1);
-                let mut out = db::db_status(&db_path);
-                out["dry_run"] = serde_json::json!(dry_run);
-                out["db_bytes_before"] = serde_json::json!(db::file_size(&db_path));
-                out["free_pages_before"] = serde_json::json!(freelist);
-                if dry_run {
-                    return output::print_json(&out);
-                }
-                let after = commands::vacuum::cmd_vacuum(&con, &db_path)?;
-                out["db_bytes_after"] = after["db_bytes"].clone();
-                out["wal_bytes_after"] = after["wal_bytes"].clone();
-                out["free_pages_after"] = after["free_pages"].clone();
-                out["integrity"] = after["integrity"].clone();
-                output::print_json(&out)
-            }),
+        "vacuum" => {
+            let opts = commands::vacuum::parse_vacuum_args(rest)?;
+            require_db(&db_path)
+                    .and_then(|_| {
+                        if dry_run {
+                            Ok(())
+                        } else {
+                            sys::require_idle("VACUUM needs exclusive access")
+                        }
+                    })
+                    .and_then(|_| {
+                        let con = db::open_conn(&db_path, dry_run)?;
+                        let integrity = db::quick_check(&con);
+                        if integrity != "ok" {
+                            return Err(AppError::db(format!(
+                                "integrity check not ok ({integrity}) - abort"
+                            )));
+                        }
+                        let freelist: i64 = con
+                            .query_row("PRAGMA freelist_count", [], |r| r.get(0))
+                            .unwrap_or(-1);
+                        let mut out = db::db_status(&db_path);
+                        out["dry_run"] = serde_json::json!(dry_run);
+                        out["db_bytes_before"] = serde_json::json!(db::file_size(&db_path));
+                        out["free_pages_before"] = serde_json::json!(freelist);
+                        out["backup"] = if opts.backup {
+                            serde_json::json!({
+                                "path": commands::vacuum::planned_backup_path(&db_path).to_string_lossy().to_string(),
+                                "bytes": db::file_size(&db_path),
+                            })
+                        } else {
+                            serde_json::Value::Null
+                        };
+                        if dry_run {
+                            return output::print_json(&out);
+                        }
+                        let after = commands::vacuum::cmd_vacuum(&con, &db_path, &opts)?;
+                        out["backup"] = after["backup"].clone();
+                        out["db_bytes_after"] = after["db_bytes"].clone();
+                        out["wal_bytes_after"] = after["wal_bytes"].clone();
+                        out["free_pages_after"] = after["free_pages"].clone();
+                        out["integrity"] = after["integrity"].clone();
+                        output::print_json(&out)
+                    })
+        }
         "stats" => require_db(&db_path).and_then(|_| {
             let con = db::open_conn(&db_path, true)?;
             commands::stats::cmd_stats(&con, &db_path)

@@ -68,11 +68,8 @@ pub fn parse_count(s: &str) -> Result<i64> {
     Ok(n)
 }
 
-/// Format a unix-millis timestamp as UTC ISO-8601; "-" for 0.
-pub fn dt(ms: i64) -> String {
-    if ms == 0 {
-        return "-".to_string();
-    }
+/// Decompose a unix-millis timestamp into UTC calendar fields.
+fn calendar(ms: i64) -> (i64, u32, u32, u32, u32, u32) {
     let secs = ms / 1000;
     let days = secs.div_euclid(86400);
     let tod = secs.rem_euclid(86400);
@@ -86,15 +83,30 @@ pub fn dt(ms: i64) -> String {
     let d = doy - (153 * mp + 2) / 5 + 1;
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = y + if m <= 2 { 1 } else { 0 };
-    format!(
-        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+    (
         y,
-        m,
-        d,
-        tod / 3600,
-        (tod % 3600) / 60,
-        tod % 60
+        m as u32,
+        d as u32,
+        (tod / 3600) as u32,
+        ((tod % 3600) / 60) as u32,
+        (tod % 60) as u32,
     )
+}
+
+/// Format a unix-millis timestamp as UTC ISO-8601; "-" for 0.
+pub fn dt(ms: i64) -> String {
+    if ms == 0 {
+        return "-".to_string();
+    }
+    let (y, m, d, h, mi, s) = calendar(ms);
+    format!("{y:04}-{m:02}-{d:02}T{h:02}:{mi:02}:{s:02}Z")
+}
+
+/// Compact UTC timestamp for backup filenames (no colons), e.g.
+/// `20260830T120000Z`.
+pub fn timestamp_utc(ms: i64) -> String {
+    let (y, m, d, h, mi, s) = calendar(ms);
+    format!("{y:04}{m:02}{d:02}T{h:02}{mi:02}{s:02}Z")
 }
 
 /// Round to 4 decimal places for cost output.
@@ -113,6 +125,12 @@ mod tests {
         assert_eq!(super::dt(1451606400000), "2016-01-01T00:00:00Z");
         assert_eq!(super::dt(1582934400000), "2020-02-29T00:00:00Z");
         assert_eq!(super::dt(1592611200000), "2020-06-20T00:00:00Z");
+    }
+
+    #[test]
+    fn timestamp_utc_is_compact_with_z() {
+        assert_eq!(super::timestamp_utc(1136214245000), "20060102T150405Z");
+        assert_eq!(super::timestamp_utc(1451606400000), "20160101T000000Z");
     }
 
     #[test]

@@ -3,9 +3,23 @@
 //! Mirrors the opencode schema subset the tool reads and writes.
 
 use rusqlite::Connection;
+use std::path::Path;
 
 pub fn create() -> Connection {
     let con = Connection::open_in_memory().unwrap();
+    schema(&con);
+    con
+}
+
+/// Same schema on a real file (for tests that need file operations,
+/// such as VACUUM and backups).
+pub fn create_at(path: &Path) -> Connection {
+    let con = Connection::open(path).unwrap();
+    schema(&con);
+    con
+}
+
+fn schema(con: &Connection) {
     con.execute_batch(
         "CREATE TABLE project (id TEXT PRIMARY KEY, worktree TEXT, name TEXT);
          CREATE TABLE session (id TEXT PRIMARY KEY, directory TEXT, title TEXT, parent_id TEXT, project_id TEXT REFERENCES project(id) ON DELETE CASCADE, time_updated INTEGER, cost REAL);
@@ -23,7 +37,6 @@ pub fn create() -> Connection {
          CREATE TABLE workspace (project_id TEXT);",
     )
     .unwrap();
-    con
 }
 
 pub fn insert_session(con: &Connection, id: &str, dir: &str, parent: Option<&str>) {

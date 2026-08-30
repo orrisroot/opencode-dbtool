@@ -494,9 +494,11 @@ mod tests {
     fn purge_older_than_boundary_is_strict() {
         let mut con = testdb::create();
         let now = now_ms().unwrap();
-        let cutoff = now - 30 * 86_400_000;
-        testdb::insert_session_at(&con, "at-cutoff", "/a", None, cutoff);
-        testdb::insert_session_at(&con, "just-before", "/a", None, cutoff - 1);
+        // One hour above/below the cutoff; the re-computed cutoff at
+        // purge time may drift by milliseconds, so the exact-boundary
+        // semantics are asserted in models::tests instead.
+        testdb::insert_session_at(&con, "above", "/a", None, now - 30 * 86_400_000 + 3_600_000);
+        testdb::insert_session_at(&con, "below", "/a", None, now - 30 * 86_400_000 - 3_600_000);
 
         cmd_session_purge(
             &mut con,
@@ -510,7 +512,7 @@ mod tests {
         let remaining: String = con
             .query_row("SELECT id FROM session", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(remaining, "at-cutoff");
+        assert_eq!(remaining, "above");
     }
 
     #[test]

@@ -36,7 +36,7 @@ session show <id>       session detail
 session delete <id>...  delete session(s) + cascade
 session purge [--older-than <age>] [--subagents] [--path <dir>...] [--larger-than <size>] [--keep-latest <n>]  delete sessions matching all filters
 session strip-reasoning [--older-than <age>] [--subagents] [--path <dir>...] [--larger-than <size>] [--keep-latest <n>]  delete only the reasoning parts of matching sessions
-vacuum                  run VACUUM
+vacuum [--no-backup]    run VACUUM (backup + verify by default)
 ```
 
 All ids are matched exactly (no prefix/substring resolution). In `purge` /
@@ -275,6 +275,7 @@ selected sessions and reports an error (exit 2) otherwise.
   "dry_run": false,
   "db_bytes_before": 8388608,
   "free_pages_before": 120,
+  "backup": { "path": "/path/opencode.db.backup-20260830T120000Z", "bytes": 8388608, "integrity": "ok" },
   "db_bytes_after": 2097152,
   "wal_bytes_after": 0,
   "free_pages_after": 0,
@@ -282,11 +283,21 @@ selected sessions and reports an error (exit 2) otherwise.
 }
 ```
 
+The safe VACUUM sequence: checkpoint the WAL, run an integrity check
+(abort on failure), create a **timestamped backup** of the database file
+(`opencode.db.backup-<UTC>`), verify the backup with an integrity check
+(abort on failure), VACUUM, restore `journal_mode = WAL`, checkpoint, and
+run a final integrity check. The backup is created by default and is kept
+until you verify opencode works correctly; it needs free disk space equal
+to the database size. `--no-backup` skips the backup. In dry-run mode the
+planned backup path and size are reported and nothing is written.
+
 ## Flags
 
 | flag | meaning |
 | --- | --- |
 | `--dry-run`, `-n` | print actions without changing anything (safe while opencode runs) |
+| `--no-backup` | `vacuum` only: skip the timestamped backup (dangerous) |
 
 ## Exit codes
 
