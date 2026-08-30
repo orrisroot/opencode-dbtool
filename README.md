@@ -44,7 +44,8 @@ vacuum [--no-backup]    run VACUUM (backup + verify by default)
 All ids are matched exactly (no prefix/substring resolution). In `purge` /
 `strip-reasoning`, `--path <dir>` is an exact match against the session
 `directory`; in `project list`/`project purge` it is an exact match against
-the project `worktree`. It is never a prefix match.
+the project `worktree`. It is never a prefix match; a trailing slash is
+ignored on both sides of the comparison.
 
 ### Common fields
 
@@ -79,11 +80,14 @@ commands still proceed; guarded commands fail with exit 3).
 
 `tables` maps every table name to its row count. `total_data_bytes` sums the
 `data` column of every table that has one (message, part, event,
-session_message, ...). `db_bytes` is the file size on disk. `storage`
-reports the sizes of opencode's filesystem storage beside the database:
-session diffs (`storage/session_diff/`), git snapshots (`snapshot/`), and
-tool output (`tool-output/`). Missing directories count as 0. `part_types`
-breaks the `part` table down by its `data.type` (largest first).
+session_message, ...). `db_bytes` is the file size on disk, `wal_bytes` the
+WAL file size, and `free_pages` the SQLite freelist page count (space that
+`vacuum` can reclaim). `storage` reports the sizes of opencode's filesystem
+storage beside the database: session diffs (`storage/session_diff/`), git
+snapshots (`snapshot/`), and tool output (`tool-output/`). Missing
+directories count as 0. `part_types` breaks the `part` table down by its
+`data.type` (largest first); rows whose `data` is not JSON or has no `type`
+are grouped under `"unknown"`.
 
 `stats --detail` adds:
 
@@ -98,8 +102,9 @@ breaks the `part` table down by its `data.type` (largest first).
 ```
 
 `activity` reports the creation history of `part` and `message` rows over
-the last 30 days (by `time_created`). `subagent` reports the session count
-and data size of subagent sessions relative to all sessions.
+the last 30 days (by `time_created`), grouped by the user's local
+calendar day. `subagent` reports the session count and data size of
+subagent sessions relative to all sessions.
 
 ### `doctor`
 
@@ -114,11 +119,21 @@ and data size of subagent sessions relative to all sessions.
     "sessions_missing_parent": [],
     "sessions_missing_workspace": [],
     "orphaned_event_sequences": [],
-    "mismatched_parts": []
+    "mismatched_parts": 0
   },
   "ok": true
 }
 ```
+
+`quick_check` and `integrity_check` run SQLite's `PRAGMA quick_check` /
+`PRAGMA integrity_check` (both report `"ok"` on a healthy database).
+`foreign_key_violations` lists every row rejected by
+`PRAGMA foreign_key_check`. `orphans` collects references that no FK
+constraint covers: `sessions_missing_parent` (a session whose `parent_id`
+points at a nonexistent session), `sessions_missing_workspace` (a session
+whose `workspace_id` has no `workspace` row), `orphaned_event_sequences`
+(`event_sequence` rows whose session is gone), and `mismatched_parts`
+(`part` rows whose `session_id` disagrees with their `message`'s).
 
 `ok: false` (exit code 3) when integrity/fk/orphan checks fail.
 
@@ -394,7 +409,7 @@ planned backup path and size are reported and nothing is written.
 | --- | --- |
 | 0 | success |
 | 1 | opencode is running and the command was refused (close opencode and retry) |
-| 2 | not found / bad arguments (usage printed) |
+| 2 | not found / bad arguments |
 | 3 | database error, or running-process detection failed |
 
 ## Environment

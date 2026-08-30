@@ -3,10 +3,12 @@
 use crate::db::{db_status, file_size, quick_check};
 use crate::error::{AppError, Result};
 use crate::output::print_json;
+use crate::util::expect_no_args;
 use rusqlite::Connection;
 use std::path::Path;
 
-pub fn cmd_doctor(con: &Connection, db_path: &Path) -> Result<()> {
+pub fn cmd_doctor(con: &Connection, db_path: &Path, args: &[String]) -> Result<()> {
+    expect_no_args(args, "doctor")?;
     let mut out = db_status(db_path);
     out["db_bytes"] = serde_json::json!(file_size(db_path));
     out["wal_bytes"] = serde_json::json!(file_size(&db_path.with_extension("db-wal")));

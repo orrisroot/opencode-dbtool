@@ -153,7 +153,7 @@ fn run() -> Result<()> {
         }),
         "doctor" => require_db(&db_path).and_then(|_| {
             let con = db::open_conn(&db_path, true)?;
-            commands::doctor::cmd_doctor(&con, &db_path)
+            commands::doctor::cmd_doctor(&con, &db_path, rest)
         }),
         "project" => match rest.first().map(|s| s.as_str()).unwrap_or("") {
             "list" => require_db(&db_path).and_then(|_| {

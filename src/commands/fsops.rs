@@ -8,7 +8,7 @@
 use crate::db::db_status;
 use crate::error::{AppError, Result};
 use crate::output::print_json;
-use crate::util::{dir_size, session_diff_dir, snapshot_dir};
+use crate::util::{dir_size, expect_no_args, session_diff_dir, snapshot_dir};
 use rusqlite::Connection;
 use std::collections::HashSet;
 use std::path::Path;
@@ -115,15 +115,6 @@ pub fn cmd_fs_clean_snapshots(args: &[String], dry_run: bool, db_path: &Path) ->
     }
     out["deleted"] = serde_json::json!(true);
     print_json(&out)
-}
-
-fn expect_no_args(args: &[String], usage: &str) -> Result<()> {
-    if let Some(a) = args.first() {
-        return Err(AppError::usage(format!(
-            "unexpected argument: {a} (usage: opencode-dbtool {usage})"
-        )));
-    }
-    Ok(())
 }
 
 #[cfg(test)]
