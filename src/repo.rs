@@ -265,6 +265,135 @@ pub fn reasoning_left(con: &Connection, ids: &[String]) -> Result<i64> {
     Ok(con.query_row(&sql, rusqlite::params_from_iter(ids), |r| r.get(0))?)
 }
 
+/// Durable reasoning event types (`session.next.reasoning.delta` is
+/// live-only and never persisted).
+const REASONING_EVENT_TYPES: [&str; 2] = [
+    "session.next.reasoning.started",
+    "session.next.reasoning.ended",
+];
+
+/// Parameter list of session ids followed by the reasoning event types.
+fn reasoning_event_params(ids: &[String]) -> Vec<rusqlite::types::Value> {
+    let mut p: Vec<rusqlite::types::Value> = ids
+        .iter()
+        .map(|s| rusqlite::types::Value::Text(s.clone()))
+        .collect();
+    p.extend(
+        REASONING_EVENT_TYPES
+            .iter()
+            .map(|t| rusqlite::types::Value::Text((*t).to_string())),
+    );
+    p
+}
+
+/// Per-session reasoning event counts and bytes for the given ids.
+/// Sessions without matching events are omitted.
+pub fn reasoning_event_counts(con: &Connection, ids: &[String]) -> Result<Vec<(String, i64, i64)>> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let sql = format!(
+        "SELECT aggregate_id, COUNT(*), COALESCE(SUM(length(CAST(data AS BLOB))),0) \
+         FROM event WHERE aggregate_id IN ({}) AND type IN ({}) \
+         GROUP BY aggregate_id",
+        in_clause(ids),
+        vec!["?"; REASONING_EVENT_TYPES.len()].join(",")
+    );
+    let mut stmt = con.prepare(&sql)?;
+    let rows = stmt.query_map(
+        rusqlite::params_from_iter(reasoning_event_params(ids)),
+        |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, i64>(2)?,
+            ))
+        },
+    )?;
+    Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+}
+
+/// Delete reasoning events for the given ids; returns rows removed.
+pub fn strip_reasoning_events(con: &Connection, ids: &[String]) -> Result<usize> {
+    if ids.is_empty() {
+        return Ok(0);
+    }
+    let sql = format!(
+        "DELETE FROM event WHERE aggregate_id IN ({}) AND type IN ({})",
+        in_clause(ids),
+        vec!["?"; REASONING_EVENT_TYPES.len()].join(",")
+    );
+    Ok(con.execute(
+        &sql,
+        rusqlite::params_from_iter(reasoning_event_params(ids)),
+    )?)
+}
+
+/// Reasoning events remaining for the given ids (post-strip verification).
+pub fn reasoning_events_left(con: &Connection, ids: &[String]) -> Result<i64> {
+    if ids.is_empty() {
+        return Ok(0);
+    }
+    let sql = format!(
+        "SELECT COUNT(*) FROM event WHERE aggregate_id IN ({}) AND type IN ({})",
+        in_clause(ids),
+        vec!["?"; REASONING_EVENT_TYPES.len()].join(",")
+    );
+    Ok(con.query_row(
+        &sql,
+        rusqlite::params_from_iter(reasoning_event_params(ids)),
+        |r| r.get(0),
+    )?)
+}
+
+/// Assistant `session_message` rows (id, session_id, data) for the
+/// given ids, in seq order.
+pub fn assistant_messages(
+    con: &Connection,
+    ids: &[String],
+) -> Result<Vec<(String, String, String)>> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let sql = format!(
+        "SELECT id, session_id, data FROM session_message \
+         WHERE session_id IN ({}) AND type = 'assistant' ORDER BY session_id, seq",
+        in_clause(ids)
+    );
+    let mut stmt = con.prepare(&sql)?;
+    let rows = stmt.query_map(rusqlite::params_from_iter(ids), |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, String>(2)?,
+        ))
+    })?;
+    Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+}
+
+/// Rewrite a session_message row's data payload.
+pub fn rewrite_message(con: &Connection, id: &str, data: &str) -> Result<()> {
+    con.execute(
+        "UPDATE session_message SET data = ?1 WHERE id = ?2",
+        params![data, id],
+    )?;
+    Ok(())
+}
+
+/// Assistant messages still containing reasoning content (post-strip
+/// verification).
+pub fn reasoning_messages_left(con: &Connection, ids: &[String]) -> Result<i64> {
+    if ids.is_empty() {
+        return Ok(0);
+    }
+    let sql = format!(
+        "SELECT COUNT(*) FROM session_message WHERE session_id IN ({}) \
+         AND type = 'assistant' AND data LIKE '%\"type\":\"reasoning\"%'",
+        in_clause(ids)
+    );
+    Ok(con.query_row(&sql, rusqlite::params_from_iter(ids), |r| r.get(0))?)
+}
+
 /// Per-table row counts for a project delete preview, including the
 /// project row itself and every cascade-eligible table.
 pub fn project_impact(con: &Connection, project_id: &str) -> Result<Vec<(String, i64)>> {

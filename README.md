@@ -254,11 +254,22 @@ match of zero sessions is normal (exit 0), not an error:
 
 ### `session strip-reasoning`
 
-Deletes only the `reasoning` parts (`part` rows whose `data` has
-`type: "reasoning"`) of the sessions selected by the same filters as
-`purge`. Filters are optional: without any, every session is stripped.
+Deletes the reasoning content of the sessions selected by the same filters
+as `purge`. Filters are optional: without any, every session is stripped.
 Conversation text, tool results, messages, and sessions themselves are
-untouched; the `event` table is also left alone (it is an append-only log).
+untouched.
+
+Reasoning lives in three places, all of which are stripped:
+
+| location | handled how |
+| --- | --- |
+| V1 `part` rows (`data` has `type: "reasoning"`) | rows deleted |
+| durable `event` rows (`session.next.reasoning.started` / `.ended`) | rows deleted (`.ended` holds the full text; `.delta` is live-only and never persisted) |
+| V2 `session_message` assistant `content[]` | `type: "reasoning"` elements removed from the JSON, rows rewritten only when changed |
+
+Deleting the events also prevents reasoning from being re-projected from
+the event log. Token and cost aggregates (`tokens.reasoning`, `cost`) are
+kept: they record what was actually billed and are not content.
 
 No child expansion is performed: only sessions that match the filters
 themselves are stripped. `--keep-latest` keeps the newest matches'
@@ -270,16 +281,25 @@ deleted).
   "dry_run": true,
   "action": "strip-reasoning",
   "filters": { "older_than": null, "subagents": false, "paths": [], "larger_than": null, "keep_latest": null },
-  "sessions": [ { "id": "ses_...", "reasoning_parts": 33, "reasoning_bytes": 106929 } ],
+  "sessions": [
+    { "id": "ses_...", "reasoning_parts": 33, "reasoning_bytes": 106929,
+      "reasoning_events": 4, "reasoning_event_bytes": 80000,
+      "messages_rewritten": 2, "rewritten_bytes": 5000 }
+  ],
   "total_sessions": 1,
   "total_reasoning_parts": 33,
   "total_reasoning_bytes": 106929,
+  "total_reasoning_events": 4,
+  "total_reasoning_event_bytes": 80000,
+  "total_messages_rewritten": 2,
+  "total_rewritten_bytes": 5000,
   "stripped": false
 }
 ```
 
-After a real run the tool verifies no reasoning parts remain for the
-selected sessions and reports an error (exit 2) otherwise.
+After a real run the tool verifies no reasoning parts, events, or
+message content remain for the selected sessions and reports an error
+(exit 2) otherwise.
 
 ### `fs clean-orphans`
 

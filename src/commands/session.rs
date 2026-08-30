@@ -5,8 +5,9 @@ use crate::error::{AppError, Result};
 use crate::models::{session_json, PurgeFilter};
 use crate::output::print_json;
 use crate::repo::{
-    child_session_ids, load_sessions, reasoning_counts, reasoning_left, resolve_session_ids,
-    session_exists, strip_reasoning,
+    assistant_messages, child_session_ids, load_sessions, reasoning_counts, reasoning_event_counts,
+    reasoning_events_left, reasoning_left, reasoning_messages_left, resolve_session_ids,
+    rewrite_message, session_exists, strip_reasoning, strip_reasoning_events,
 };
 use crate::util::{now_ms, parse_age_ms, parse_count, parse_size_bytes, session_diff_dir};
 use rusqlite::{params, Connection};
@@ -107,8 +108,14 @@ pub fn cmd_session_purge(
     print_json(&out)
 }
 
-/// Delete reasoning parts of the sessions selected by filters (optional
+/// Delete reasoning content of the sessions selected by filters (optional
 /// filters: none = every session). Conversation text is untouched.
+///
+/// Reasoning lives in three places, all of which are stripped: V1 `part`
+/// rows, durable `event` rows (`session.next.reasoning.started` /
+/// `.ended`; the full text lives in `.ended`), and V2 `session_message`
+/// assistant content. Removing the events also prevents reasoning from
+/// being re-projected from the event log. Token/cost aggregates are kept.
 pub fn cmd_session_strip_reasoning(
     con: &mut Connection,
     args: &[String],
@@ -119,26 +126,84 @@ pub fn cmd_session_strip_reasoning(
     // No child expansion for strip: only matching sessions are stripped.
     let selected = select_ids(con, &filters, false)?;
 
+    // V1 parts and durable reasoning events, per session.
+    let mut part_map: std::collections::HashMap<String, (i64, i64)> =
+        std::collections::HashMap::new();
+    for (id, n, bytes) in reasoning_counts(con, &selected)? {
+        part_map.insert(id, (n, bytes));
+    }
+    let mut event_map: std::collections::HashMap<String, (i64, i64)> =
+        std::collections::HashMap::new();
+    for (id, n, bytes) in reasoning_event_counts(con, &selected)? {
+        event_map.insert(id, (n, bytes));
+    }
+    // V2 session_message reasoning (requires parsing the JSON).
+    let mut message_map: std::collections::HashMap<String, (i64, i64)> =
+        std::collections::HashMap::new();
+    let mut rewrites: Vec<(String, String, String)> = Vec::new(); // (id, session_id, new data)
+    for (id, session_id, data) in assistant_messages(con, &selected)? {
+        if let Some(new_data) = sanitize_assistant_data(&data) {
+            let old_bytes = data.len() as i64;
+            let new_bytes = new_data.len() as i64;
+            let e = message_map.entry(session_id.clone()).or_insert((0, 0));
+            e.0 += 1;
+            e.1 += (old_bytes - new_bytes).max(0);
+            rewrites.push((id, session_id, new_data));
+        }
+    }
+
+    let mut all_ids: Vec<String> = part_map.keys().cloned().collect();
+    for id in event_map.keys() {
+        if !all_ids.contains(id) {
+            all_ids.push(id.clone());
+        }
+    }
+    for id in message_map.keys() {
+        if !all_ids.contains(id) {
+            all_ids.push(id.clone());
+        }
+    }
+    all_ids.sort();
+
     let mut out = db_status(db_path);
     out["dry_run"] = serde_json::json!(dry_run);
     out["action"] = serde_json::json!("strip-reasoning");
     out["filters"] = filters.json();
     let mut sessions_arr: Vec<serde_json::Value> = Vec::new();
     let mut total_parts: i64 = 0;
-    let mut total_bytes: i64 = 0;
-    for (id, n, bytes) in reasoning_counts(con, &selected)? {
-        total_parts += n;
-        total_bytes += bytes;
+    let mut total_part_bytes: i64 = 0;
+    let mut total_events: i64 = 0;
+    let mut total_event_bytes: i64 = 0;
+    let mut total_messages: i64 = 0;
+    let mut total_rewritten_bytes: i64 = 0;
+    for id in &all_ids {
+        let (parts, part_bytes) = part_map.get(id).copied().unwrap_or((0, 0));
+        let (events, event_bytes) = event_map.get(id).copied().unwrap_or((0, 0));
+        let (messages, rewritten_bytes) = message_map.get(id).copied().unwrap_or((0, 0));
+        total_parts += parts;
+        total_part_bytes += part_bytes;
+        total_events += events;
+        total_event_bytes += event_bytes;
+        total_messages += messages;
+        total_rewritten_bytes += rewritten_bytes;
         sessions_arr.push(serde_json::json!({
             "id": id,
-            "reasoning_parts": n,
-            "reasoning_bytes": bytes,
+            "reasoning_parts": parts,
+            "reasoning_bytes": part_bytes,
+            "reasoning_events": events,
+            "reasoning_event_bytes": event_bytes,
+            "messages_rewritten": messages,
+            "rewritten_bytes": rewritten_bytes,
         }));
     }
     out["sessions"] = serde_json::json!(sessions_arr);
     out["total_sessions"] = serde_json::json!(sessions_arr.len());
     out["total_reasoning_parts"] = serde_json::json!(total_parts);
-    out["total_reasoning_bytes"] = serde_json::json!(total_bytes);
+    out["total_reasoning_bytes"] = serde_json::json!(total_part_bytes);
+    out["total_reasoning_events"] = serde_json::json!(total_events);
+    out["total_reasoning_event_bytes"] = serde_json::json!(total_event_bytes);
+    out["total_messages_rewritten"] = serde_json::json!(total_messages);
+    out["total_rewritten_bytes"] = serde_json::json!(total_rewritten_bytes);
     out["stripped"] = serde_json::json!(false);
     if dry_run {
         return print_json(&out);
@@ -147,6 +212,10 @@ pub fn cmd_session_strip_reasoning(
     con.execute_batch("PRAGMA foreign_keys = ON;")?;
     let tx = con.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     strip_reasoning(&tx, &selected)?;
+    strip_reasoning_events(&tx, &selected)?;
+    for (id, _session_id, new_data) in &rewrites {
+        rewrite_message(&tx, id, new_data)?;
+    }
     tx.commit()?;
 
     let left = reasoning_left(con, &selected)?;
@@ -155,9 +224,35 @@ pub fn cmd_session_strip_reasoning(
             "reasoning parts still remain after strip: {left}"
         )));
     }
+    let events_left = reasoning_events_left(con, &selected)?;
+    if events_left != 0 {
+        return Err(AppError::usage(format!(
+            "reasoning events still remain after strip: {events_left}"
+        )));
+    }
+    let messages_left = reasoning_messages_left(con, &selected)?;
+    if messages_left != 0 {
+        return Err(AppError::usage(format!(
+            "reasoning content still remains in session messages: {messages_left}"
+        )));
+    }
     out["stripped"] = serde_json::json!(true);
     out["note"] = serde_json::json!("file size is unchanged until `opencode-dbtool vacuum` is run");
     print_json(&out)
+}
+
+/// Remove `type: "reasoning"` elements from an assistant message's
+/// `content` array. Returns the rewritten data, or None when the
+/// message has no reasoning content.
+fn sanitize_assistant_data(data: &str) -> Option<String> {
+    let mut v: serde_json::Value = serde_json::from_str(data).ok()?;
+    let arr = v.get_mut("content")?.as_array_mut()?;
+    let before = arr.len();
+    arr.retain(|item| item.get("type").and_then(|t| t.as_str()) != Some("reasoning"));
+    if arr.len() == before {
+        return None;
+    }
+    Some(v.to_string())
 }
 
 /// Parse `session delete` args: ids only; flags are rejected.
@@ -815,6 +910,133 @@ mod tests {
         cmd_session_strip_reasoning(&mut con, &[], true, Path::new("/tmp/x.db")).unwrap();
 
         assert_eq!(testdb::reasoning_part_count(&con), 1);
+    }
+
+    #[test]
+    fn strip_reasoning_removes_reasoning_events() {
+        let mut con = testdb::create();
+        testdb::insert_session(&con, "s1", "/a", None);
+        testdb::insert_event(
+            &con,
+            "s1",
+            "session.next.reasoning.started",
+            r#"{"reasoningID":"r1"}"#,
+        );
+        testdb::insert_event(
+            &con,
+            "s1",
+            "session.next.reasoning.ended",
+            r#"{"reasoningID":"r1","text":"chain of thought"}"#,
+        );
+        testdb::insert_event(&con, "s1", "session.next.text.ended", r#"{"text":"hello"}"#);
+
+        cmd_session_strip_reasoning(&mut con, &[], false, Path::new("/tmp/x.db")).unwrap();
+
+        let remaining: Vec<String> = con
+            .prepare("SELECT type FROM event ORDER BY type")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(remaining, vec!["session.next.text.ended"]);
+    }
+
+    #[test]
+    fn strip_reasoning_sanitizes_session_messages() {
+        let mut con = testdb::create();
+        testdb::insert_session(&con, "s1", "/a", None);
+        testdb::insert_session_message(
+            &con,
+            "m1",
+            "s1",
+            "assistant",
+            r#"{"type":"assistant","content":[
+                {"type":"reasoning","text":"think think","id":"r1"},
+                {"type":"text","text":"hello","id":"t1"}
+            ],"tokens":{"reasoning":100,"output":5}}"#,
+        );
+        testdb::insert_session_message(
+            &con,
+            "m2",
+            "s1",
+            "user",
+            r#"{"type":"user","content":"hi"}"#,
+        );
+
+        cmd_session_strip_reasoning(&mut con, &[], false, Path::new("/tmp/x.db")).unwrap();
+
+        let data: String = con
+            .query_row(
+                "SELECT data FROM session_message WHERE id = 'm1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&data).unwrap();
+        assert_eq!(v["content"].as_array().unwrap().len(), 1);
+        assert_eq!(v["content"][0]["type"], "text");
+        assert_eq!(v["tokens"]["reasoning"], 100, "token aggregates kept");
+
+        let user_data: String = con
+            .query_row(
+                "SELECT data FROM session_message WHERE id = 'm2'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(user_data.contains("hi"), "user message untouched");
+    }
+
+    #[test]
+    fn strip_reasoning_skips_messages_without_reasoning() {
+        let mut con = testdb::create();
+        testdb::insert_session(&con, "s1", "/a", None);
+        testdb::insert_session_message(
+            &con,
+            "m1",
+            "s1",
+            "assistant",
+            r#"{"type":"assistant","content":[{"type":"text","text":"hi","id":"t1"}]}"#,
+        );
+
+        cmd_session_strip_reasoning(&mut con, &[], false, Path::new("/tmp/x.db")).unwrap();
+
+        let data: String = con
+            .query_row(
+                "SELECT data FROM session_message WHERE id = 'm1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(data.contains("hi"));
+    }
+
+    #[test]
+    fn sanitize_assistant_data_helpers() {
+        let kept = sanitize_assistant_data(
+            r#"{"type":"assistant","content":[
+                {"type":"reasoning","text":"x"},
+                {"type":"text","text":"y"},
+                {"type":"tool","tool":"bash"}
+            ]}"#,
+        )
+        .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&kept).unwrap();
+        let types: Vec<&str> = v["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["type"].as_str().unwrap())
+            .collect();
+        assert_eq!(types, vec!["text", "tool"]);
+
+        assert!(sanitize_assistant_data(
+            r#"{"type":"assistant","content":[{"type":"text","text":"y"}]}"#
+        )
+        .is_none());
+        assert!(sanitize_assistant_data(r#"{"type":"user"}"#).is_none());
+        assert!(sanitize_assistant_data("not json").is_none());
     }
 
     #[test]

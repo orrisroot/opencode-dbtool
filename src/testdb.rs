@@ -37,11 +37,11 @@ fn schema(con: &Connection) {
          CREATE TABLE message (session_id TEXT, data BLOB);
          CREATE TABLE part (session_id TEXT, data TEXT);
          CREATE TABLE todo (session_id TEXT);
-         CREATE TABLE event (aggregate_id TEXT, data BLOB);
+         CREATE TABLE event (aggregate_id TEXT, type TEXT, data BLOB);
          CREATE TABLE event_sequence (aggregate_id TEXT);
          CREATE TABLE session_share (session_id TEXT);
          CREATE TABLE session_input (session_id TEXT);
-         CREATE TABLE session_message (session_id TEXT);
+         CREATE TABLE session_message (id TEXT PRIMARY KEY, session_id TEXT, type TEXT, seq INTEGER NOT NULL DEFAULT 0, data TEXT);
          CREATE TABLE session_context_epoch (session_id TEXT);
          CREATE TABLE permission (project_id TEXT);
          CREATE TABLE project_directory (project_id TEXT);
@@ -73,6 +73,30 @@ pub fn insert_part(con: &Connection, session_id: &str, data: &str) {
     con.execute(
         "INSERT INTO part (session_id, data) VALUES (?1, ?2)",
         rusqlite::params![session_id, data],
+    )
+    .unwrap();
+}
+
+/// Insert an event row (durable event log).
+pub fn insert_event(con: &Connection, aggregate_id: &str, event_type: &str, data: &str) {
+    con.execute(
+        "INSERT INTO event (aggregate_id, type, data) VALUES (?1, ?2, ?3)",
+        rusqlite::params![aggregate_id, event_type, data],
+    )
+    .unwrap();
+}
+
+/// Insert a session_message row with raw JSON `data`.
+pub fn insert_session_message(
+    con: &Connection,
+    id: &str,
+    session_id: &str,
+    msg_type: &str,
+    data: &str,
+) {
+    con.execute(
+        "INSERT INTO session_message (id, session_id, type, data) VALUES (?1, ?2, ?3, ?4)",
+        rusqlite::params![id, session_id, msg_type, data],
     )
     .unwrap();
 }
