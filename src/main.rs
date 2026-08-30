@@ -48,6 +48,8 @@ fn usage() {
     println!("  opencode-dbtool session strip-reasoning [--older-than <age>] [--subagents] [--path <dir>...] [--larger-than <size>] [--keep-latest <n>]  delete only the reasoning parts of matching sessions");
     println!("  opencode-dbtool fs clean-orphans      delete session_diff files with no matching session");
     println!("  opencode-dbtool fs clean-snapshots    delete all snapshot (undo/redo) storage");
+    println!("  opencode-dbtool fs clean-tool-output  delete all truncated tool output");
+    println!("  opencode-dbtool fs clean-log          truncate log/opencode.log to zero bytes");
     println!("  opencode-dbtool vacuum [--no-backup]    run VACUUM (backup + verify by default)");
     println!("  opencode-dbtool [--help]                 show this message");
     println!();
@@ -265,6 +267,20 @@ fn run() -> Result<()> {
                 .and_then(|_| {
                     commands::fsops::cmd_fs_clean_snapshots(&rest[1..], dry_run, &db_path)
                 }),
+            "clean-tool-output" => {
+                // Unguarded: the same retention-based cleanup opencode
+                // performs itself while running.
+                commands::fsops::cmd_fs_clean_tool_output(&rest[1..], dry_run, &db_path)
+            }
+            "clean-log" => require_db(&db_path)
+                .and_then(|_| {
+                    if dry_run {
+                        Ok(())
+                    } else {
+                        sys::require_idle("truncating the log while opencode runs is not allowed")
+                    }
+                })
+                .and_then(|_| commands::fsops::cmd_fs_clean_log(&rest[1..], dry_run, &db_path)),
             _ => {
                 usage();
                 Err(AppError::silent(error::EXIT_NOT_FOUND))

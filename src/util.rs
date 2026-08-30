@@ -120,6 +120,16 @@ pub fn tool_output_dir(db_path: &Path) -> PathBuf {
         .join("tool-output")
 }
 
+/// `log` dir for a database path.
+pub fn log_dir(db_path: &Path) -> PathBuf {
+    db_path.parent().unwrap_or(Path::new(".")).join("log")
+}
+
+/// `log/opencode.log` file for a database path.
+pub fn log_file(db_path: &Path) -> PathBuf {
+    log_dir(db_path).join("opencode.log")
+}
+
 /// Decompose a unix-millis timestamp into UTC calendar fields.
 fn calendar(ms: i64) -> (i64, u32, u32, u32, u32, u32) {
     let secs = ms / 1000;

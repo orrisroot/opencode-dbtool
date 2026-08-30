@@ -4,7 +4,9 @@
 use crate::db::{db_status, file_size};
 use crate::error::{AppError, Result};
 use crate::output::print_json;
-use crate::util::{dir_size, now_ms, quote_ident, session_diff_dir, snapshot_dir, tool_output_dir};
+use crate::util::{
+    dir_size, log_dir, now_ms, quote_ident, session_diff_dir, snapshot_dir, tool_output_dir,
+};
 use rusqlite::{params, Connection};
 use std::path::Path;
 
@@ -100,6 +102,7 @@ pub fn stats_value(con: &Connection, db_path: &Path, detail: bool) -> Result<ser
         "session_diff_bytes": dir_size(&session_diff_dir(db_path)),
         "snapshot_bytes": dir_size(&snapshot_dir(db_path)),
         "tool_output_bytes": dir_size(&tool_output_dir(db_path)),
+        "log_bytes": dir_size(&log_dir(db_path)),
     });
     out["part_types"] = part_types;
     if detail {
