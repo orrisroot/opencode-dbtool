@@ -15,6 +15,12 @@ current shapes, plus `project_directory`, `workspace`, `event`, ...). Older
 databases fail with exit code 3; open the DB once with opencode >= 1.18.0 so
 its migrations run, then retry.
 
+## Install
+
+Prebuilt binaries (Linux musl, macOS, Windows; arm64 + x86_64) are attached to
+each [GitHub Release](https://github.com/orrisroot/opencode-dbtool/releases),
+pushed as a `v<version>` tag matching `Cargo.toml`.
+
 ## Build
 
 ```sh
