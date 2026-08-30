@@ -40,11 +40,12 @@ fn usage() {
     );
     println!("  opencode-dbtool project show <id>        project detail (sessions, breakdown)");
     println!("  opencode-dbtool project delete <id>...   delete project(s) + all related data");
-    println!("  opencode-dbtool project delete --path <dir>  delete by directory (repeatable, combinable with ids)");
+    println!("  opencode-dbtool project purge [--older-than <age>] [--path <dir>...]  delete projects matching all filters");
     println!("  opencode-dbtool session list             per-session breakdown (full ids)");
     println!("  opencode-dbtool session show <id>        session detail");
     println!("  opencode-dbtool session delete <id>...   delete session(s) + cascade");
-    println!("  opencode-dbtool session delete --path <dir> delete all sessions in directory");
+    println!("  opencode-dbtool session purge [--older-than <age>] [--subagents] [--path <dir>...]  delete sessions matching all filters");
+    println!("  opencode-dbtool session strip-reasoning [--older-than <age>] [--subagents] [--path <dir>...]  delete only the reasoning parts of matching sessions");
     println!("  opencode-dbtool vacuum                  run VACUUM (as before)");
     println!("  opencode-dbtool [--help]                 show this message");
     println!();
@@ -149,7 +150,7 @@ fn run() -> Result<()> {
                 let con = db::open_conn(&db_path, true)?;
                 commands::project::cmd_project_show(&con, &rest[1..])
             }),
-            "delete" => require_db(&db_path)
+            "delete" | "purge" => require_db(&db_path)
                 .and_then(|_| {
                     if dry_run {
                         Ok(())
@@ -159,7 +160,21 @@ fn run() -> Result<()> {
                 })
                 .and_then(|_| {
                     let mut con = db::open_conn(&db_path, dry_run)?;
-                    commands::project::cmd_project_delete(&mut con, &rest[1..], dry_run, &db_path)
+                    if rest.first().map(|s| s.as_str()) == Some("delete") {
+                        commands::project::cmd_project_delete(
+                            &mut con,
+                            &rest[1..],
+                            dry_run,
+                            &db_path,
+                        )
+                    } else {
+                        commands::project::cmd_project_purge(
+                            &mut con,
+                            &rest[1..],
+                            dry_run,
+                            &db_path,
+                        )
+                    }
                 }),
             _ => {
                 usage();
@@ -192,6 +207,32 @@ fn run() -> Result<()> {
                 .and_then(|_| {
                     let mut con = db::open_conn(&db_path, dry_run)?;
                     commands::session::cmd_session_delete(&mut con, &rest[1..], dry_run, &db_path)
+                }),
+            "purge" | "strip-reasoning" => require_db(&db_path)
+                .and_then(|_| {
+                    if dry_run {
+                        Ok(())
+                    } else {
+                        sys::require_idle("deleting while opencode is running is not allowed")
+                    }
+                })
+                .and_then(|_| {
+                    let mut con = db::open_conn(&db_path, dry_run)?;
+                    if rest.first().map(|s| s.as_str()) == Some("purge") {
+                        commands::session::cmd_session_purge(
+                            &mut con,
+                            &rest[1..],
+                            dry_run,
+                            &db_path,
+                        )
+                    } else {
+                        commands::session::cmd_session_strip_reasoning(
+                            &mut con,
+                            &rest[1..],
+                            dry_run,
+                            &db_path,
+                        )
+                    }
                 }),
             _ => {
                 usage();

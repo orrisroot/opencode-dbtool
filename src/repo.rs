@@ -201,12 +201,56 @@ pub fn lookup_project(
     }
 }
 
-/// All projects registered at a worktree (duplicates included).
-pub fn lookup_projects_by_worktree(con: &Connection, dir: &str) -> Result<Vec<ProjectRow>> {
-    let mut stmt =
-        con.prepare("SELECT id, worktree, COALESCE(name,'') FROM project WHERE worktree = ?1")?;
-    let rows = stmt.query_map(params![dir], project_row_from_row)?;
+fn in_clause(ids: &[String]) -> String {
+    vec!["?"; ids.len()].join(",")
+}
+
+/// Per-session reasoning part counts and bytes for the given ids.
+/// Sessions without reasoning parts are omitted.
+pub fn reasoning_counts(con: &Connection, ids: &[String]) -> Result<Vec<(String, i64, i64)>> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let sql = format!(
+        "SELECT session_id, COUNT(*), COALESCE(SUM(length(CAST(data AS BLOB))),0) \
+         FROM part WHERE session_id IN ({}) AND json_extract(data, '$.type') = 'reasoning' \
+         GROUP BY session_id",
+        in_clause(ids)
+    );
+    let mut stmt = con.prepare(&sql)?;
+    let rows = stmt.query_map(rusqlite::params_from_iter(ids), |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, i64>(1)?,
+            r.get::<_, i64>(2)?,
+        ))
+    })?;
     Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+}
+
+/// Delete reasoning parts for the given session ids; returns rows removed.
+pub fn strip_reasoning(con: &Connection, ids: &[String]) -> Result<usize> {
+    if ids.is_empty() {
+        return Ok(0);
+    }
+    let sql = format!(
+        "DELETE FROM part WHERE session_id IN ({}) AND json_extract(data, '$.type') = 'reasoning'",
+        in_clause(ids)
+    );
+    Ok(con.execute(&sql, rusqlite::params_from_iter(ids))?)
+}
+
+/// Reasoning parts remaining for the given ids (post-strip verification).
+pub fn reasoning_left(con: &Connection, ids: &[String]) -> Result<i64> {
+    if ids.is_empty() {
+        return Ok(0);
+    }
+    let sql = format!(
+        "SELECT COUNT(*) FROM part WHERE session_id IN ({}) \
+         AND json_extract(data, '$.type') = 'reasoning'",
+        in_clause(ids)
+    );
+    Ok(con.query_row(&sql, rusqlite::params_from_iter(ids), |r| r.get(0))?)
 }
 
 /// Per-table row counts for a project delete preview, including the

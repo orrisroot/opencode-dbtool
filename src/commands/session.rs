@@ -1,10 +1,14 @@
-//! `session` subcommands: list, show, delete.
+//! `session` subcommands: list, show, delete, purge, strip-reasoning.
 
 use crate::db::db_status;
 use crate::error::{AppError, Result};
-use crate::models::{filter_sessions, session_json};
+use crate::models::{session_json, PurgeFilter};
 use crate::output::print_json;
-use crate::repo::{child_session_ids, load_sessions, resolve_session_ids, session_exists};
+use crate::repo::{
+    child_session_ids, load_sessions, reasoning_counts, reasoning_left, resolve_session_ids,
+    session_exists, strip_reasoning,
+};
+use crate::util::{now_ms, parse_age_ms};
 use rusqlite::{params, Connection};
 use std::collections::HashSet;
 use std::path::Path;
@@ -39,50 +43,208 @@ pub fn cmd_session_delete(
     dry_run: bool,
     db_path: &Path,
 ) -> Result<()> {
-    let (dir, id_args) = parse_target_args(args)?;
-    if dir.is_none() && id_args.is_empty() {
+    let ids = parse_id_args(args)?;
+    if ids.is_empty() {
         return Err(AppError::usage(
-            "usage: opencode-dbtool session delete <session-id> [session-id...] | --path <directory>",
+            "usage: opencode-dbtool session delete <session-id> [session-id...]",
         ));
     }
-    let mut resolved: Vec<String> = Vec::new();
-    if let Some(d) = &dir {
-        if !id_args.is_empty() {
-            return Err(AppError::usage("cannot combine session ids with --path"));
-        }
-        for s in filter_sessions(&load_sessions(con)?, Some(d)) {
-            resolved.push(s.id.clone());
-        }
-        if resolved.is_empty() {
-            return Err(AppError::usage(format!(
-                "no sessions found in directory: {d}"
-            )));
-        }
-    } else {
-        resolved = resolve_session_ids(con, &id_args)?;
-    }
-
-    // Expand to child sessions (recursive subagent sessions), deduping
-    // duplicate ids passed on the command line.
-    let mut seen: HashSet<String> = HashSet::new();
-    resolved.retain(|id| seen.insert(id.clone()));
-    {
-        let mut queue: Vec<String> = resolved.clone();
-        while let Some(id) = queue.pop() {
-            for c in child_session_ids(con, &id)? {
-                if seen.insert(c.clone()) {
-                    queue.push(c.clone());
-                    resolved.push(c);
-                }
-            }
-        }
-    }
+    let refs: Vec<&str> = ids.iter().map(|s| s.as_str()).collect();
+    let mut resolved = resolve_session_ids(con, &refs)?;
+    expand_children(con, &mut resolved)?;
 
     let mut out = db_status(db_path);
     out["dry_run"] = serde_json::json!(dry_run);
-    let mut total_rows: i64 = 0;
+    let (total_rows, sessions_arr) = preview_impact(con, &resolved)?;
+    out["total_rows"] = serde_json::json!(total_rows);
+    out["sessions"] = serde_json::json!(sessions_arr);
+    out["deleted"] = serde_json::json!(false);
+    if dry_run {
+        return print_json(&out);
+    }
+
+    execute_delete(con, &resolved)?;
+    out["deleted"] = serde_json::json!(true);
+    out["note"] = serde_json::json!("file size is unchanged until `opencode-dbtool vacuum` is run");
+    print_json(&out)
+}
+
+/// Delete sessions selected by filters. At least one filter is required.
+pub fn cmd_session_purge(
+    con: &mut Connection,
+    args: &[String],
+    dry_run: bool,
+    db_path: &Path,
+) -> Result<()> {
+    let filters = parse_purge_args(args)?;
+    if filters.is_empty() {
+        return Err(AppError::usage(
+            "usage: opencode-dbtool session purge [--older-than <age>] [--subagents] [--path <dir>...]",
+        ));
+    }
+    let mut selected: Vec<String> = load_sessions(con)?
+        .iter()
+        .filter(|s| filters.matches(s))
+        .map(|s| s.id.clone())
+        .collect();
+    expand_children(con, &mut selected)?;
+
+    let mut out = db_status(db_path);
+    out["dry_run"] = serde_json::json!(dry_run);
+    out["action"] = serde_json::json!("delete");
+    out["filters"] = filters.json();
+    let (total_rows, sessions_arr) = preview_impact(con, &selected)?;
+    out["total_rows"] = serde_json::json!(total_rows);
+    out["sessions"] = serde_json::json!(sessions_arr);
+    out["deleted"] = serde_json::json!(false);
+    if dry_run {
+        return print_json(&out);
+    }
+
+    execute_delete(con, &selected)?;
+    out["deleted"] = serde_json::json!(true);
+    out["note"] = serde_json::json!("file size is unchanged until `opencode-dbtool vacuum` is run");
+    print_json(&out)
+}
+
+/// Delete reasoning parts of the sessions selected by filters (optional
+/// filters: none = every session). Conversation text is untouched.
+pub fn cmd_session_strip_reasoning(
+    con: &mut Connection,
+    args: &[String],
+    dry_run: bool,
+    db_path: &Path,
+) -> Result<()> {
+    let filters = parse_purge_args(args)?;
+    let selected: Vec<String> = load_sessions(con)?
+        .iter()
+        .filter(|s| filters.matches(s))
+        .map(|s| s.id.clone())
+        .collect();
+
+    let mut out = db_status(db_path);
+    out["dry_run"] = serde_json::json!(dry_run);
+    out["action"] = serde_json::json!("strip-reasoning");
+    out["filters"] = filters.json();
     let mut sessions_arr: Vec<serde_json::Value> = Vec::new();
-    for id in &resolved {
+    let mut total_parts: i64 = 0;
+    let mut total_bytes: i64 = 0;
+    for (id, n, bytes) in reasoning_counts(con, &selected)? {
+        total_parts += n;
+        total_bytes += bytes;
+        sessions_arr.push(serde_json::json!({
+            "id": id,
+            "reasoning_parts": n,
+            "reasoning_bytes": bytes,
+        }));
+    }
+    out["sessions"] = serde_json::json!(sessions_arr);
+    out["total_sessions"] = serde_json::json!(sessions_arr.len());
+    out["total_reasoning_parts"] = serde_json::json!(total_parts);
+    out["total_reasoning_bytes"] = serde_json::json!(total_bytes);
+    out["stripped"] = serde_json::json!(false);
+    if dry_run {
+        return print_json(&out);
+    }
+
+    con.execute_batch("PRAGMA foreign_keys = ON;")?;
+    let tx = con.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    strip_reasoning(&tx, &selected)?;
+    tx.commit()?;
+
+    let left = reasoning_left(con, &selected)?;
+    if left != 0 {
+        return Err(AppError::usage(format!(
+            "reasoning parts still remain after strip: {left}"
+        )));
+    }
+    out["stripped"] = serde_json::json!(true);
+    out["note"] = serde_json::json!("file size is unchanged until `opencode-dbtool vacuum` is run");
+    print_json(&out)
+}
+
+/// Parse `session delete` args: ids only; flags are rejected.
+fn parse_id_args(args: &[String]) -> Result<Vec<String>> {
+    let mut ids = Vec::new();
+    for a in args {
+        let id = a.trim();
+        if id.is_empty() {
+            continue;
+        }
+        if id == "--path" {
+            return Err(AppError::usage(
+                "`--path` was removed; use `session purge --path <dir>`",
+            ));
+        }
+        if id.starts_with("--") {
+            return Err(AppError::usage(format!("unknown option: {id}")));
+        }
+        ids.push(id.to_string());
+    }
+    Ok(ids)
+}
+
+/// Parse purge/strip-reasoning filter flags: `--older-than <age>`,
+/// `--subagents`, `--path <dir>` (repeatable). Positional args are
+/// rejected.
+fn parse_purge_args(args: &[String]) -> Result<PurgeFilter> {
+    let mut f = PurgeFilter {
+        older_than_raw: None,
+        cutoff_ms: None,
+        subagents: false,
+        paths: Vec::new(),
+    };
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--older-than" => {
+                let age = args
+                    .get(i + 1)
+                    .ok_or_else(|| AppError::usage("--older-than requires an age (e.g. 30d)"))?;
+                let ms = parse_age_ms(age)?;
+                f.older_than_raw = Some(age.clone());
+                f.cutoff_ms = Some(now_ms()? - ms);
+                i += 2;
+            }
+            "--subagents" => {
+                f.subagents = true;
+                i += 1;
+            }
+            "--path" => {
+                let p = args
+                    .get(i + 1)
+                    .ok_or_else(|| AppError::usage("--path requires a directory"))?;
+                f.paths.push(p.clone());
+                i += 2;
+            }
+            other => return Err(AppError::usage(format!("unknown option: {other}"))),
+        }
+    }
+    Ok(f)
+}
+
+/// Append all descendant sessions (recursive subagent sessions) of the
+/// given ids, deduping.
+fn expand_children(con: &Connection, ids: &mut Vec<String>) -> Result<()> {
+    let mut seen: HashSet<String> = ids.iter().cloned().collect();
+    let mut queue: Vec<String> = ids.clone();
+    while let Some(id) = queue.pop() {
+        for c in child_session_ids(con, &id)? {
+            if seen.insert(c.clone()) {
+                queue.push(c.clone());
+                ids.push(c);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Per-session preview rows (id + per-table counts + total) and the
+/// sum of all row counts.
+fn preview_impact(con: &Connection, ids: &[String]) -> Result<(i64, Vec<serde_json::Value>)> {
+    let mut total_rows: i64 = 0;
+    let mut arr: Vec<serde_json::Value> = Vec::new();
+    for id in ids {
         let counts = preview_counts(con, id)?;
         let mut rows_map = serde_json::Map::new();
         let mut total: i64 = 1; // the session row itself
@@ -91,22 +253,21 @@ pub fn cmd_session_delete(
             rows_map.insert(table, serde_json::json!(n));
         }
         total_rows += total;
-        sessions_arr.push(serde_json::json!({
+        arr.push(serde_json::json!({
             "id": id,
             "rows": rows_map,
             "total": total,
         }));
     }
-    out["total_rows"] = serde_json::json!(total_rows);
-    out["sessions"] = serde_json::json!(sessions_arr);
-    out["deleted"] = serde_json::json!(false);
-    if dry_run {
-        return print_json(&out);
-    }
+    Ok((total_rows, arr))
+}
 
+/// Delete the given sessions in a single immediate transaction and
+/// verify they are gone afterwards.
+fn execute_delete(con: &mut Connection, resolved: &[String]) -> Result<()> {
     con.execute_batch("PRAGMA foreign_keys = ON;")?;
     let tx = con.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-    for id in &resolved {
+    for id in resolved {
         // event tables have no FK to session, so they must be deleted
         // explicitly; the rest follows via ON DELETE CASCADE.
         tx.execute("DELETE FROM event WHERE aggregate_id = ?1", params![id])?;
@@ -118,39 +279,14 @@ pub fn cmd_session_delete(
     }
     tx.commit()?;
 
-    for id in &resolved {
+    for id in resolved {
         if session_exists(con, id)? {
             return Err(AppError::usage(format!(
                 "session still exists after delete: {id}"
             )));
         }
     }
-    out["deleted"] = serde_json::json!(true);
-    out["note"] = serde_json::json!("file size is unchanged until `opencode-dbtool vacuum` is run");
-    print_json(&out)
-}
-
-/// Parse `[--path <dir>] [ids...]`; combining both is rejected by the caller.
-fn parse_target_args(args: &[String]) -> Result<(Option<String>, Vec<&str>)> {
-    let mut dir: Option<String> = None;
-    let mut id_args: Vec<&str> = Vec::new();
-    let mut i = 0;
-    while i < args.len() {
-        if args[i] == "--path" {
-            match args.get(i + 1) {
-                Some(p) => dir = Some(p.clone()),
-                None => return Err(AppError::usage("--path requires a directory")),
-            }
-            i += 2;
-        } else {
-            let id = args[i].trim();
-            if !id.is_empty() {
-                id_args.push(id);
-            }
-            i += 1;
-        }
-    }
-    Ok((dir, id_args))
+    Ok(())
 }
 
 /// Per-table row counts for a session's delete preview.
@@ -174,7 +310,7 @@ fn preview_counts(con: &Connection, id: &str) -> Result<Vec<(String, i64)>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{cmd_session_delete, parse_target_args};
+    use super::*;
     use crate::testdb;
     use std::path::Path;
 
@@ -202,23 +338,6 @@ mod tests {
     }
 
     #[test]
-    fn delete_path_removes_children_in_other_dirs() {
-        let mut con = testdb::create();
-        testdb::insert_session(&con, "parent", "/a", None);
-        testdb::insert_session(&con, "child", "/b", Some("parent"));
-
-        cmd_session_delete(
-            &mut con,
-            &["--path".to_string(), "/a".to_string()],
-            false,
-            Path::new("/tmp/x.db"),
-        )
-        .unwrap();
-
-        assert_eq!(testdb::session_count(&con), 0);
-    }
-
-    #[test]
     fn delete_leaf_keeps_parent() {
         let mut con = testdb::create();
         testdb::insert_session(&con, "parent", "/a", None);
@@ -240,22 +359,250 @@ mod tests {
     }
 
     #[test]
-    fn parse_target_args_ok() {
-        let args = vec![
-            "--path".to_string(),
-            "/a/b".to_string(),
-            "ses_1".to_string(),
-        ];
-        let (dir, ids) = parse_target_args(&args).unwrap();
-        assert_eq!(dir.as_deref(), Some("/a/b"));
-        assert_eq!(ids, vec!["ses_1"]);
+    fn delete_rejects_path() {
+        let mut con = testdb::create();
+        testdb::insert_session(&con, "s1", "/a", None);
+
+        let err = cmd_session_delete(
+            &mut con,
+            &["--path".to_string(), "/a".to_string()],
+            false,
+            Path::new("/tmp/x.db"),
+        )
+        .unwrap_err();
+        assert_eq!(err.code, 2);
+        assert!(err.message.contains("purge"));
     }
 
     #[test]
-    fn parse_target_args_dangling_path() {
-        let args = vec!["ses_1".to_string(), "--path".to_string()];
-        let err = parse_target_args(&args).unwrap_err();
+    fn purge_path_expands_children_in_other_dirs() {
+        let mut con = testdb::create();
+        testdb::insert_session(&con, "parent", "/a", None);
+        testdb::insert_session(&con, "child", "/b", Some("parent"));
+
+        cmd_session_purge(
+            &mut con,
+            &["--path".to_string(), "/a".to_string()],
+            false,
+            Path::new("/tmp/x.db"),
+        )
+        .unwrap();
+
+        assert_eq!(testdb::session_count(&con), 0);
+    }
+
+    #[test]
+    fn purge_no_filters_is_usage_error() {
+        let mut con = testdb::create();
+        testdb::insert_session(&con, "s1", "/a", None);
+
+        let err = cmd_session_purge(&mut con, &[], false, Path::new("/tmp/x.db")).unwrap_err();
         assert_eq!(err.code, 2);
-        assert_eq!(err.message, "--path requires a directory");
+    }
+
+    #[test]
+    fn purge_subagents_only() {
+        let mut con = testdb::create();
+        testdb::insert_session(&con, "root", "/a", None);
+        testdb::insert_session(&con, "child", "/a", Some("root"));
+
+        cmd_session_purge(
+            &mut con,
+            &["--subagents".to_string()],
+            false,
+            Path::new("/tmp/x.db"),
+        )
+        .unwrap();
+
+        assert_eq!(testdb::session_count(&con), 1);
+        let remaining: String = con
+            .query_row("SELECT id FROM session", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(remaining, "root");
+    }
+
+    #[test]
+    fn purge_older_than_selects_only_old() {
+        let mut con = testdb::create();
+        let now = now_ms().unwrap();
+        testdb::insert_session_at(&con, "old", "/a", None, 0);
+        testdb::insert_session_at(&con, "recent", "/a", None, now);
+
+        cmd_session_purge(
+            &mut con,
+            &["--older-than".to_string(), "30d".to_string()],
+            false,
+            Path::new("/tmp/x.db"),
+        )
+        .unwrap();
+
+        assert_eq!(testdb::session_count(&con), 1);
+        let remaining: String = con
+            .query_row("SELECT id FROM session", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(remaining, "recent");
+    }
+
+    #[test]
+    fn purge_older_than_boundary_is_strict() {
+        let mut con = testdb::create();
+        let now = now_ms().unwrap();
+        let cutoff = now - 30 * 86_400_000;
+        testdb::insert_session_at(&con, "at-cutoff", "/a", None, cutoff);
+        testdb::insert_session_at(&con, "just-before", "/a", None, cutoff - 1);
+
+        cmd_session_purge(
+            &mut con,
+            &["--older-than".to_string(), "30d".to_string()],
+            false,
+            Path::new("/tmp/x.db"),
+        )
+        .unwrap();
+
+        assert_eq!(testdb::session_count(&con), 1);
+        let remaining: String = con
+            .query_row("SELECT id FROM session", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(remaining, "at-cutoff");
+    }
+
+    #[test]
+    fn purge_filters_combine_with_and() {
+        let mut con = testdb::create();
+        let now = now_ms().unwrap();
+        testdb::insert_session_at(&con, "old-root", "/a", None, 0);
+        testdb::insert_session_at(&con, "old-child", "/a", Some("old-root"), 0);
+        testdb::insert_session_at(&con, "recent-child", "/a", Some("old-root"), now);
+
+        cmd_session_purge(
+            &mut con,
+            &[
+                "--older-than".to_string(),
+                "30d".to_string(),
+                "--subagents".to_string(),
+            ],
+            false,
+            Path::new("/tmp/x.db"),
+        )
+        .unwrap();
+
+        assert_eq!(testdb::session_count(&con), 2);
+        let remaining: Vec<String> = con
+            .prepare("SELECT id FROM session ORDER BY id")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(remaining, vec!["old-root", "recent-child"]);
+    }
+
+    #[test]
+    fn purge_dry_run_changes_nothing() {
+        let mut con = testdb::create();
+        testdb::insert_session(&con, "s1", "/a", None);
+
+        cmd_session_purge(
+            &mut con,
+            &["--path".to_string(), "/a".to_string()],
+            true,
+            Path::new("/tmp/x.db"),
+        )
+        .unwrap();
+
+        assert_eq!(testdb::session_count(&con), 1);
+    }
+
+    #[test]
+    fn strip_reasoning_removes_only_reasoning_parts() {
+        let mut con = testdb::create();
+        testdb::insert_session(&con, "s1", "/a", None);
+        testdb::insert_part(
+            &con,
+            "s1",
+            r#"{"type":"reasoning","text":"chain of thought"}"#,
+        );
+        testdb::insert_part(&con, "s1", r#"{"type":"reasoning","text":"more thinking"}"#);
+        testdb::insert_part(&con, "s1", r#"{"type":"text","text":"hello"}"#);
+        testdb::insert_part(&con, "s1", r#"{"type":"tool","text":"{}"}"#);
+
+        cmd_session_strip_reasoning(&mut con, &[], false, Path::new("/tmp/x.db")).unwrap();
+
+        assert_eq!(testdb::session_count(&con), 1);
+        assert_eq!(testdb::part_count(&con), 2);
+        assert_eq!(testdb::reasoning_part_count(&con), 0);
+    }
+
+    #[test]
+    fn strip_reasoning_applies_filters() {
+        let mut con = testdb::create();
+        testdb::insert_session(&con, "parent", "/a", None);
+        testdb::insert_session(&con, "child", "/a", Some("parent"));
+        testdb::insert_part(&con, "parent", r#"{"type":"reasoning","text":"p"}"#);
+        testdb::insert_part(&con, "child", r#"{"type":"reasoning","text":"c"}"#);
+
+        cmd_session_strip_reasoning(
+            &mut con,
+            &["--subagents".to_string()],
+            false,
+            Path::new("/tmp/x.db"),
+        )
+        .unwrap();
+
+        assert_eq!(testdb::reasoning_part_count(&con), 1);
+        let remaining: String = con
+            .query_row("SELECT session_id FROM part", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(remaining, "parent");
+    }
+
+    #[test]
+    fn strip_reasoning_dry_run_changes_nothing() {
+        let mut con = testdb::create();
+        testdb::insert_session(&con, "s1", "/a", None);
+        testdb::insert_part(&con, "s1", r#"{"type":"reasoning","text":"x"}"#);
+
+        cmd_session_strip_reasoning(&mut con, &[], true, Path::new("/tmp/x.db")).unwrap();
+
+        assert_eq!(testdb::reasoning_part_count(&con), 1);
+    }
+
+    #[test]
+    fn parse_purge_args_ok() {
+        let f = parse_purge_args(&[
+            "--older-than".to_string(),
+            "30d".to_string(),
+            "--subagents".to_string(),
+            "--path".to_string(),
+            "/a".to_string(),
+            "--path".to_string(),
+            "/b".to_string(),
+        ])
+        .unwrap();
+        assert_eq!(f.older_than_raw.as_deref(), Some("30d"));
+        assert!(f.cutoff_ms.is_some());
+        assert!(f.subagents);
+        assert_eq!(f.paths, vec!["/a", "/b"]);
+    }
+
+    #[test]
+    fn parse_purge_args_rejects_bad_input() {
+        for args in [
+            vec!["--older-than".to_string()],
+            vec!["--older-than".to_string(), "xyz".to_string()],
+            vec!["--older-than".to_string(), "0d".to_string()],
+            vec!["--path".to_string()],
+            vec!["ses_1".to_string()],
+            vec!["--unknown".to_string()],
+        ] {
+            assert!(parse_purge_args(&args).is_err(), "should reject: {args:?}");
+        }
+    }
+
+    #[test]
+    fn parse_id_args_ok() {
+        let ids = parse_id_args(&["ses_1".to_string(), "  ses_2  ".to_string()]).unwrap();
+        assert_eq!(ids, vec!["ses_1", "ses_2"]);
+        assert!(parse_id_args(&[]).unwrap().is_empty());
     }
 }

@@ -41,14 +41,50 @@ pub fn session_json(s: &SessionRow) -> Value {
     })
 }
 
-/// Filter sessions by exact directory match (trailing slash tolerant).
-pub fn filter_sessions<'a>(sessions: &'a [SessionRow], dir: Option<&str>) -> Vec<&'a SessionRow> {
-    match dir {
-        None => sessions.iter().collect(),
-        Some(dir) => {
-            let dir = dir.trim_end_matches('/');
-            sessions.iter().filter(|s| s.directory == dir).collect()
+/// Filters for `session purge` / `session strip-reasoning`; set filters
+/// combine with AND. `older_than` compares against `time_updated`.
+pub struct PurgeFilter {
+    /// Raw `--older-than` argument as given (for JSON output).
+    pub older_than_raw: Option<String>,
+    /// Parsed cutoff (epoch ms); sessions with `time_updated >=` this
+    /// value are excluded. `None` when `--older-than` was not given.
+    pub cutoff_ms: Option<i64>,
+    /// Only subagent sessions (`parent_id` set).
+    pub subagents: bool,
+    /// Exact session `directory` matches (repeatable, OR).
+    pub paths: Vec<String>,
+}
+
+impl PurgeFilter {
+    pub fn is_empty(&self) -> bool {
+        self.older_than_raw.is_none() && !self.subagents && self.paths.is_empty()
+    }
+
+    pub fn matches(&self, s: &SessionRow) -> bool {
+        if let Some(cutoff) = self.cutoff_ms {
+            if s.updated >= cutoff {
+                return false;
+            }
         }
+        if self.subagents && s.parent_id.is_none() {
+            return false;
+        }
+        if !self.paths.is_empty() {
+            let dir = s.directory.trim_end_matches('/');
+            if !self.paths.iter().any(|p| p.trim_end_matches('/') == dir) {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Stable JSON contract for the `filters` field in purge output.
+    pub fn json(&self) -> Value {
+        json!({
+            "older_than": self.older_than_raw,
+            "subagents": self.subagents,
+            "paths": self.paths,
+        })
     }
 }
 
@@ -99,6 +135,48 @@ pub fn filter_projects<'a>(projects: &'a [ProjectRow], paths: &[&str]) -> Vec<&'
         .collect()
 }
 
+/// Filters for `project purge`; set filters combine with AND.
+/// `older_than` compares against the project's latest session activity
+/// (the max `time_updated` of its sessions).
+pub struct ProjectFilter {
+    /// Raw `--older-than` argument as given (for JSON output).
+    pub older_than_raw: Option<String>,
+    /// Parsed cutoff (epoch ms); projects whose latest session activity
+    /// is `>=` this value are excluded.
+    pub cutoff_ms: Option<i64>,
+    /// Exact project `worktree` matches (repeatable, OR).
+    pub paths: Vec<String>,
+}
+
+impl ProjectFilter {
+    pub fn is_empty(&self) -> bool {
+        self.older_than_raw.is_none() && self.paths.is_empty()
+    }
+
+    pub fn matches(&self, p: &ProjectRow) -> bool {
+        if let Some(cutoff) = self.cutoff_ms {
+            if p.updated >= cutoff {
+                return false;
+            }
+        }
+        if !self.paths.is_empty() {
+            let wt = p.worktree.trim_end_matches('/');
+            if !self.paths.iter().any(|d| d.trim_end_matches('/') == wt) {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Stable JSON contract for the `filters` field in purge output.
+    pub fn json(&self) -> Value {
+        json!({
+            "older_than": self.older_than_raw,
+            "paths": self.paths,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -122,15 +200,26 @@ mod tests {
         }
     }
 
+    fn filter(f: &PurgeFilter, s: &SessionRow) -> bool {
+        f.matches(s)
+    }
+
     #[test]
-    fn exact_match_only() {
-        let sessions = vec![
+    fn path_is_exact_match_only() {
+        let f = PurgeFilter {
+            older_than_raw: None,
+            cutoff_ms: None,
+            subagents: false,
+            paths: vec!["/home/okumura/work/misc".to_string()],
+        };
+        let sessions = [
             row("/home/okumura/work/misc"),
             row("/home/okumura/work/misc/opencode-dbtool"),
             row("/home/okumura/work/misc/opencode-dbtool/sub"),
         ];
-        let hit: Vec<_> = filter_sessions(&sessions, Some("/home/okumura/work/misc"))
-            .into_iter()
+        let hit: Vec<_> = sessions
+            .iter()
+            .filter(|s| filter(&f, s))
             .map(|s| s.directory.clone())
             .collect();
         assert_eq!(hit, vec!["/home/okumura/work/misc"]);
@@ -138,23 +227,109 @@ mod tests {
 
     #[test]
     fn trailing_slash_stripped() {
-        let sessions = vec![row("/a/b")];
-        let hit = filter_sessions(&sessions, Some("/a/b/"));
-        assert_eq!(hit.len(), 1);
+        let f = PurgeFilter {
+            older_than_raw: None,
+            cutoff_ms: None,
+            subagents: false,
+            paths: vec!["/a/b/".to_string()],
+        };
+        assert!(filter(&f, &row("/a/b")));
+        assert!(!filter(&f, &row("/a")));
     }
 
     #[test]
-    fn empty_dir_matches_nothing() {
-        let sessions = vec![row("/a/b")];
-        let hit = filter_sessions(&sessions, Some(""));
-        assert_eq!(hit.len(), 0);
+    fn multiple_paths_are_or() {
+        let f = PurgeFilter {
+            older_than_raw: None,
+            cutoff_ms: None,
+            subagents: false,
+            paths: vec!["/a".to_string(), "/b".to_string()],
+        };
+        assert!(filter(&f, &row("/a")));
+        assert!(filter(&f, &row("/b")));
+        assert!(!filter(&f, &row("/c")));
     }
 
     #[test]
-    fn none_matches_all() {
-        let sessions = vec![row("/a"), row("/b")];
-        let hit = filter_sessions(&sessions, None);
-        assert_eq!(hit.len(), 2);
+    fn empty_paths_match_all() {
+        let f = PurgeFilter {
+            older_than_raw: None,
+            cutoff_ms: None,
+            subagents: false,
+            paths: Vec::new(),
+        };
+        assert!(filter(&f, &row("/a")));
+        assert!(filter(&f, &row("/b")));
+    }
+
+    #[test]
+    fn subagents_only() {
+        let f = PurgeFilter {
+            older_than_raw: None,
+            cutoff_ms: None,
+            subagents: true,
+            paths: Vec::new(),
+        };
+        let mut root = row("/a");
+        root.parent_id = None;
+        let mut child = row("/a");
+        child.parent_id = Some("p".to_string());
+        assert!(!filter(&f, &root));
+        assert!(filter(&f, &child));
+    }
+
+    #[test]
+    fn older_than_cutoff_is_strict() {
+        let f = PurgeFilter {
+            older_than_raw: Some("30d".to_string()),
+            cutoff_ms: Some(1000),
+            subagents: false,
+            paths: Vec::new(),
+        };
+        let mut old = row("/a");
+        old.updated = 999;
+        let mut boundary = row("/a");
+        boundary.updated = 1000;
+        let mut recent = row("/a");
+        recent.updated = 1001;
+        assert!(filter(&f, &old));
+        assert!(!filter(&f, &boundary));
+        assert!(!filter(&f, &recent));
+    }
+
+    #[test]
+    fn filters_combine_with_and() {
+        let f = PurgeFilter {
+            older_than_raw: Some("30d".to_string()),
+            cutoff_ms: Some(1000),
+            subagents: true,
+            paths: vec!["/a".to_string()],
+        };
+        let mut old_child_in_a = row("/a");
+        old_child_in_a.parent_id = Some("p".to_string());
+        old_child_in_a.updated = 0;
+        let mut recent_child_in_a = old_child_in_a.clone();
+        recent_child_in_a.updated = 2000;
+        let mut old_root_in_a = old_child_in_a.clone();
+        old_root_in_a.parent_id = None;
+        let mut old_child_in_b = old_child_in_a.clone();
+        old_child_in_b.directory = "/b".to_string();
+        assert!(filter(&f, &old_child_in_a));
+        assert!(!filter(&f, &recent_child_in_a));
+        assert!(!filter(&f, &old_root_in_a));
+        assert!(!filter(&f, &old_child_in_b));
+    }
+
+    #[test]
+    fn empty_filter_matches_all() {
+        let f = PurgeFilter {
+            older_than_raw: None,
+            cutoff_ms: None,
+            subagents: false,
+            paths: Vec::new(),
+        };
+        assert!(f.is_empty());
+        assert!(filter(&f, &row("/a")));
     }
 
     #[test]
