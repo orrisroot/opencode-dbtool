@@ -260,6 +260,15 @@ fn delete_output(
         .collect::<Vec<_>>()
         .join(", ");
     let project_ids: Vec<&str> = projects.iter().map(|p| p.id.as_str()).collect();
+    let session_ids: Vec<String> = {
+        let mut stmt = con.prepare(&format!(
+            "SELECT id FROM session WHERE project_id IN ({plist})"
+        ))?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(&project_ids), |r| {
+            r.get::<_, String>(0)
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()?
+    };
     con.execute_batch("PRAGMA foreign_keys = ON;")?;
     let tx = con.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     // event tables have no FK to session/project, so they must be deleted
@@ -300,9 +309,30 @@ fn delete_output(
             "some project data still exists after delete",
         ));
     }
+    let (diff_files, diff_bytes) = remove_diff_files(db_path, &session_ids);
     out["deleted"] = serde_json::json!(true);
+    out["diff_files_removed"] = serde_json::json!(diff_files);
+    out["diff_bytes_removed"] = serde_json::json!(diff_bytes);
     out["note"] = serde_json::json!("file size is unchanged until `opencode-dbtool vacuum` is run");
     print_json(&out)
+}
+
+/// Best-effort removal of `storage/session_diff/<id>.json` files;
+/// missing files are ignored. Returns (files removed, bytes removed).
+fn remove_diff_files(db_path: &Path, ids: &[String]) -> (usize, u64) {
+    let dir = crate::util::session_diff_dir(db_path);
+    let mut removed = 0;
+    let mut bytes = 0;
+    for id in ids {
+        let p = dir.join(format!("{id}.json"));
+        if let Ok(meta) = std::fs::metadata(&p) {
+            if std::fs::remove_file(&p).is_ok() {
+                removed += 1;
+                bytes += meta.len();
+            }
+        }
+    }
+    (removed, bytes)
 }
 
 #[cfg(test)]
@@ -438,6 +468,28 @@ mod tests {
         ] {
             assert!(parse_purge_args(&args).is_err(), "should reject: {args:?}");
         }
+    }
+
+    #[test]
+    fn delete_removes_session_diff_files() {
+        let dir = testdb::temp_data_dir("proj-diff");
+        let db_path = dir.join("opencode.db");
+        let mut con = testdb::create_at(&db_path);
+        testdb::insert_project(&con, "p1", "/a");
+        testdb::insert_project_session(&con, "s1", "/a", "p1", 0);
+        testdb::insert_project_session(&con, "s2", "/a", "p1", 0);
+        let diff = dir.join("storage/session_diff");
+        std::fs::create_dir_all(&diff).unwrap();
+        std::fs::write(diff.join("s1.json"), vec![0u8; 4]).unwrap();
+        std::fs::write(diff.join("s2.json"), vec![0u8; 6]).unwrap();
+        std::fs::write(diff.join("other.json"), vec![0u8; 8]).unwrap();
+
+        cmd_project_delete(&mut con, &["p1".to_string()], false, &db_path).unwrap();
+
+        assert!(!diff.join("s1.json").exists());
+        assert!(!diff.join("s2.json").exists());
+        assert!(diff.join("other.json").exists(), "unrelated file kept");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

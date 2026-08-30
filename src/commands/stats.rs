@@ -3,11 +3,16 @@
 use crate::db::{db_status, file_size};
 use crate::error::Result;
 use crate::output::print_json;
-use crate::util::quote_ident;
+use crate::util::{dir_size, quote_ident, session_diff_dir, snapshot_dir, tool_output_dir};
 use rusqlite::{params, Connection};
 use std::path::Path;
 
 pub fn cmd_stats(con: &Connection, db_path: &Path) -> Result<()> {
+    print_json(&stats_value(con, db_path)?)
+}
+
+/// Build the stats object (exposed for tests).
+pub fn stats_value(con: &Connection, db_path: &Path) -> Result<serde_json::Value> {
     let freelist: i64 = con
         .query_row("PRAGMA freelist_count", [], |r| r.get(0))
         .unwrap_or(-1);
@@ -59,5 +64,37 @@ pub fn cmd_stats(con: &Connection, db_path: &Path) -> Result<()> {
     }
     out["tables"] = serde_json::json!(tables);
     out["total_data_bytes"] = serde_json::json!(total);
-    print_json(&out)
+    out["storage"] = serde_json::json!({
+        "session_diff_bytes": dir_size(&session_diff_dir(db_path)),
+        "snapshot_bytes": dir_size(&snapshot_dir(db_path)),
+        "tool_output_bytes": dir_size(&tool_output_dir(db_path)),
+    });
+    Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::stats_value;
+    use crate::testdb;
+    use std::fs;
+
+    #[test]
+    fn storage_field_reports_directory_sizes() {
+        let dir = testdb::temp_data_dir("stats-storage");
+        let db_path = dir.join("opencode.db");
+        let con = testdb::create_at(&db_path);
+        fs::create_dir_all(dir.join("storage/session_diff")).unwrap();
+        fs::write(dir.join("storage/session_diff/s1.json"), vec![0u8; 3]).unwrap();
+        fs::create_dir_all(dir.join("snapshot/p")).unwrap();
+        fs::write(dir.join("snapshot/p/o"), vec![0u8; 5]).unwrap();
+        fs::create_dir_all(dir.join("tool-output")).unwrap();
+        fs::write(dir.join("tool-output/x"), vec![0u8; 7]).unwrap();
+
+        let out = stats_value(&con, &db_path).unwrap();
+        assert_eq!(out["storage"]["session_diff_bytes"], 3);
+        assert_eq!(out["storage"]["snapshot_bytes"], 5);
+        assert_eq!(out["storage"]["tool_output_bytes"], 7);
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
 }

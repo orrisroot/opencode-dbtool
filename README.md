@@ -36,6 +36,8 @@ session show <id>       session detail
 session delete <id>...  delete session(s) + cascade
 session purge [--older-than <age>] [--subagents] [--path <dir>...] [--larger-than <size>] [--keep-latest <n>]  delete sessions matching all filters
 session strip-reasoning [--older-than <age>] [--subagents] [--path <dir>...] [--larger-than <size>] [--keep-latest <n>]  delete only the reasoning parts of matching sessions
+fs clean-orphans      delete session_diff files with no matching session
+fs clean-snapshots    delete all snapshot (undo/redo) storage
 vacuum [--no-backup]    run VACUUM (backup + verify by default)
 ```
 
@@ -48,7 +50,8 @@ the project `worktree`. It is never a prefix match.
 
 Commands that print a single result object (`stats`, `doctor`, `project
 delete`, `project purge`, `session delete`, `session purge`, `session
-strip-reasoning`, `vacuum`) start with an environment block;
+strip-reasoning`, `fs clean-orphans`, `fs clean-snapshots`, `vacuum`)
+start with an environment block;
 `project/session list` print a bare array and `project/session show` a bare
 object:
 
@@ -68,13 +71,17 @@ commands still proceed; guarded commands fail with exit 3).
   "wal_bytes": 0,
   "free_pages": 120,
   "tables": { "session": 6, "message": 640, "part": 5210, "event": 90210, "...": 0 },
-  "total_data_bytes": 12345678
+  "total_data_bytes": 12345678,
+  "storage": { "session_diff_bytes": 0, "snapshot_bytes": 736000, "tool_output_bytes": 0 }
 }
 ```
 
 `tables` maps every table name to its row count. `total_data_bytes` sums the
 `data` column of every table that has one (message, part, event,
-session_message, ...). `db_bytes` is the file size on disk.
+session_message, ...). `db_bytes` is the file size on disk. `storage`
+reports the sizes of opencode's filesystem storage beside the database:
+session diffs (`storage/session_diff/`), git snapshots (`snapshot/`), and
+tool output (`tool-output/`). Missing directories count as 0.
 
 ### `doctor`
 
@@ -173,12 +180,15 @@ projects is normal (exit 0).
   "parts": 868,
   "events": 15035,
   "size_bytes": 2100000,
+  "diff_bytes": 1234,
   "cost": 0.42
 }
 ```
 
 `parent_id` is the parent session id for subagent sessions, `null` for
 top-level sessions. It also appears in `project show`'s `session_list`.
+`diff_bytes` is the size of the session's `storage/session_diff/<id>.json`
+file (0 when it does not exist).
 
 ### `session delete`
 
@@ -194,7 +204,10 @@ top-level sessions. It also appears in `project show`'s `session_list`.
 ```
 
 On success, `deleted: true` plus a note that the file size only shrinks
-after `vacuum`.
+after `vacuum`. The session's `storage/session_diff/<id>.json` file (if
+any) is removed as well, reported as `diff_files_removed` /
+`diff_bytes_removed`. `session purge` and `project delete` behave the
+same.
 
 ### `session purge`
 
@@ -268,6 +281,41 @@ deleted).
 After a real run the tool verifies no reasoning parts remain for the
 selected sessions and reports an error (exit 2) otherwise.
 
+### `fs clean-orphans`
+
+Deletes `storage/session_diff/` files whose session no longer exists in
+the database (opencode or other tools can leave them behind when sessions
+are removed). Safe to run while opencode runs: opencode only
+writes diff files for live sessions, so the files removed here are never
+referenced again.
+
+```json
+{
+  "dry_run": true,
+  "dir": "/path/storage/session_diff",
+  "orphans": [ { "file": "ses_...", "bytes": 1234 } ],
+  "total_files": 3,
+  "total_bytes": 5000,
+  "deleted": false
+}
+```
+
+### `fs clean-snapshots`
+
+Deletes the entire `snapshot/` directory (git object packs used for
+undo/redo). It has no database relationship, but it destroys revert
+history, so it is **refused while opencode runs** (exit 1).
+
+```json
+{
+  "dry_run": true,
+  "dir": "/path/snapshot",
+  "entries": [ { "name": "<project-id>", "bytes": 736000 } ],
+  "total_bytes": 736000,
+  "deleted": false
+}
+```
+
 ### `vacuum`
 
 ```json
@@ -322,17 +370,18 @@ Default data dir: `~/.local/share/opencode`.
 opencode runs SQLite in WAL mode, and this tool opens the database with a
 matching busy timeout, so concurrent reads never wedge.
 
-- `stats`, `doctor`, `project list/show`, `session list/show` are safe while
-  opencode runs.
+- `stats`, `doctor`, `project list/show`, `session list/show`, and
+  `fs clean-orphans` are safe while opencode runs.
 - Running instances are detected by process name (`opencode`,
   `opencode-server`) via the [sysinfo](https://crates.io/crates/sysinfo)
   crate, which works on Linux, macOS, and Windows.
-- `delete`, `purge`, `strip-reasoning`, and `vacuum` are **refused while
-  opencode runs** (exit 1); close opencode and retry. Deleting a session a
-  running instance is using is not safe: the row is not resurrected, later
-  writes fail FK checks (new prompts 404, in-flight streams 500), and the TUI
-  keeps showing the cached session until refreshed. If detection itself
-  fails, guarded commands fail with exit 3 instead of guessing.
+- `delete`, `purge`, `strip-reasoning`, `fs clean-snapshots`, and `vacuum`
+  are **refused while opencode runs** (exit 1); close opencode and retry.
+  Deleting a session a running instance is using is not safe: the row is
+  not resurrected, later writes fail FK checks (new prompts 404, in-flight
+  streams 500), and the TUI keeps showing the cached session until
+  refreshed. If detection itself fails, guarded commands fail with exit 3
+  instead of guessing.
 - `--dry-run` is exempt from the running-instance guard: it only reads the DB
   and previews the impact, so it works while opencode runs.
 - Deleted rows free space only after `vacuum`.
@@ -358,6 +407,11 @@ other reasons.
 
 `strip-reasoning` runs in its own immediate transaction (foreign keys on)
 that only deletes matching `part` rows, then verifies the result.
+
+Every deleted session also removes its `storage/session_diff/<id>.json`
+file (best-effort, reported in the output); files of other sessions are
+never touched. Orphans created by other tools can be reclaimed with
+`fs clean-orphans`.
 
 ## License
 

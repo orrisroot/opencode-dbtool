@@ -46,6 +46,8 @@ fn usage() {
     println!("  opencode-dbtool session delete <id>...   delete session(s) + cascade");
     println!("  opencode-dbtool session purge [--older-than <age>] [--subagents] [--path <dir>...] [--larger-than <size>] [--keep-latest <n>]  delete sessions matching all filters");
     println!("  opencode-dbtool session strip-reasoning [--older-than <age>] [--subagents] [--path <dir>...] [--larger-than <size>] [--keep-latest <n>]  delete only the reasoning parts of matching sessions");
+    println!("  opencode-dbtool fs clean-orphans      delete session_diff files with no matching session");
+    println!("  opencode-dbtool fs clean-snapshots    delete all snapshot (undo/redo) storage");
     println!("  opencode-dbtool vacuum [--no-backup]    run VACUUM (backup + verify by default)");
     println!("  opencode-dbtool [--help]                 show this message");
     println!();
@@ -201,12 +203,12 @@ fn run() -> Result<()> {
                 }
                 require_db(&db_path).and_then(|_| {
                     let con = db::open_conn(&db_path, true)?;
-                    commands::session::cmd_session_list(&con)
+                    commands::session::cmd_session_list(&con, &db_path)
                 })
             }
             "show" => require_db(&db_path).and_then(|_| {
                 let con = db::open_conn(&db_path, true)?;
-                commands::session::cmd_session_show(&con, &rest[1..])
+                commands::session::cmd_session_show(&con, &rest[1..], &db_path)
             }),
             "delete" => require_db(&db_path)
                 .and_then(|_| {
@@ -245,6 +247,29 @@ fn run() -> Result<()> {
                             &db_path,
                         )
                     }
+                }),
+            _ => {
+                usage();
+                Err(AppError::silent(error::EXIT_NOT_FOUND))
+            }
+        },
+        "fs" => match rest.first().map(|s| s.as_str()).unwrap_or("") {
+            "clean-orphans" => require_db(&db_path).and_then(|_| {
+                // Unguarded: orphan diff files are never referenced
+                // by a live opencode session.
+                let con = db::open_conn(&db_path, true)?;
+                commands::fsops::cmd_fs_clean_orphans(&con, &rest[1..], dry_run, &db_path)
+            }),
+            "clean-snapshots" => require_db(&db_path)
+                .and_then(|_| {
+                    if dry_run {
+                        Ok(())
+                    } else {
+                        sys::require_idle("snapshots are in use while opencode runs")
+                    }
+                })
+                .and_then(|_| {
+                    commands::fsops::cmd_fs_clean_snapshots(&rest[1..], dry_run, &db_path)
                 }),
             _ => {
                 usage();

@@ -8,18 +8,18 @@ use crate::repo::{
     child_session_ids, load_sessions, reasoning_counts, reasoning_left, resolve_session_ids,
     session_exists, strip_reasoning,
 };
-use crate::util::{now_ms, parse_age_ms, parse_count, parse_size_bytes};
+use crate::util::{now_ms, parse_age_ms, parse_count, parse_size_bytes, session_diff_dir};
 use rusqlite::{params, Connection};
 use std::collections::HashSet;
 use std::path::Path;
 
-pub fn cmd_session_list(con: &Connection) -> Result<()> {
-    let sessions = load_sessions(con)?;
+pub fn cmd_session_list(con: &Connection, db_path: &Path) -> Result<()> {
+    let sessions = load_sessions(con, Some(&session_diff_dir(db_path)))?;
     let arr: Vec<serde_json::Value> = sessions.iter().map(session_json).collect();
     print_json(&serde_json::json!(arr))
 }
 
-pub fn cmd_session_show(con: &Connection, args: &[String]) -> Result<()> {
+pub fn cmd_session_show(con: &Connection, args: &[String], db_path: &Path) -> Result<()> {
     if args.len() != 1 {
         return Err(AppError::usage(
             "usage: opencode-dbtool session show <session-id>",
@@ -29,7 +29,7 @@ pub fn cmd_session_show(con: &Connection, args: &[String]) -> Result<()> {
         .into_iter()
         .next()
         .unwrap();
-    let sessions = load_sessions(con)?;
+    let sessions = load_sessions(con, Some(&session_diff_dir(db_path)))?;
     let s = sessions
         .iter()
         .find(|s| s.id == id)
@@ -63,8 +63,10 @@ pub fn cmd_session_delete(
         return print_json(&out);
     }
 
-    execute_delete(con, &resolved)?;
+    let (diff_files, diff_bytes) = execute_delete(con, &resolved, db_path)?;
     out["deleted"] = serde_json::json!(true);
+    out["diff_files_removed"] = serde_json::json!(diff_files);
+    out["diff_bytes_removed"] = serde_json::json!(diff_bytes);
     out["note"] = serde_json::json!("file size is unchanged until `opencode-dbtool vacuum` is run");
     print_json(&out)
 }
@@ -97,8 +99,10 @@ pub fn cmd_session_purge(
         return print_json(&out);
     }
 
-    execute_delete(con, &selected)?;
+    let (diff_files, diff_bytes) = execute_delete(con, &selected, db_path)?;
     out["deleted"] = serde_json::json!(true);
+    out["diff_files_removed"] = serde_json::json!(diff_files);
+    out["diff_bytes_removed"] = serde_json::json!(diff_bytes);
     out["note"] = serde_json::json!("file size is unchanged until `opencode-dbtool vacuum` is run");
     print_json(&out)
 }
@@ -239,7 +243,7 @@ fn select_ids(
     filters: &PurgeFilter,
     protect_ancestors: bool,
 ) -> Result<Vec<String>> {
-    let sessions = load_sessions(con)?;
+    let sessions = load_sessions(con, None)?;
     let mut selected: Vec<&crate::models::SessionRow> =
         sessions.iter().filter(|s| filters.matches(s)).collect();
     if let Some(n) = filters.keep_latest {
@@ -309,9 +313,14 @@ fn preview_impact(con: &Connection, ids: &[String]) -> Result<(i64, Vec<serde_js
     Ok((total_rows, arr))
 }
 
-/// Delete the given sessions in a single immediate transaction and
-/// verify they are gone afterwards.
-fn execute_delete(con: &mut Connection, resolved: &[String]) -> Result<()> {
+/// Delete the given sessions in a single immediate transaction, verify
+/// they are gone, and remove their session_diff files (best-effort).
+/// Returns the number of diff files and bytes removed.
+fn execute_delete(
+    con: &mut Connection,
+    resolved: &[String],
+    db_path: &Path,
+) -> Result<(usize, u64)> {
     con.execute_batch("PRAGMA foreign_keys = ON;")?;
     let tx = con.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     for id in resolved {
@@ -333,7 +342,25 @@ fn execute_delete(con: &mut Connection, resolved: &[String]) -> Result<()> {
             )));
         }
     }
-    Ok(())
+    Ok(remove_diff_files(db_path, resolved))
+}
+
+/// Best-effort removal of `storage/session_diff/<id>.json` files;
+/// missing files are ignored. Returns (files removed, bytes removed).
+fn remove_diff_files(db_path: &Path, ids: &[String]) -> (usize, u64) {
+    let dir = session_diff_dir(db_path);
+    let mut removed = 0;
+    let mut bytes = 0;
+    for id in ids {
+        let p = dir.join(format!("{id}.json"));
+        if let Ok(meta) = std::fs::metadata(&p) {
+            if std::fs::remove_file(&p).is_ok() {
+                removed += 1;
+                bytes += meta.len();
+            }
+        }
+    }
+    (removed, bytes)
 }
 
 /// Per-table row counts for a session's delete preview.
@@ -788,6 +815,67 @@ mod tests {
         cmd_session_strip_reasoning(&mut con, &[], true, Path::new("/tmp/x.db")).unwrap();
 
         assert_eq!(testdb::reasoning_part_count(&con), 1);
+    }
+
+    #[test]
+    fn delete_removes_session_diff_file() {
+        let dir = testdb::temp_data_dir("del-diff");
+        let db_path = dir.join("opencode.db");
+        let mut con = testdb::create_at(&db_path);
+        testdb::insert_session(&con, "s1", "/a", None);
+        let diff = dir.join("storage/session_diff");
+        std::fs::create_dir_all(&diff).unwrap();
+        std::fs::write(diff.join("s1.json"), vec![0u8; 4]).unwrap();
+        std::fs::write(diff.join("other.json"), vec![0u8; 8]).unwrap();
+
+        cmd_session_delete(&mut con, &["s1".to_string()], false, &db_path).unwrap();
+
+        assert!(
+            !diff.join("s1.json").exists(),
+            "diff of deleted session gone"
+        );
+        assert!(diff.join("other.json").exists(), "unrelated file kept");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn purge_removes_session_diff_file() {
+        let dir = testdb::temp_data_dir("purge-diff");
+        let db_path = dir.join("opencode.db");
+        let mut con = testdb::create_at(&db_path);
+        testdb::insert_session(&con, "s1", "/a", None);
+        let diff = dir.join("storage/session_diff");
+        std::fs::create_dir_all(&diff).unwrap();
+        std::fs::write(diff.join("s1.json"), vec![0u8; 4]).unwrap();
+
+        cmd_session_purge(
+            &mut con,
+            &["--path".to_string(), "/a".to_string()],
+            false,
+            &db_path,
+        )
+        .unwrap();
+
+        assert!(!diff.join("s1.json").exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn load_sessions_reads_diff_bytes() {
+        let dir = testdb::temp_data_dir("diff-bytes");
+        let db_path = dir.join("opencode.db");
+        let con = testdb::create_at(&db_path);
+        testdb::insert_session(&con, "s1", "/a", None);
+        let diff = dir.join("storage/session_diff");
+        std::fs::create_dir_all(&diff).unwrap();
+        std::fs::write(diff.join("s1.json"), vec![0u8; 6]).unwrap();
+
+        let sessions = load_sessions(&con, Some(&session_diff_dir(&db_path))).unwrap();
+        assert_eq!(sessions[0].diff_bytes, 6);
+
+        let sessions = load_sessions(&con, None).unwrap();
+        assert_eq!(sessions[0].diff_bytes, 0);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

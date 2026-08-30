@@ -3,7 +3,18 @@
 //! Mirrors the opencode schema subset the tool reads and writes.
 
 use rusqlite::Connection;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+/// Fresh temporary directory for tests that need real files.
+pub fn temp_data_dir(stem: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!(
+        "opencode-dbtool-test-{}-{}",
+        std::process::id(),
+        stem
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
 
 pub fn create() -> Connection {
     let con = Connection::open_in_memory().unwrap();

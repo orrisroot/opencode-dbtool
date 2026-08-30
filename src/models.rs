@@ -17,6 +17,7 @@ pub struct SessionRow {
     pub part_bytes: i64,
     pub events: i64,
     pub event_bytes: i64,
+    pub diff_bytes: i64,
     pub cost: f64,
 }
 
@@ -37,6 +38,7 @@ pub fn session_json(s: &SessionRow) -> Value {
         "parts": s.parts,
         "events": s.events,
         "size_bytes": s.size_bytes(),
+        "diff_bytes": s.diff_bytes,
         "cost": round4(s.cost),
     })
 }
@@ -221,6 +223,7 @@ mod tests {
             part_bytes: 0,
             events: 0,
             event_bytes: 0,
+            diff_bytes: 0,
             cost: 0.0,
         }
     }

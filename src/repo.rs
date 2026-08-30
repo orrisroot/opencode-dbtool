@@ -40,7 +40,12 @@ pub fn resolve_session_ids(con: &Connection, id_args: &[&str]) -> Result<Vec<Str
 }
 
 /// All sessions with per-session message/part/event counts and sizes.
-pub fn load_sessions(con: &Connection) -> Result<Vec<SessionRow>> {
+/// When `diff_dir` is given, each session's `diff_bytes` is read from
+/// `<diff_dir>/<id>.json` (0 when missing).
+pub fn load_sessions(
+    con: &Connection,
+    diff_dir: Option<&std::path::Path>,
+) -> Result<Vec<SessionRow>> {
     let mut stmt = con.prepare(
         "SELECT s.id, s.title, s.directory, s.parent_id, s.time_updated, s.cost, \
          (SELECT COUNT(*) FROM message m WHERE m.session_id = s.id), \
@@ -83,6 +88,12 @@ pub fn load_sessions(con: &Connection) -> Result<Vec<SessionRow>> {
             events,
             event_bytes,
         ) = r?;
+        let diff_bytes = match diff_dir {
+            Some(dir) => std::fs::metadata(dir.join(format!("{id}.json")))
+                .map(|m| m.len() as i64)
+                .unwrap_or(0),
+            None => 0,
+        };
         out.push(SessionRow {
             id,
             title,
@@ -95,6 +106,7 @@ pub fn load_sessions(con: &Connection) -> Result<Vec<SessionRow>> {
             part_bytes,
             events,
             event_bytes,
+            diff_bytes,
             cost,
         });
     }

@@ -1,6 +1,7 @@
 //! Small formatting and SQL helpers.
 
 use crate::error::{AppError, Result};
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Current time in epoch milliseconds.
@@ -66,6 +67,47 @@ pub fn parse_count(s: &str) -> Result<i64> {
         return Err(AppError::usage(format!("count must be non-negative: {s}")));
     }
     Ok(n)
+}
+
+/// Recursive size of a directory in bytes (regular files only, no
+/// symlink following); 0 when the directory is missing or unreadable.
+pub fn dir_size(path: &std::path::Path) -> u64 {
+    let mut total = 0;
+    if let Ok(rd) = std::fs::read_dir(path) {
+        for e in rd.flatten() {
+            if let Ok(ft) = e.file_type() {
+                if ft.is_dir() {
+                    total += dir_size(&e.path());
+                } else if ft.is_file() {
+                    total += e.metadata().map(|m| m.len()).unwrap_or(0);
+                }
+            }
+        }
+    }
+    total
+}
+
+/// `storage/session_diff` dir for a database path (one `<id>.json` per
+/// session).
+pub fn session_diff_dir(db_path: &Path) -> PathBuf {
+    db_path
+        .parent()
+        .unwrap_or(Path::new("."))
+        .join("storage")
+        .join("session_diff")
+}
+
+/// `snapshot` dir for a database path (git object packs per project).
+pub fn snapshot_dir(db_path: &Path) -> PathBuf {
+    db_path.parent().unwrap_or(Path::new(".")).join("snapshot")
+}
+
+/// `tool-output` dir for a database path.
+pub fn tool_output_dir(db_path: &Path) -> PathBuf {
+    db_path
+        .parent()
+        .unwrap_or(Path::new("."))
+        .join("tool-output")
 }
 
 /// Decompose a unix-millis timestamp into UTC calendar fields.
@@ -185,5 +227,18 @@ mod tests {
         for bad in ["", "-1", "abc", "1.5"] {
             assert!(parse_count(bad).is_err(), "should reject: {bad:?}");
         }
+    }
+
+    #[test]
+    fn dir_size_sums_nested_files() {
+        let dir =
+            std::env::temp_dir().join(format!("opencode-dbtool-dirsize-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("a/b")).unwrap();
+        std::fs::write(dir.join("f1"), vec![0u8; 3]).unwrap();
+        std::fs::write(dir.join("a/f2"), vec![0u8; 5]).unwrap();
+        std::fs::write(dir.join("a/b/f3"), vec![0u8; 7]).unwrap();
+        assert_eq!(super::dir_size(&dir), 15);
+        assert_eq!(super::dir_size(&dir.join("missing")), 0);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
