@@ -8,15 +8,75 @@
 //!   (`tool_*`).
 //! - `clean-log` truncates the append-only `log/opencode.log`.
 
-use crate::db::db_status;
+use crate::db::{env_status, EnvStatus};
 use crate::error::{AppError, Result};
 use crate::output::print_json;
 use crate::util::{
     dir_size, expect_no_args, log_file, session_diff_dir, snapshot_dir, tool_output_dir,
 };
 use rusqlite::Connection;
+use serde::Serialize;
 use std::collections::HashSet;
 use std::path::Path;
+
+/// One file entry in `fs clean-orphans` / `fs clean-tool-output`.
+#[derive(Serialize)]
+struct FileEntry {
+    file: String,
+    bytes: u64,
+}
+
+/// One entry in `fs clean-snapshots`.
+#[derive(Serialize)]
+struct SnapshotEntry {
+    name: String,
+    bytes: u64,
+}
+
+#[derive(Serialize)]
+struct OrphansOut {
+    #[serde(flatten)]
+    env: EnvStatus,
+    dry_run: bool,
+    dir: String,
+    orphans: Vec<FileEntry>,
+    total_files: usize,
+    total_bytes: u64,
+    deleted: bool,
+}
+
+#[derive(Serialize)]
+struct ToolOutputOut {
+    #[serde(flatten)]
+    env: EnvStatus,
+    dry_run: bool,
+    dir: String,
+    files: Vec<FileEntry>,
+    total_files: usize,
+    total_bytes: u64,
+    deleted: bool,
+}
+
+#[derive(Serialize)]
+struct SnapshotsOut {
+    #[serde(flatten)]
+    env: EnvStatus,
+    dry_run: bool,
+    dir: String,
+    entries: Vec<SnapshotEntry>,
+    total_bytes: u64,
+    deleted: bool,
+}
+
+#[derive(Serialize)]
+struct LogOut {
+    #[serde(flatten)]
+    env: EnvStatus,
+    dry_run: bool,
+    file: String,
+    bytes: u64,
+    deleted: bool,
+}
 
 /// Delete `storage/session_diff` files with no matching session.
 /// Safe while opencode runs: opencode only writes diff files for live
@@ -39,7 +99,7 @@ pub fn cmd_fs_clean_orphans(
         }
     }
 
-    let mut orphans: Vec<serde_json::Value> = Vec::new();
+    let mut orphans: Vec<FileEntry> = Vec::new();
     let mut total_bytes: u64 = 0;
     if let Ok(entries) = std::fs::read_dir(&dir) {
         for e in entries.flatten() {
@@ -55,28 +115,33 @@ pub fn cmd_fs_clean_orphans(
             }
             let bytes = e.metadata().map(|m| m.len()).unwrap_or(0);
             total_bytes += bytes;
-            orphans.push(serde_json::json!({ "file": sid, "bytes": bytes }));
+            orphans.push(FileEntry {
+                file: sid.to_string(),
+                bytes,
+            });
         }
     }
 
-    let mut out = db_status(db_path);
-    out["dry_run"] = serde_json::json!(dry_run);
-    out["dir"] = serde_json::json!(dir.to_string_lossy().to_string());
-    out["orphans"] = serde_json::json!(orphans);
-    out["total_files"] = serde_json::json!(orphans.len());
-    out["total_bytes"] = serde_json::json!(total_bytes);
-    out["deleted"] = serde_json::json!(false);
+    let mut out = OrphansOut {
+        env: env_status(db_path),
+        dry_run,
+        dir: dir.to_string_lossy().to_string(),
+        orphans,
+        total_files: 0,
+        total_bytes,
+        deleted: true,
+    };
+    out.total_files = out.orphans.len();
     if dry_run {
-        return print_json(&out);
+        out.deleted = false;
+        return print_json(&serde_json::to_value(&out)?);
     }
 
-    for o in &orphans {
-        let file = o["file"].as_str().unwrap();
-        std::fs::remove_file(dir.join(format!("{file}.json")))
-            .map_err(|e| AppError::db(format!("cannot remove {file}.json: {e}")))?;
+    for o in &out.orphans {
+        std::fs::remove_file(dir.join(format!("{}.json", o.file)))
+            .map_err(|e| AppError::db(format!("cannot remove {}.json: {e}", o.file)))?;
     }
-    out["deleted"] = serde_json::json!(true);
-    print_json(&out)
+    print_json(&serde_json::to_value(&out)?)
 }
 
 /// Delete all `tool-output` files (`tool_*`), like every other `clean-*`
@@ -86,7 +151,7 @@ pub fn cmd_fs_clean_orphans(
 pub fn cmd_fs_clean_tool_output(args: &[String], dry_run: bool, db_path: &Path) -> Result<()> {
     expect_no_args(args, "fs clean-tool-output")?;
     let dir = tool_output_dir(db_path);
-    let mut files: Vec<serde_json::Value> = Vec::new();
+    let mut files: Vec<FileEntry> = Vec::new();
     let mut total_bytes: u64 = 0;
     if let Ok(rd) = std::fs::read_dir(&dir) {
         for e in rd.flatten() {
@@ -99,28 +164,30 @@ pub fn cmd_fs_clean_tool_output(args: &[String], dry_run: bool, db_path: &Path) 
             }
             let bytes = e.metadata().map(|m| m.len()).unwrap_or(0);
             total_bytes += bytes;
-            files.push(serde_json::json!({ "file": name, "bytes": bytes }));
+            files.push(FileEntry { file: name, bytes });
         }
     }
 
-    let mut out = db_status(db_path);
-    out["dry_run"] = serde_json::json!(dry_run);
-    out["dir"] = serde_json::json!(dir.to_string_lossy().to_string());
-    out["files"] = serde_json::json!(files);
-    out["total_files"] = serde_json::json!(files.len());
-    out["total_bytes"] = serde_json::json!(total_bytes);
-    out["deleted"] = serde_json::json!(false);
+    let mut out = ToolOutputOut {
+        env: env_status(db_path),
+        dry_run,
+        dir: dir.to_string_lossy().to_string(),
+        files,
+        total_files: 0,
+        total_bytes,
+        deleted: true,
+    };
+    out.total_files = out.files.len();
     if dry_run {
-        return print_json(&out);
+        out.deleted = false;
+        return print_json(&serde_json::to_value(&out)?);
     }
 
-    for f in out["files"].as_array().unwrap() {
-        let name = f["file"].as_str().unwrap();
-        std::fs::remove_file(dir.join(name))
-            .map_err(|e| AppError::db(format!("cannot remove {name}: {e}")))?;
+    for f in &out.files {
+        std::fs::remove_file(dir.join(&f.file))
+            .map_err(|e| AppError::db(format!("cannot remove {}: {e}", f.file)))?;
     }
-    out["deleted"] = serde_json::json!(true);
-    print_json(&out)
+    print_json(&serde_json::to_value(&out)?)
 }
 
 /// Truncate `log/opencode.log` to zero bytes. Rotation (renaming) would
@@ -131,23 +198,25 @@ pub fn cmd_fs_clean_log(args: &[String], dry_run: bool, db_path: &Path) -> Resul
     expect_no_args(args, "fs clean-log")?;
     let file = log_file(db_path);
 
-    let mut out = db_status(db_path);
-    out["dry_run"] = serde_json::json!(dry_run);
-    out["file"] = serde_json::json!(file.to_string_lossy().to_string());
-    out["bytes"] = serde_json::json!(0);
-    out["deleted"] = serde_json::json!(false);
+    let mut out = LogOut {
+        env: env_status(db_path),
+        dry_run,
+        file: file.to_string_lossy().to_string(),
+        bytes: 0,
+        deleted: false,
+    };
     if !file.exists() {
-        return print_json(&out);
+        return print_json(&serde_json::to_value(&out)?);
     }
-    out["bytes"] = serde_json::json!(std::fs::metadata(&file).map(|m| m.len()).unwrap_or(0));
+    out.bytes = std::fs::metadata(&file).map(|m| m.len()).unwrap_or(0);
     if dry_run {
-        return print_json(&out);
+        return print_json(&serde_json::to_value(&out)?);
     }
 
     std::fs::write(&file, [])
         .map_err(|e| AppError::db(format!("cannot truncate {}: {e}", file.display())))?;
-    out["deleted"] = serde_json::json!(true);
-    print_json(&out)
+    out.deleted = true;
+    print_json(&serde_json::to_value(&out)?)
 }
 
 /// Delete all snapshot storage (undo/redo history). Guarded while
@@ -156,7 +225,7 @@ pub fn cmd_fs_clean_snapshots(args: &[String], dry_run: bool, db_path: &Path) ->
     expect_no_args(args, "fs clean-snapshots")?;
     let dir = snapshot_dir(db_path);
 
-    let mut entries: Vec<serde_json::Value> = Vec::new();
+    let mut entries: Vec<SnapshotEntry> = Vec::new();
     let mut total_bytes: u64 = 0;
     if let Ok(rd) = std::fs::read_dir(&dir) {
         for e in rd.flatten() {
@@ -166,31 +235,32 @@ pub fn cmd_fs_clean_snapshots(args: &[String], dry_run: bool, db_path: &Path) ->
             }
             let bytes = dir_size(&p);
             total_bytes += bytes;
-            entries.push(serde_json::json!({
-                "name": e.file_name().to_string_lossy().to_string(),
-                "bytes": bytes,
-            }));
+            entries.push(SnapshotEntry {
+                name: e.file_name().to_string_lossy().to_string(),
+                bytes,
+            });
         }
     }
 
-    let mut out = db_status(db_path);
-    out["dry_run"] = serde_json::json!(dry_run);
-    out["dir"] = serde_json::json!(dir.to_string_lossy().to_string());
-    out["entries"] = serde_json::json!(entries);
-    out["total_bytes"] = serde_json::json!(total_bytes);
-    out["deleted"] = serde_json::json!(false);
+    let mut out = SnapshotsOut {
+        env: env_status(db_path),
+        dry_run,
+        dir: dir.to_string_lossy().to_string(),
+        entries,
+        total_bytes,
+        deleted: true,
+    };
     if dry_run {
-        return print_json(&out);
+        out.deleted = false;
+        return print_json(&serde_json::to_value(&out)?);
     }
 
-    for e in &entries {
-        let name = e["name"].as_str().unwrap();
-        let p = dir.join(name);
+    for e in &out.entries {
+        let p = dir.join(&e.name);
         std::fs::remove_dir_all(&p)
-            .map_err(|err| AppError::db(format!("cannot remove snapshot {name}: {err}")))?;
+            .map_err(|err| AppError::db(format!("cannot remove snapshot {}: {err}", e.name)))?;
     }
-    out["deleted"] = serde_json::json!(true);
-    print_json(&out)
+    print_json(&serde_json::to_value(&out)?)
 }
 
 #[cfg(test)]
@@ -295,6 +365,35 @@ mod tests {
 
         cmd_fs_clean_snapshots(&[], false, &db_path).unwrap();
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn clean_orphans_output_contract() {
+        let out = OrphansOut {
+            env: crate::db::EnvStatus {
+                opencode_running: Some(false),
+                pids: Some(vec![]),
+                pid_error: None,
+                db: "/tmp/x.db".into(),
+            },
+            dry_run: true,
+            dir: "/d".into(),
+            orphans: vec![FileEntry {
+                file: "ses_orphan".into(),
+                bytes: 4,
+            }],
+            total_files: 1,
+            total_bytes: 4,
+            deleted: false,
+        };
+        let v = serde_json::to_value(&out).unwrap();
+        let expected = serde_json::json!({
+            "opencode_running": false, "pids": [], "db": "/tmp/x.db",
+            "dry_run": true, "dir": "/d",
+            "orphans": [ { "file": "ses_orphan", "bytes": 4 } ],
+            "total_files": 1, "total_bytes": 4, "deleted": false
+        });
+        assert_eq!(v, expected, "fs clean-orphans JSON contract changed");
     }
 
     #[test]

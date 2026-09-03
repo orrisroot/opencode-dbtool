@@ -2,7 +2,7 @@
 //! and in-memory filtering.
 
 use crate::util::{dt, round4};
-use serde_json::{json, Value};
+use serde::Serialize;
 
 #[derive(Clone)]
 pub struct SessionRow {
@@ -27,20 +27,46 @@ impl SessionRow {
     }
 }
 
-pub fn session_json(s: &SessionRow) -> Value {
-    json!({
-        "id": s.id,
-        "title": s.title,
-        "directory": s.directory,
-        "parent_id": s.parent_id,
-        "updated": dt(s.updated),
-        "msgs": s.msgs,
-        "parts": s.parts,
-        "events": s.events,
-        "size_bytes": s.size_bytes(),
-        "diff_bytes": s.diff_bytes,
-        "cost": round4(s.cost),
-    })
+/// JSON shape of a session in `session list` / `session show`.
+#[derive(Serialize)]
+pub struct SessionOut {
+    pub id: String,
+    pub title: String,
+    pub directory: String,
+    pub parent_id: Option<String>,
+    pub updated: String,
+    pub msgs: i64,
+    pub parts: i64,
+    pub events: i64,
+    pub size_bytes: i64,
+    pub diff_bytes: i64,
+    pub cost: f64,
+}
+
+pub fn session_json(s: &SessionRow) -> SessionOut {
+    SessionOut {
+        id: s.id.clone(),
+        title: s.title.clone(),
+        directory: s.directory.clone(),
+        parent_id: s.parent_id.clone(),
+        updated: dt(s.updated),
+        msgs: s.msgs,
+        parts: s.parts,
+        events: s.events,
+        size_bytes: s.size_bytes(),
+        diff_bytes: s.diff_bytes,
+        cost: round4(s.cost),
+    }
+}
+
+/// Lightweight session fields used by filter selection (no per-table
+/// aggregates). Ordering matches `load_session_meta`.
+#[derive(Clone)]
+pub struct SessionMeta {
+    pub id: String,
+    pub directory: String,
+    pub parent_id: Option<String>,
+    pub updated: i64,
 }
 
 /// Filters for `session purge` / `session strip-reasoning`; set filters
@@ -80,20 +106,19 @@ impl PurgeFilter {
             && self.keep_latest_raw.is_none()
     }
 
+    /// Same as `matches_meta` plus the size check (which needs the
+    /// per-table aggregates); used by unit tests and `--larger-than`
+    /// callers that already hold a `SessionRow`.
+    #[cfg(test)]
     pub fn matches(&self, s: &SessionRow) -> bool {
-        if let Some(cutoff) = self.cutoff_ms {
-            if s.updated >= cutoff {
-                return false;
-            }
-        }
-        if self.subagents && s.parent_id.is_none() {
+        let meta = SessionMeta {
+            id: s.id.clone(),
+            directory: s.directory.clone(),
+            parent_id: s.parent_id.clone(),
+            updated: s.updated,
+        };
+        if !self.matches_meta(&meta) {
             return false;
-        }
-        if !self.paths.is_empty() {
-            let dir = s.directory.trim_end_matches('/');
-            if !self.paths.iter().any(|p| p.trim_end_matches('/') == dir) {
-                return false;
-            }
         }
         if let Some(min) = self.larger_than_bytes {
             if s.size_bytes() <= min {
@@ -103,16 +128,46 @@ impl PurgeFilter {
         true
     }
 
-    /// Stable JSON contract for the `filters` field in purge output.
-    pub fn json(&self) -> Value {
-        json!({
-            "older_than": self.older_than_raw,
-            "subagents": self.subagents,
-            "paths": self.paths,
-            "larger_than": self.larger_than_raw,
-            "keep_latest": self.keep_latest_raw,
-        })
+    /// Same as `matches` minus the size check (which needs the
+    /// per-table aggregates); used with `SessionMeta`.
+    pub fn matches_meta(&self, m: &SessionMeta) -> bool {
+        if let Some(cutoff) = self.cutoff_ms {
+            if m.updated >= cutoff {
+                return false;
+            }
+        }
+        if self.subagents && m.parent_id.is_none() {
+            return false;
+        }
+        if !self.paths.is_empty() {
+            let dir = m.directory.trim_end_matches('/');
+            if !self.paths.iter().any(|p| p.trim_end_matches('/') == dir) {
+                return false;
+            }
+        }
+        true
     }
+
+    /// Stable JSON contract for the `filters` field in purge output.
+    pub fn json(&self) -> PurgeFilterJson {
+        PurgeFilterJson {
+            older_than: self.older_than_raw.clone(),
+            subagents: self.subagents,
+            paths: self.paths.clone(),
+            larger_than: self.larger_than_raw.clone(),
+            keep_latest: self.keep_latest_raw.clone(),
+        }
+    }
+}
+
+/// JSON contract for `session purge` / `strip-reasoning` filters.
+#[derive(Serialize)]
+pub struct PurgeFilterJson {
+    pub older_than: Option<String>,
+    pub subagents: bool,
+    pub paths: Vec<String>,
+    pub larger_than: Option<String>,
+    pub keep_latest: Option<String>,
 }
 
 #[derive(Clone)]
@@ -135,19 +190,34 @@ pub fn project_total_bytes(p: &ProjectRow) -> i64 {
     p.msg_bytes + p.part_bytes + p.event_bytes
 }
 
-pub fn project_json(p: &ProjectRow) -> Value {
-    json!({
-        "id": p.id,
-        "worktree": p.worktree,
-        "name": p.name,
-        "sessions": p.sessions,
-        "msgs": p.msgs,
-        "parts": p.parts,
-        "events": p.events,
-        "size_bytes": project_total_bytes(p),
-        "cost": round4(p.cost),
-        "updated": dt(p.updated),
-    })
+/// JSON shape of a project in `project list` / `project show`.
+#[derive(Serialize)]
+pub struct ProjectOut {
+    pub id: String,
+    pub worktree: String,
+    pub name: String,
+    pub sessions: i64,
+    pub msgs: i64,
+    pub parts: i64,
+    pub events: i64,
+    pub size_bytes: i64,
+    pub cost: f64,
+    pub updated: String,
+}
+
+pub fn project_json(p: &ProjectRow) -> ProjectOut {
+    ProjectOut {
+        id: p.id.clone(),
+        worktree: p.worktree.clone(),
+        name: p.name.clone(),
+        sessions: p.sessions,
+        msgs: p.msgs,
+        parts: p.parts,
+        events: p.events,
+        size_bytes: project_total_bytes(p),
+        cost: round4(p.cost),
+        updated: dt(p.updated),
+    }
 }
 
 /// Filter projects by exact worktree match (trailing slash tolerant, OR).
@@ -196,12 +266,19 @@ impl ProjectFilter {
     }
 
     /// Stable JSON contract for the `filters` field in purge output.
-    pub fn json(&self) -> Value {
-        json!({
-            "older_than": self.older_than_raw,
-            "paths": self.paths,
-        })
+    pub fn json(&self) -> ProjectFilterJson {
+        ProjectFilterJson {
+            older_than: self.older_than_raw.clone(),
+            paths: self.paths.clone(),
+        }
     }
+}
+
+/// JSON contract for `project purge` filters.
+#[derive(Serialize)]
+pub struct ProjectFilterJson {
+    pub older_than: Option<String>,
+    pub paths: Vec<String>,
 }
 
 #[cfg(test)]
@@ -209,6 +286,57 @@ mod tests {
     use super::*;
     use crate::repo::load_projects;
     use crate::testdb;
+
+    #[test]
+    fn session_output_contract() {
+        let s = SessionRow {
+            id: "ses_1".into(),
+            title: "t".into(),
+            directory: "/a".into(),
+            parent_id: None,
+            updated: 1136214245000,
+            msgs: 1,
+            msg_bytes: 10,
+            parts: 2,
+            part_bytes: 20,
+            events: 3,
+            event_bytes: 30,
+            diff_bytes: 5,
+            cost: 0.004594,
+        };
+        let v = serde_json::to_value(session_json(&s)).unwrap();
+        let expected = serde_json::json!({
+            "id": "ses_1", "title": "t", "directory": "/a", "parent_id": null,
+            "updated": "2006-01-02T15:04:05Z", "msgs": 1, "parts": 2, "events": 3,
+            "size_bytes": 60, "diff_bytes": 5, "cost": 0.0046
+        });
+        assert_eq!(v, expected, "session JSON contract changed");
+    }
+
+    #[test]
+    fn project_output_contract() {
+        let p = ProjectRow {
+            id: "p1".into(),
+            worktree: "/w".into(),
+            name: "n".into(),
+            sessions: 1,
+            msgs: 1,
+            msg_bytes: 10,
+            parts: 2,
+            part_bytes: 20,
+            events: 3,
+            event_bytes: 30,
+            cost: 0.004594,
+            updated: 1136214245000,
+        };
+        let v = serde_json::to_value(project_json(&p)).unwrap();
+        let expected = serde_json::json!({
+            "id": "p1", "worktree": "/w", "name": "n", "sessions": 1,
+            "msgs": 1, "parts": 2, "events": 3, "size_bytes": 60,
+            "cost": 0.0046, "updated": "2006-01-02T15:04:05Z"
+        });
+        assert_eq!(v, expected, "project JSON contract changed");
+    }
 
     fn row(dir: &str) -> SessionRow {
         SessionRow {

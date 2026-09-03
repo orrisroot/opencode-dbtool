@@ -46,7 +46,7 @@ cargo build --release   # -> target/release/opencode-dbtool
 | `fs clean-snapshots` | delete all snapshot (undo/redo) storage |
 | `fs clean-tool-output` | delete all truncated tool output |
 | `fs clean-log` | truncate log/opencode.log to zero bytes |
-| `vacuum [--no-backup]` | run VACUUM (backup + verify by default) |
+| `vacuum [--no-backup] [--keep-backups <n>]` | run VACUUM (backup + verify by default) |
 
 All ids are matched exactly (no prefix/substring resolution). In `purge` /
 `strip-reasoning`, `--path <dir>` is an exact match against the session
@@ -440,7 +440,10 @@ failure), create a **timestamped backup** of the database file
 (abort on failure), VACUUM, restore `journal_mode = WAL`, checkpoint, and
 run a final integrity check. The backup is created by default and is kept
 until you verify opencode works correctly; it needs free disk space equal
-to the database size. `--no-backup` skips the backup. In dry-run mode the
+to the database size. `--no-backup` skips the backup. `--keep-backups <n>`
+keeps only the newest `<n>` backups found after a successful run and
+deletes the older `opencode.db.backup-*` files (it cannot be combined
+with `--no-backup`). In dry-run mode the
 planned backup path and size are reported and nothing is written.
 
 ```json
@@ -456,12 +459,25 @@ planned backup path and size are reported and nothing is written.
 }
 ```
 
+With `--keep-backups <n>` (at least 1), a `backup_cleanup` block is
+added on a real run (dry-run reports nothing since no backup is touched):
+
+```json
+"backup_cleanup": { "kept": 3, "removed_files": 7, "removed_bytes": 52428800 }
+```
+
 ## Flags
 
 | flag | meaning |
 | --- | --- |
 | `--dry-run`, `-n` | print actions without changing anything (safe while opencode runs) |
+| `--yes`, `-y` | confirm a destructive command; required for every real (non-dry-run) run of `delete`, `purge`, `strip-reasoning`, `fs clean-*`, and `vacuum` |
 | `--no-backup` | `vacuum` only: skip the timestamped backup (dangerous) |
+
+Destructive commands refuse to run without `--yes` or `--dry-run`
+(exit code 2): share the JSON output shape, and use `--dry-run` to
+preview the impact before confirming with `--yes`. `--dry-run` and
+`--yes` may be passed anywhere on the command line.
 
 ## Exit codes
 
@@ -489,9 +505,12 @@ matching busy timeout, so concurrent reads never wedge.
 - `stats`, `doctor`, `project list/show`, `session list/show`,
   `fs clean-orphans`, and `fs clean-tool-output` are safe while opencode
   runs.
-- Running instances are detected by process name (`opencode`,
-  `opencode-server`) via the [sysinfo](https://crates.io/crates/sysinfo)
-  crate, which works on Linux, macOS, and Windows.
+- Running instances are detected by process name, executable path, and
+  command line (`opencode`, `opencode-server`) via the
+  [sysinfo](https://crates.io/crates/sysinfo) crate, which works on
+  Linux, macOS, and Windows. Command-line matching only accepts
+  invocations (e.g. `/usr/bin/opencode`), not references to opencode's
+  data files.
 - `delete`, `purge`, `strip-reasoning`, `fs clean-snapshots`,
   `fs clean-log`, and `vacuum` are **refused while opencode runs** (exit
   1); close opencode and retry.

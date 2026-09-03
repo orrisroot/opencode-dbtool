@@ -33,9 +33,9 @@ pub fn create_at(path: &Path) -> Connection {
 fn schema(con: &Connection) {
     con.execute_batch(
         "CREATE TABLE project (id TEXT PRIMARY KEY, worktree TEXT, name TEXT);
-         CREATE TABLE session (id TEXT PRIMARY KEY, directory TEXT, title TEXT, parent_id TEXT, project_id TEXT REFERENCES project(id) ON DELETE CASCADE, time_updated INTEGER, cost REAL);
-         CREATE TABLE message (session_id TEXT, data BLOB, time_created INTEGER NOT NULL DEFAULT 0);
-         CREATE TABLE part (session_id TEXT, data TEXT, time_created INTEGER NOT NULL DEFAULT 0);
+         CREATE TABLE session (id TEXT PRIMARY KEY, directory TEXT, title TEXT, parent_id TEXT, project_id TEXT REFERENCES project(id) ON DELETE CASCADE, workspace_id TEXT, time_updated INTEGER, cost REAL);
+         CREATE TABLE message (id TEXT, session_id TEXT, data BLOB, time_created INTEGER NOT NULL DEFAULT 0);
+         CREATE TABLE part (session_id TEXT, message_id TEXT, data TEXT, time_created INTEGER NOT NULL DEFAULT 0);
          CREATE TABLE todo (session_id TEXT);
          CREATE TABLE event (aggregate_id TEXT, type TEXT, data BLOB);
          CREATE TABLE event_sequence (aggregate_id TEXT);
@@ -45,7 +45,7 @@ fn schema(con: &Connection) {
          CREATE TABLE session_context_epoch (session_id TEXT);
          CREATE TABLE permission (project_id TEXT);
          CREATE TABLE project_directory (project_id TEXT);
-         CREATE TABLE workspace (project_id TEXT);",
+         CREATE TABLE workspace (id TEXT PRIMARY KEY, project_id TEXT);",
     )
     .unwrap();
 }

@@ -1,13 +1,57 @@
 //! `project` subcommands: list, show, delete, purge.
 
-use crate::db::db_status;
+use crate::db::{env_status, EnvStatus};
 use crate::error::{AppError, Result};
-use crate::models::{filter_projects, project_json, ProjectFilter, ProjectRow};
+use crate::models::{
+    filter_projects, project_json, ProjectFilter, ProjectFilterJson, ProjectOut, ProjectRow,
+};
 use crate::output::print_json;
-use crate::repo::{load_projects, lookup_project, project_impact};
-use crate::util::{dt, now_ms, parse_age_ms, round4};
+use crate::repo::{load_project, load_projects, lookup_project, project_impact};
+use crate::util::{now_ms, parse_age_ms};
 use rusqlite::{params, Connection};
+use serde::Serialize;
 use std::path::Path;
+
+/// One session row in `project show`'s `session_list`.
+#[derive(Serialize)]
+struct SessionDetailOut {
+    id: String,
+    title: String,
+    parent_id: Option<String>,
+    updated: String,
+    msgs: i64,
+    parts: i64,
+    events: i64,
+    cost: f64,
+}
+
+/// One project in a delete/purge preview.
+#[derive(Serialize)]
+struct ProjectBriefOut {
+    id: String,
+    worktree: String,
+}
+
+#[derive(Serialize)]
+struct ProjectDeleteOut {
+    #[serde(flatten)]
+    env: EnvStatus,
+    dry_run: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    action: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    filters: Option<ProjectFilterJson>,
+    total_rows: i64,
+    projects: Vec<ProjectBriefOut>,
+    rows: serde_json::Map<String, serde_json::Value>,
+    deleted: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    diff_files_removed: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    diff_bytes_removed: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    note: Option<String>,
+}
 
 pub fn cmd_project_list(con: &Connection, args: &[String]) -> Result<()> {
     let mut paths: Vec<&str> = Vec::new();
@@ -24,11 +68,11 @@ pub fn cmd_project_list(con: &Connection, args: &[String]) -> Result<()> {
         }
     }
     let projects = load_projects(con)?;
-    let arr: Vec<serde_json::Value> = filter_projects(&projects, &paths)
+    let arr: Vec<ProjectOut> = filter_projects(&projects, &paths)
         .iter()
         .map(|p| project_json(p))
         .collect();
-    print_json(&serde_json::json!(arr))
+    print_json(&serde_json::to_value(arr)?)
 }
 
 pub fn cmd_project_show(con: &Connection, args: &[String]) -> Result<()> {
@@ -38,37 +82,15 @@ pub fn cmd_project_show(con: &Connection, args: &[String]) -> Result<()> {
         ));
     }
     let id = args[0].trim();
-    let proj = lookup_project(con, id, false)?
+    let proj = load_project(con, id)?
         .ok_or_else(|| AppError::usage(format!("project not found: {id}")))?;
-    let all = load_projects(con)?;
-    print_json(&project_detail(con, &all, proj)?)
-}
-
-/// One session row in `project show`'s `session_list`.
-struct SessionDetail {
-    id: String,
-    title: String,
-    parent_id: Option<String>,
-    updated: i64,
-    msgs: i64,
-    parts: i64,
-    events: i64,
-    cost: f64,
+    print_json(&project_detail(con, proj)?)
 }
 
 /// Project object plus per-session breakdown.
-fn project_detail(
-    con: &Connection,
-    all: &[ProjectRow],
-    proj: ProjectRow,
-) -> Result<serde_json::Value> {
-    let full = all
-        .iter()
-        .find(|p| p.id == proj.id)
-        .cloned()
-        .unwrap_or(proj);
-    let mut out = project_json(&full);
-    let sessions: Vec<SessionDetail> = {
+fn project_detail(con: &Connection, full: ProjectRow) -> Result<serde_json::Value> {
+    let mut out = serde_json::to_value(project_json(&full))?;
+    let sessions: Vec<SessionDetailOut> = {
         let mut stmt = con.prepare(
             "SELECT id, title, parent_id, time_updated, \
              (SELECT COUNT(*) FROM message m WHERE m.session_id = s.id), \
@@ -78,35 +100,20 @@ fn project_detail(
              FROM session s WHERE s.project_id = ?1 ORDER BY s.time_updated DESC",
         )?;
         let rows = stmt.query_map(params![full.id], |r| {
-            Ok(SessionDetail {
+            Ok(SessionDetailOut {
                 id: r.get(0)?,
                 title: r.get(1)?,
                 parent_id: r.get(2)?,
-                updated: r.get(3)?,
+                updated: crate::util::dt(r.get::<_, i64>(3)?),
                 msgs: r.get(4)?,
                 parts: r.get(5)?,
                 events: r.get(6)?,
-                cost: r.get(7)?,
+                cost: crate::util::round4(r.get::<_, f64>(7)?),
             })
         })?;
         rows.collect::<std::result::Result<Vec<_>, _>>()?
     };
-    let sessions_arr: Vec<serde_json::Value> = sessions
-        .iter()
-        .map(|s| {
-            serde_json::json!({
-                "id": s.id,
-                "title": s.title,
-                "parent_id": s.parent_id,
-                "updated": dt(s.updated),
-                "msgs": s.msgs,
-                "parts": s.parts,
-                "events": s.events,
-                "cost": round4(s.cost),
-            })
-        })
-        .collect();
-    out["session_list"] = serde_json::json!(sessions_arr);
+    out["session_list"] = serde_json::to_value(sessions)?;
     Ok(out)
 }
 
@@ -223,13 +230,11 @@ fn delete_output(
     db_path: &Path,
     filters: Option<&ProjectFilter>,
 ) -> Result<()> {
-    let projects_json: Vec<serde_json::Value> = projects
+    let projects_json: Vec<ProjectBriefOut> = projects
         .iter()
-        .map(|p| {
-            serde_json::json!({
-                "id": p.id,
-                "worktree": p.worktree,
-            })
+        .map(|p| ProjectBriefOut {
+            id: p.id.clone(),
+            worktree: p.worktree.clone(),
         })
         .collect();
     let mut rows_map = serde_json::Map::new();
@@ -241,18 +246,21 @@ fn delete_output(
             total += n;
         }
     }
-    let mut out = db_status(db_path);
-    out["dry_run"] = serde_json::json!(dry_run);
-    if let Some(f) = filters {
-        out["action"] = serde_json::json!("delete");
-        out["filters"] = f.json();
-    }
-    out["total_rows"] = serde_json::json!(total);
-    out["projects"] = serde_json::json!(projects_json);
-    out["rows"] = serde_json::json!(rows_map);
-    out["deleted"] = serde_json::json!(false);
+    let mut out = ProjectDeleteOut {
+        env: env_status(db_path),
+        dry_run,
+        action: filters.map(|_| "delete".to_string()),
+        filters: filters.map(|f| f.json()),
+        total_rows: total,
+        projects: projects_json,
+        rows: rows_map,
+        deleted: false,
+        diff_files_removed: None,
+        diff_bytes_removed: None,
+        note: None,
+    };
     if dry_run {
-        return print_json(&out);
+        return print_json(&serde_json::to_value(&out)?);
     }
 
     let plist: String = (1..=projects.len())
@@ -310,11 +318,11 @@ fn delete_output(
         ));
     }
     let (diff_files, diff_bytes) = remove_diff_files(db_path, &session_ids);
-    out["deleted"] = serde_json::json!(true);
-    out["diff_files_removed"] = serde_json::json!(diff_files);
-    out["diff_bytes_removed"] = serde_json::json!(diff_bytes);
-    out["note"] = serde_json::json!("file size is unchanged until `opencode-dbtool vacuum` is run");
-    print_json(&out)
+    out.deleted = true;
+    out.diff_files_removed = Some(diff_files);
+    out.diff_bytes_removed = Some(diff_bytes);
+    out.note = Some("file size is unchanged until `opencode-dbtool vacuum` is run".into());
+    print_json(&serde_json::to_value(&out)?)
 }
 
 /// Best-effort removal of `storage/session_diff/<id>.json` files;

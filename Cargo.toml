@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 rusqlite = { version = "0.37", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 sysinfo = "0.39.6"
 

@@ -4,6 +4,11 @@ use crate::error::{AppError, Result};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+/// SQLite's per-statement variable limit depends on the build (commonly
+/// 32,766); keep `IN (...)` chunks well below the common limits so
+/// batch queries never hit "too many SQL variables".
+pub const SQL_VAR_CHUNK: usize = 900;
+
 /// Current time in epoch milliseconds.
 pub fn now_ms() -> Result<i64> {
     Ok(SystemTime::now()

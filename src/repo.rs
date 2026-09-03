@@ -3,16 +3,133 @@
 //! and testable against a fake schema.
 
 use crate::error::{AppError, Result};
-use crate::models::{ProjectRow, SessionRow};
+use crate::models::{ProjectRow, SessionMeta, SessionRow};
 use rusqlite::{params, Connection};
+use std::collections::HashMap;
+use std::path::Path;
 
-pub fn session_exists(con: &Connection, id: &str) -> Result<bool> {
-    let n: i64 = con.query_row(
-        "SELECT COUNT(*) FROM session WHERE id = ?1",
-        params![id],
-        |r| r.get(0),
+/// Column list shared by `load_sessions` and `load_session`: the 12
+/// session columns plus per-session message/part/event counts and sizes.
+const SESSION_COLS: &str = "s.id, s.title, s.directory, s.parent_id, s.time_updated, s.cost, \
+     (SELECT COUNT(*) FROM message m WHERE m.session_id = s.id), \
+     (SELECT COALESCE(SUM(length(CAST(m.data AS BLOB))),0) FROM message m WHERE m.session_id = s.id), \
+     (SELECT COUNT(*) FROM part p WHERE p.session_id = s.id), \
+     (SELECT COALESCE(SUM(length(CAST(p.data AS BLOB))),0) FROM part p WHERE p.session_id = s.id), \
+     (SELECT COUNT(*) FROM event e WHERE e.aggregate_id = s.id), \
+     (SELECT COALESCE(SUM(length(CAST(e.data AS BLOB))),0) FROM event e WHERE e.aggregate_id = s.id)";
+
+/// Session row columns as read by SQLite (per-session aggregates
+/// included), before `diff_bytes` is attached.
+struct SessionAgg {
+    id: String,
+    title: String,
+    directory: String,
+    parent_id: Option<String>,
+    updated: i64,
+    cost: f64,
+    msgs: i64,
+    msg_bytes: i64,
+    parts: i64,
+    part_bytes: i64,
+    events: i64,
+    event_bytes: i64,
+}
+
+fn read_session_row(r: &rusqlite::Row) -> rusqlite::Result<SessionAgg> {
+    Ok(SessionAgg {
+        id: r.get(0)?,
+        title: r.get(1)?,
+        directory: r.get(2)?,
+        parent_id: r.get(3)?,
+        updated: r.get(4)?,
+        cost: r.get(5)?,
+        msgs: r.get(6)?,
+        msg_bytes: r.get(7)?,
+        parts: r.get(8)?,
+        part_bytes: r.get(9)?,
+        events: r.get(10)?,
+        event_bytes: r.get(11)?,
+    })
+}
+
+fn diff_bytes_for(dir: Option<&Path>, id: &str) -> i64 {
+    dir.map(|d| {
+        std::fs::metadata(d.join(format!("{id}.json")))
+            .map(|m| m.len() as i64)
+            .unwrap_or(0)
+    })
+    .unwrap_or(0)
+}
+
+fn make_session_row(a: SessionAgg, diff_dir: Option<&Path>) -> SessionRow {
+    let diff_bytes = diff_bytes_for(diff_dir, &a.id);
+    SessionRow {
+        id: a.id,
+        title: a.title,
+        directory: a.directory,
+        parent_id: a.parent_id,
+        updated: a.updated,
+        msgs: a.msgs,
+        msg_bytes: a.msg_bytes,
+        parts: a.parts,
+        part_bytes: a.part_bytes,
+        events: a.events,
+        event_bytes: a.event_bytes,
+        diff_bytes,
+        cost: a.cost,
+    }
+}
+
+/// Light session fields for filter selection, ordered by
+/// `time_updated` desc (id as tiebreaker), the same order `load_sessions`
+/// uses.
+pub fn load_session_meta(con: &Connection) -> Result<Vec<SessionMeta>> {
+    let mut stmt = con.prepare(
+        "SELECT id, directory, parent_id, time_updated FROM session \
+         ORDER BY time_updated DESC, id",
     )?;
-    Ok(n > 0)
+    let rows = stmt.query_map([], |r| {
+        Ok(SessionMeta {
+            id: r.get(0)?,
+            directory: r.get(1)?,
+            parent_id: r.get(2)?,
+            updated: r.get(3)?,
+        })
+    })?;
+    Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+}
+
+/// Own size (msg+part+event bytes) per session for the given ids, using
+/// one batched GROUP BY query per table (chunked to stay under SQLite's
+/// variable limit) instead of per-session scans. Sessions without rows
+/// in a table contribute 0.
+pub fn session_sizes(con: &Connection, ids: &[String]) -> Result<HashMap<String, i64>> {
+    let mut map: HashMap<String, i64> = HashMap::new();
+    if ids.is_empty() {
+        return Ok(map);
+    }
+    for (table, id_col) in [
+        ("message", "session_id"),
+        ("part", "session_id"),
+        ("event", "aggregate_id"),
+    ] {
+        for chunk in ids.chunks(crate::util::SQL_VAR_CHUNK) {
+            let sql = format!(
+                "SELECT {id_col}, COALESCE(SUM(length(CAST(data AS BLOB))),0) \
+                 FROM {table} WHERE {id_col} IN ({}) GROUP BY {id_col}",
+                in_clause(chunk)
+            );
+            let mut stmt = con.prepare(&sql)?;
+            let rows = stmt.query_map(rusqlite::params_from_iter(chunk), |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+            })?;
+            for r in rows {
+                let (id, bytes) = r?;
+                *map.entry(id).or_insert(0) += bytes;
+            }
+        }
+    }
+    Ok(map)
 }
 
 /// Direct children of a session (recursive subagent sessions).
@@ -42,140 +159,109 @@ pub fn resolve_session_ids(con: &Connection, id_args: &[&str]) -> Result<Vec<Str
 /// All sessions with per-session message/part/event counts and sizes.
 /// When `diff_dir` is given, each session's `diff_bytes` is read from
 /// `<diff_dir>/<id>.json` (0 when missing).
-pub fn load_sessions(
-    con: &Connection,
-    diff_dir: Option<&std::path::Path>,
-) -> Result<Vec<SessionRow>> {
-    let mut stmt = con.prepare(
-        "SELECT s.id, s.title, s.directory, s.parent_id, s.time_updated, s.cost, \
-         (SELECT COUNT(*) FROM message m WHERE m.session_id = s.id), \
-         (SELECT COALESCE(SUM(length(CAST(m.data AS BLOB))),0) FROM message m WHERE m.session_id = s.id), \
-         (SELECT COUNT(*) FROM part p WHERE p.session_id = s.id), \
-         (SELECT COALESCE(SUM(length(CAST(p.data AS BLOB))),0) FROM part p WHERE p.session_id = s.id), \
-         (SELECT COUNT(*) FROM event e WHERE e.aggregate_id = s.id), \
-         (SELECT COALESCE(SUM(length(CAST(e.data AS BLOB))),0) FROM event e WHERE e.aggregate_id = s.id) \
-         FROM session s ORDER BY s.time_updated DESC, s.id",
-    )?;
-    let rows = stmt.query_map([], |r| {
-        Ok((
-            r.get::<_, String>(0)?,
-            r.get::<_, String>(1)?,
-            r.get::<_, String>(2)?,
-            r.get::<_, Option<String>>(3)?,
-            r.get::<_, i64>(4)?,
-            r.get::<_, f64>(5)?,
-            r.get::<_, i64>(6)?,
-            r.get::<_, i64>(7)?,
-            r.get::<_, i64>(8)?,
-            r.get::<_, i64>(9)?,
-            r.get::<_, i64>(10)?,
-            r.get::<_, i64>(11)?,
-        ))
-    })?;
+pub fn load_sessions(con: &Connection, diff_dir: Option<&Path>) -> Result<Vec<SessionRow>> {
+    let sql = format!("SELECT {SESSION_COLS} FROM session s ORDER BY s.time_updated DESC, s.id");
+    let mut stmt = con.prepare(&sql)?;
+    let rows = stmt.query_map([], read_session_row)?;
     let mut out = Vec::new();
     for r in rows {
-        let (
-            id,
-            title,
-            directory,
-            parent_id,
-            updated,
-            cost,
-            msgs,
-            msg_bytes,
-            parts,
-            part_bytes,
-            events,
-            event_bytes,
-        ) = r?;
-        let diff_bytes = match diff_dir {
-            Some(dir) => std::fs::metadata(dir.join(format!("{id}.json")))
-                .map(|m| m.len() as i64)
-                .unwrap_or(0),
-            None => 0,
-        };
-        out.push(SessionRow {
-            id,
-            title,
-            directory,
-            parent_id,
-            updated,
-            msgs,
-            msg_bytes,
-            parts,
-            part_bytes,
-            events,
-            event_bytes,
-            diff_bytes,
-            cost,
-        });
+        let a = r?;
+        out.push(make_session_row(a, diff_dir));
     }
     Ok(out)
 }
 
-/// All projects with aggregated session stats.
-pub fn load_projects(con: &Connection) -> Result<Vec<ProjectRow>> {
-    let mut stmt = con.prepare(
-        "SELECT p.id, p.worktree, COALESCE(p.name,''), \
-         (SELECT COUNT(*) FROM session s WHERE s.project_id = p.id), \
-         (SELECT COALESCE(SUM((SELECT COUNT(*) FROM message m WHERE m.session_id = s.id)),0) FROM session s WHERE s.project_id = p.id), \
-          (SELECT COALESCE(SUM((SELECT COALESCE(SUM(length(CAST(m.data AS BLOB))),0) FROM message m WHERE m.session_id = s.id)),0) FROM session s WHERE s.project_id = p.id), \
-         (SELECT COALESCE(SUM((SELECT COUNT(*) FROM part p2 WHERE p2.session_id = s.id)),0) FROM session s WHERE s.project_id = p.id), \
-          (SELECT COALESCE(SUM((SELECT COALESCE(SUM(length(CAST(p2.data AS BLOB))),0) FROM part p2 WHERE p2.session_id = s.id)),0) FROM session s WHERE s.project_id = p.id), \
-         (SELECT COALESCE(SUM((SELECT COUNT(*) FROM event e WHERE e.aggregate_id = s.id)),0) FROM session s WHERE s.project_id = p.id), \
-          (SELECT COALESCE(SUM((SELECT COALESCE(SUM(length(CAST(e.data AS BLOB))),0) FROM event e WHERE e.aggregate_id = s.id)),0) FROM session s WHERE s.project_id = p.id), \
-         (SELECT COALESCE(SUM(s.cost),0) FROM session s WHERE s.project_id = p.id), \
-         (SELECT COALESCE(MAX(s.time_updated),0) FROM session s WHERE s.project_id = p.id) \
-         FROM project p ORDER BY p.worktree",
-    )?;
-    let rows = stmt.query_map([], |r| {
-        Ok((
-            r.get::<_, String>(0)?,
-            r.get::<_, String>(1)?,
-            r.get::<_, String>(2)?,
-            r.get::<_, i64>(3)?,
-            r.get::<_, i64>(4)?,
-            r.get::<_, i64>(5)?,
-            r.get::<_, i64>(6)?,
-            r.get::<_, i64>(7)?,
-            r.get::<_, i64>(8)?,
-            r.get::<_, i64>(9)?,
-            r.get::<_, f64>(10)?,
-            r.get::<_, i64>(11)?,
-        ))
-    })?;
-    let mut out = Vec::new();
-    for r in rows {
-        let (
-            id,
-            worktree,
-            name,
-            sessions,
-            msgs,
-            msg_bytes,
-            parts,
-            part_bytes,
-            events,
-            event_bytes,
-            cost,
-            updated,
-        ) = r?;
-        out.push(ProjectRow {
-            id,
-            worktree,
-            name,
-            sessions,
-            msgs,
-            msg_bytes,
-            parts,
-            part_bytes,
-            events,
-            event_bytes,
-            cost,
-            updated,
-        });
+/// A single session by exact id, with the same aggregate columns as
+/// `load_sessions`; `None` when the id is unknown.
+pub fn load_session(
+    con: &Connection,
+    id: &str,
+    diff_dir: Option<&Path>,
+) -> Result<Option<SessionRow>> {
+    let sql = format!("SELECT {SESSION_COLS} FROM session s WHERE s.id = ?1");
+    match con.query_row(&sql, params![id], read_session_row) {
+        Ok(a) => Ok(Some(make_session_row(a, diff_dir))),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(AppError::db(e.to_string())),
     }
-    Ok(out)
+}
+
+/// All projects with aggregated session stats. The aggregation subqueries
+/// scan each table once (GROUP BY project) instead of running correlated
+/// counts per session/project.
+pub fn load_projects(con: &Connection) -> Result<Vec<ProjectRow>> {
+    let sql = format!(
+        "SELECT p.id, p.worktree, COALESCE(p.name,''), \
+         COALESCE(s.sessions,0), \
+         COALESCE(m.msgs,0), COALESCE(m.msg_bytes,0), \
+         COALESCE(parts.parts,0), COALESCE(parts.part_bytes,0), \
+         COALESCE(e.events,0), COALESCE(e.event_bytes,0), \
+         COALESCE(s.cost,0), COALESCE(s.updated,0) \
+         {FROM_PROJECTS} ORDER BY p.worktree",
+        FROM_PROJECTS = from_projects()
+    );
+    let mut stmt = con.prepare(&sql)?;
+    let rows = stmt.query_map([], read_project_row)?;
+    Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+}
+
+/// A single project by exact id with the same aggregated stats;
+/// `None` when the id is unknown.
+pub fn load_project(con: &Connection, id: &str) -> Result<Option<ProjectRow>> {
+    let sql = format!(
+        "SELECT p.id, p.worktree, COALESCE(p.name,''), \
+         COALESCE(s.sessions,0), \
+         COALESCE(m.msgs,0), COALESCE(m.msg_bytes,0), \
+         COALESCE(parts.parts,0), COALESCE(parts.part_bytes,0), \
+         COALESCE(e.events,0), COALESCE(e.event_bytes,0), \
+         COALESCE(s.cost,0), COALESCE(s.updated,0) \
+         {FROM_PROJECTS} WHERE p.id = ?1",
+        FROM_PROJECTS = from_projects()
+    );
+    match con.query_row(&sql, params![id], read_project_row) {
+        Ok(row) => Ok(Some(row)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(AppError::db(e.to_string())),
+    }
+}
+
+/// Shared FROM/JOIN clause for project aggregation queries: session
+/// stats (count/cost/latest activity) plus per-table message/part/event
+/// aggregates, one grouping subquery per table.
+fn from_projects() -> &'static str {
+    "FROM project p \
+     LEFT JOIN (SELECT project_id, COUNT(*) sessions, COALESCE(SUM(cost),0) cost, \
+                MAX(time_updated) updated \
+                FROM session GROUP BY project_id) s ON s.project_id = p.id \
+     LEFT JOIN (SELECT s2.project_id, COUNT(*) msgs, \
+                COALESCE(SUM(length(CAST(m.data AS BLOB))),0) msg_bytes \
+                FROM session s2 JOIN message m ON m.session_id = s2.id \
+                GROUP BY s2.project_id) m ON m.project_id = p.id \
+     LEFT JOIN (SELECT s2.project_id, COUNT(*) parts, \
+                COALESCE(SUM(length(CAST(p2.data AS BLOB))),0) part_bytes \
+                FROM session s2 JOIN part p2 ON p2.session_id = s2.id \
+                GROUP BY s2.project_id) parts ON parts.project_id = p.id \
+     LEFT JOIN (SELECT s2.project_id, COUNT(*) events, \
+                COALESCE(SUM(length(CAST(e2.data AS BLOB))),0) event_bytes \
+                FROM session s2 JOIN event e2 ON e2.aggregate_id = s2.id \
+                GROUP BY s2.project_id) e ON e.project_id = p.id"
+}
+
+fn read_project_row(r: &rusqlite::Row) -> rusqlite::Result<ProjectRow> {
+    Ok(ProjectRow {
+        id: r.get(0)?,
+        worktree: r.get(1)?,
+        name: r.get(2)?,
+        sessions: r.get(3)?,
+        msgs: r.get(4)?,
+        msg_bytes: r.get(5)?,
+        parts: r.get(6)?,
+        part_bytes: r.get(7)?,
+        events: r.get(8)?,
+        event_bytes: r.get(9)?,
+        cost: r.get(10)?,
+        updated: r.get(11)?,
+    })
 }
 
 fn project_row_from_row(r: &rusqlite::Row) -> rusqlite::Result<ProjectRow> {
@@ -382,13 +468,30 @@ pub fn rewrite_message(con: &Connection, id: &str, data: &str) -> Result<()> {
 
 /// Assistant messages still containing reasoning content (post-strip
 /// verification).
+///
+/// Valid JSON is checked structurally: `content[]` items with
+/// `type: "reasoning"` via the JSON functions, mirroring
+/// `sanitize_assistant_data`; whitespace in the stored JSON and literal
+/// `"type":"reasoning"` text inside other items do not affect the
+/// result, and `json_each` is never evaluated against a malformed
+/// document (the `CASE` substitutes `[]`).
+///
+/// Rows that are not valid JSON cannot be stripped by
+/// `sanitize_assistant_data`, so they are counted as "left" when they
+/// still contain a reasoning marker — the strip then reports a leftover
+/// instead of silently succeeding on corrupt data.
 pub fn reasoning_messages_left(con: &Connection, ids: &[String]) -> Result<i64> {
     if ids.is_empty() {
         return Ok(0);
     }
     let sql = format!(
         "SELECT COUNT(*) FROM session_message WHERE session_id IN ({}) \
-         AND type = 'assistant' AND data LIKE '%\"type\":\"reasoning\"%'",
+         AND type = 'assistant' \
+         AND (EXISTS (SELECT 1 FROM json_each( \
+                        CASE WHEN json_valid(data) AND json_type(data, '$.content') = 'array' \
+                             THEN data ELSE '[]' END, '$.content') \
+                     WHERE json_extract(value, '$.type') = 'reasoning') \
+              OR (NOT json_valid(data) AND data LIKE '%\"type\":\"reasoning\"%'))",
         in_clause(ids)
     );
     Ok(con.query_row(&sql, rusqlite::params_from_iter(ids), |r| r.get(0))?)

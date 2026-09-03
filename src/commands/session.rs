@@ -1,18 +1,107 @@
 //! `session` subcommands: list, show, delete, purge, strip-reasoning.
 
-use crate::db::db_status;
+use crate::db::{env_status, EnvStatus};
 use crate::error::{AppError, Result};
-use crate::models::{session_json, PurgeFilter};
+use crate::models::{session_json, PurgeFilter, PurgeFilterJson, SessionOut};
 use crate::output::print_json;
 use crate::repo::{
-    assistant_messages, child_session_ids, load_sessions, reasoning_counts, reasoning_event_counts,
-    reasoning_events_left, reasoning_left, reasoning_messages_left, resolve_session_ids,
-    rewrite_message, session_exists, strip_reasoning, strip_reasoning_events,
+    assistant_messages, child_session_ids, load_session, load_session_meta, load_sessions,
+    reasoning_counts, reasoning_event_counts, reasoning_events_left, reasoning_left,
+    reasoning_messages_left, resolve_session_ids, rewrite_message, session_sizes, strip_reasoning,
+    strip_reasoning_events,
 };
-use crate::util::{now_ms, parse_age_ms, parse_count, parse_size_bytes, session_diff_dir};
-use rusqlite::{params, Connection};
-use std::collections::HashSet;
+use rusqlite::Connection;
+use serde::Serialize;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
+
+use crate::util::{
+    now_ms, parse_age_ms, parse_count, parse_size_bytes, session_diff_dir, SQL_VAR_CHUNK,
+};
+
+/// One session in a delete/purge preview.
+#[derive(Serialize)]
+struct DeleteSessionRow {
+    id: String,
+    rows: serde_json::Map<String, serde_json::Value>,
+    total: i64,
+}
+
+#[derive(Serialize)]
+struct DeleteOut {
+    #[serde(flatten)]
+    env: EnvStatus,
+    dry_run: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    action: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    filters: Option<PurgeFilterJson>,
+    total_rows: i64,
+    sessions: Vec<DeleteSessionRow>,
+    deleted: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    diff_files_removed: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    diff_bytes_removed: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    note: Option<String>,
+}
+
+impl DeleteOut {
+    fn from_preview(
+        db_path: &Path,
+        dry_run: bool,
+        action: Option<String>,
+        filters: Option<PurgeFilterJson>,
+        total_rows: i64,
+        sessions: Vec<DeleteSessionRow>,
+    ) -> DeleteOut {
+        DeleteOut {
+            env: env_status(db_path),
+            dry_run,
+            action,
+            filters,
+            total_rows,
+            sessions,
+            deleted: false,
+            diff_files_removed: None,
+            diff_bytes_removed: None,
+            note: None,
+        }
+    }
+}
+
+/// One session in a strip-reasoning preview.
+#[derive(Serialize)]
+struct StripSession {
+    id: String,
+    reasoning_parts: i64,
+    reasoning_bytes: i64,
+    reasoning_events: i64,
+    reasoning_event_bytes: i64,
+    messages_rewritten: i64,
+    rewritten_bytes: i64,
+}
+
+#[derive(Serialize)]
+struct StripOut {
+    #[serde(flatten)]
+    env: EnvStatus,
+    dry_run: bool,
+    action: String,
+    filters: PurgeFilterJson,
+    sessions: Vec<StripSession>,
+    total_sessions: usize,
+    total_reasoning_parts: i64,
+    total_reasoning_bytes: i64,
+    total_reasoning_events: i64,
+    total_reasoning_event_bytes: i64,
+    total_messages_rewritten: i64,
+    total_rewritten_bytes: i64,
+    stripped: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    note: Option<String>,
+}
 
 pub fn cmd_session_list(con: &Connection, db_path: &Path, args: &[String]) -> Result<()> {
     print_json(&session_list_value(con, db_path, args)?)
@@ -65,10 +154,8 @@ pub fn session_list_value(
     if let Some(n) = limit {
         sessions.truncate(n);
     }
-    Ok(serde_json::json!(sessions
-        .iter()
-        .map(session_json)
-        .collect::<Vec<_>>()))
+    let out: Vec<SessionOut> = sessions.iter().map(session_json).collect();
+    Ok(serde_json::to_value(out)?)
 }
 
 pub fn cmd_session_show(con: &Connection, args: &[String], db_path: &Path) -> Result<()> {
@@ -77,16 +164,10 @@ pub fn cmd_session_show(con: &Connection, args: &[String], db_path: &Path) -> Re
             "usage: opencode-dbtool session show <session-id>",
         ));
     }
-    let id = resolve_session_ids(con, &[args[0].trim()])?
-        .into_iter()
-        .next()
-        .unwrap();
-    let sessions = load_sessions(con, Some(&session_diff_dir(db_path)))?;
-    let s = sessions
-        .iter()
-        .find(|s| s.id == id)
+    let id = args[0].trim();
+    let s = load_session(con, id, Some(&session_diff_dir(db_path)))?
         .ok_or_else(|| AppError::usage(format!("session not found: {id}")))?;
-    print_json(&session_json(s))
+    print_json(&serde_json::to_value(session_json(&s))?)
 }
 
 pub fn cmd_session_delete(
@@ -105,22 +186,18 @@ pub fn cmd_session_delete(
     let mut resolved = resolve_session_ids(con, &refs)?;
     expand_children(con, &mut resolved)?;
 
-    let mut out = db_status(db_path);
-    out["dry_run"] = serde_json::json!(dry_run);
     let (total_rows, sessions_arr) = preview_impact(con, &resolved)?;
-    out["total_rows"] = serde_json::json!(total_rows);
-    out["sessions"] = serde_json::json!(sessions_arr);
-    out["deleted"] = serde_json::json!(false);
+    let mut out = DeleteOut::from_preview(db_path, dry_run, None, None, total_rows, sessions_arr);
     if dry_run {
-        return print_json(&out);
+        return print_json(&serde_json::to_value(&out)?);
     }
 
     let (diff_files, diff_bytes) = execute_delete(con, &resolved, db_path)?;
-    out["deleted"] = serde_json::json!(true);
-    out["diff_files_removed"] = serde_json::json!(diff_files);
-    out["diff_bytes_removed"] = serde_json::json!(diff_bytes);
-    out["note"] = serde_json::json!("file size is unchanged until `opencode-dbtool vacuum` is run");
-    print_json(&out)
+    out.deleted = true;
+    out.diff_files_removed = Some(diff_files);
+    out.diff_bytes_removed = Some(diff_bytes);
+    out.note = Some("file size is unchanged until `opencode-dbtool vacuum` is run".into());
+    print_json(&serde_json::to_value(&out)?)
 }
 
 /// Delete sessions selected by filters. At least one filter is required.
@@ -139,24 +216,25 @@ pub fn cmd_session_purge(
     let mut selected = select_ids(con, &filters, true)?;
     expand_children(con, &mut selected)?;
 
-    let mut out = db_status(db_path);
-    out["dry_run"] = serde_json::json!(dry_run);
-    out["action"] = serde_json::json!("delete");
-    out["filters"] = filters.json();
     let (total_rows, sessions_arr) = preview_impact(con, &selected)?;
-    out["total_rows"] = serde_json::json!(total_rows);
-    out["sessions"] = serde_json::json!(sessions_arr);
-    out["deleted"] = serde_json::json!(false);
+    let mut out = DeleteOut::from_preview(
+        db_path,
+        dry_run,
+        Some("delete".into()),
+        Some(filters.json()),
+        total_rows,
+        sessions_arr,
+    );
     if dry_run {
-        return print_json(&out);
+        return print_json(&serde_json::to_value(&out)?);
     }
 
     let (diff_files, diff_bytes) = execute_delete(con, &selected, db_path)?;
-    out["deleted"] = serde_json::json!(true);
-    out["diff_files_removed"] = serde_json::json!(diff_files);
-    out["diff_bytes_removed"] = serde_json::json!(diff_bytes);
-    out["note"] = serde_json::json!("file size is unchanged until `opencode-dbtool vacuum` is run");
-    print_json(&out)
+    out.deleted = true;
+    out.diff_files_removed = Some(diff_files);
+    out.diff_bytes_removed = Some(diff_bytes);
+    out.note = Some("file size is unchanged until `opencode-dbtool vacuum` is run".into());
+    print_json(&serde_json::to_value(&out)?)
 }
 
 /// Delete reasoning content of the sessions selected by filters (optional
@@ -216,11 +294,7 @@ pub fn cmd_session_strip_reasoning(
     }
     all_ids.sort();
 
-    let mut out = db_status(db_path);
-    out["dry_run"] = serde_json::json!(dry_run);
-    out["action"] = serde_json::json!("strip-reasoning");
-    out["filters"] = filters.json();
-    let mut sessions_arr: Vec<serde_json::Value> = Vec::new();
+    let mut sessions_arr: Vec<StripSession> = Vec::new();
     let mut total_parts: i64 = 0;
     let mut total_part_bytes: i64 = 0;
     let mut total_events: i64 = 0;
@@ -237,27 +311,35 @@ pub fn cmd_session_strip_reasoning(
         total_event_bytes += event_bytes;
         total_messages += messages;
         total_rewritten_bytes += rewritten_bytes;
-        sessions_arr.push(serde_json::json!({
-            "id": id,
-            "reasoning_parts": parts,
-            "reasoning_bytes": part_bytes,
-            "reasoning_events": events,
-            "reasoning_event_bytes": event_bytes,
-            "messages_rewritten": messages,
-            "rewritten_bytes": rewritten_bytes,
-        }));
+        sessions_arr.push(StripSession {
+            id: id.clone(),
+            reasoning_parts: parts,
+            reasoning_bytes: part_bytes,
+            reasoning_events: events,
+            reasoning_event_bytes: event_bytes,
+            messages_rewritten: messages,
+            rewritten_bytes,
+        });
     }
-    out["sessions"] = serde_json::json!(sessions_arr);
-    out["total_sessions"] = serde_json::json!(sessions_arr.len());
-    out["total_reasoning_parts"] = serde_json::json!(total_parts);
-    out["total_reasoning_bytes"] = serde_json::json!(total_part_bytes);
-    out["total_reasoning_events"] = serde_json::json!(total_events);
-    out["total_reasoning_event_bytes"] = serde_json::json!(total_event_bytes);
-    out["total_messages_rewritten"] = serde_json::json!(total_messages);
-    out["total_rewritten_bytes"] = serde_json::json!(total_rewritten_bytes);
-    out["stripped"] = serde_json::json!(false);
+    let mut out = StripOut {
+        env: env_status(db_path),
+        dry_run,
+        action: "strip-reasoning".into(),
+        filters: filters.json(),
+        sessions: sessions_arr,
+        total_sessions: 0,
+        total_reasoning_parts: total_parts,
+        total_reasoning_bytes: total_part_bytes,
+        total_reasoning_events: total_events,
+        total_reasoning_event_bytes: total_event_bytes,
+        total_messages_rewritten: total_messages,
+        total_rewritten_bytes,
+        stripped: false,
+        note: None,
+    };
+    out.total_sessions = out.sessions.len();
     if dry_run {
-        return print_json(&out);
+        return print_json(&serde_json::to_value(&out)?);
     }
 
     con.execute_batch("PRAGMA foreign_keys = ON;")?;
@@ -287,9 +369,9 @@ pub fn cmd_session_strip_reasoning(
             "reasoning content still remains in session messages: {messages_left}"
         )));
     }
-    out["stripped"] = serde_json::json!(true);
-    out["note"] = serde_json::json!("file size is unchanged until `opencode-dbtool vacuum` is run");
-    print_json(&out)
+    out.stripped = true;
+    out.note = Some("file size is unchanged until `opencode-dbtool vacuum` is run".into());
+    print_json(&serde_json::to_value(&out)?)
 }
 
 /// Remove `type: "reasoning"` elements from an assistant message's
@@ -389,9 +471,17 @@ fn select_ids(
     filters: &PurgeFilter,
     protect_ancestors: bool,
 ) -> Result<Vec<String>> {
-    let sessions = load_sessions(con, None)?;
-    let mut selected: Vec<&crate::models::SessionRow> =
-        sessions.iter().filter(|s| filters.matches(s)).collect();
+    // Light selection: every session's filter fields, no aggregate
+    // counts. The size aggregate is only computed (batched) when the
+    // `--larger-than` filter actually needs it.
+    let meta = load_session_meta(con)?;
+    let mut selected: Vec<&crate::models::SessionMeta> =
+        meta.iter().filter(|m| filters.matches_meta(m)).collect();
+    if let Some(min) = filters.larger_than_bytes {
+        let ids: Vec<String> = selected.iter().map(|m| m.id.clone()).collect();
+        let sizes = session_sizes(con, &ids)?;
+        selected.retain(|m| sizes.get(&m.id).copied().unwrap_or(0) > min);
+    }
     if let Some(n) = filters.keep_latest {
         let mut kept: HashSet<&str> = HashSet::new();
         for s in selected.iter().take(n as usize) {
@@ -400,17 +490,15 @@ fn select_ids(
         if protect_ancestors {
             // A kept session's ancestors must survive too: deleting a
             // parent would orphan (or cascade-delete) the kept child.
-            let mut added = true;
-            while added {
-                added = false;
-                for s in &sessions {
-                    if kept.contains(s.id.as_str()) {
-                        if let Some(pid) = &s.parent_id {
-                            if !kept.contains(pid.as_str()) {
-                                kept.insert(pid.as_str());
-                                added = true;
-                            }
-                        }
+            let parents: HashMap<&str, Option<&str>> = meta
+                .iter()
+                .map(|m| (m.id.as_str(), m.parent_id.as_deref()))
+                .collect();
+            let mut stack: Vec<&str> = kept.iter().copied().collect();
+            while let Some(id) = stack.pop() {
+                if let Some(Some(pid)) = parents.get(id) {
+                    if kept.insert(pid) {
+                        stack.push(pid);
                     }
                 }
             }
@@ -436,27 +524,72 @@ fn expand_children(con: &Connection, ids: &mut Vec<String>) -> Result<()> {
     Ok(())
 }
 
+/// Tables counted in a session delete preview, in the stable output
+/// order.
+const PREVIEW_TABLES: [(&str, &str); 9] = [
+    ("message", "session_id"),
+    ("part", "session_id"),
+    ("todo", "session_id"),
+    ("event", "aggregate_id"),
+    ("event_sequence", "aggregate_id"),
+    ("session_share", "session_id"),
+    ("session_input", "session_id"),
+    ("session_message", "session_id"),
+    ("session_context_epoch", "session_id"),
+];
+
 /// Per-session preview rows (id + per-table counts + total) and the
-/// sum of all row counts.
-fn preview_impact(con: &Connection, ids: &[String]) -> Result<(i64, Vec<serde_json::Value>)> {
+/// sum of all row counts. Counts are fetched with one batched GROUP BY
+/// query per table (chunked to stay under SQLite's variable limit)
+/// instead of per-session queries; every table key is present, zero
+/// counts included.
+fn preview_impact(con: &Connection, ids: &[String]) -> Result<(i64, Vec<DeleteSessionRow>)> {
+    let mut per_session = HashMap::<String, Vec<(&'static str, i64)>>::new();
+    for (table, id_col) in PREVIEW_TABLES {
+        for chunk in ids.chunks(SQL_VAR_CHUNK) {
+            if chunk.is_empty() {
+                continue;
+            }
+            let sql = format!(
+                "SELECT {id_col}, COUNT(*) FROM {table} \
+                 WHERE {id_col} IN ({}) GROUP BY {id_col}",
+                placeholders(chunk.len())
+            );
+            let mut stmt = con.prepare(&sql)?;
+            let rows = stmt.query_map(rusqlite::params_from_iter(chunk), |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+            })?;
+            for r in rows {
+                let (sid, n) = r?;
+                per_session.entry(sid).or_default().push((table, n));
+            }
+        }
+    }
     let mut total_rows: i64 = 0;
-    let mut arr: Vec<serde_json::Value> = Vec::new();
+    let mut sessions: Vec<DeleteSessionRow> = Vec::new();
     for id in ids {
-        let counts = preview_counts(con, id)?;
         let mut rows_map = serde_json::Map::new();
+        for (table, _) in PREVIEW_TABLES {
+            rows_map.insert(table.to_string(), serde_json::json!(0));
+        }
         let mut total: i64 = 1; // the session row itself
-        for (table, n) in counts {
+        for (table, n) in per_session.remove(id).unwrap_or_default() {
             total += n;
-            rows_map.insert(table, serde_json::json!(n));
+            rows_map.insert(table.to_string(), serde_json::json!(n));
         }
         total_rows += total;
-        arr.push(serde_json::json!({
-            "id": id,
-            "rows": rows_map,
-            "total": total,
-        }));
+        sessions.push(DeleteSessionRow {
+            id: id.clone(),
+            rows: rows_map,
+            total,
+        });
     }
-    Ok((total_rows, arr))
+    Ok((total_rows, sessions))
+}
+
+/// `?` placeholders for an IN clause.
+fn placeholders(n: usize) -> String {
+    vec!["?"; n].join(",")
 }
 
 /// Delete the given sessions in a single immediate transaction, verify
@@ -469,24 +602,39 @@ fn execute_delete(
 ) -> Result<(usize, u64)> {
     con.execute_batch("PRAGMA foreign_keys = ON;")?;
     let tx = con.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-    for id in resolved {
+    for chunk in resolved.chunks(SQL_VAR_CHUNK) {
+        let in_sql = placeholders(chunk.len());
         // event tables have no FK to session, so they must be deleted
         // explicitly; the rest follows via ON DELETE CASCADE.
-        tx.execute("DELETE FROM event WHERE aggregate_id = ?1", params![id])?;
         tx.execute(
-            "DELETE FROM event_sequence WHERE aggregate_id = ?1",
-            params![id],
+            &format!("DELETE FROM event WHERE aggregate_id IN ({in_sql})"),
+            rusqlite::params_from_iter(chunk),
         )?;
-        tx.execute("DELETE FROM session WHERE id = ?1", params![id])?;
+        tx.execute(
+            &format!("DELETE FROM event_sequence WHERE aggregate_id IN ({in_sql})"),
+            rusqlite::params_from_iter(chunk),
+        )?;
+        tx.execute(
+            &format!("DELETE FROM session WHERE id IN ({in_sql})"),
+            rusqlite::params_from_iter(chunk),
+        )?;
     }
     tx.commit()?;
 
-    for id in resolved {
-        if session_exists(con, id)? {
-            return Err(AppError::usage(format!(
-                "session still exists after delete: {id}"
-            )));
-        }
+    let mut remaining: i64 = 0;
+    for chunk in resolved.chunks(SQL_VAR_CHUNK) {
+        let in_sql = placeholders(chunk.len());
+        let left: i64 = con.query_row(
+            &format!("SELECT COUNT(*) FROM session WHERE id IN ({in_sql})"),
+            rusqlite::params_from_iter(chunk),
+            |r| r.get(0),
+        )?;
+        remaining += left;
+    }
+    if remaining != 0 {
+        return Err(AppError::usage(format!(
+            "sessions still exist after delete: {remaining}"
+        )));
     }
     Ok(remove_diff_files(db_path, resolved))
 }
@@ -507,25 +655,6 @@ fn remove_diff_files(db_path: &Path, ids: &[String]) -> (usize, u64) {
         }
     }
     (removed, bytes)
-}
-
-/// Per-table row counts for a session's delete preview.
-fn preview_counts(con: &Connection, id: &str) -> Result<Vec<(String, i64)>> {
-    let mut stmt = con.prepare(
-        "SELECT 'message', COUNT(*) FROM message WHERE session_id = ?1 \
-          UNION ALL SELECT 'part', COUNT(*) FROM part WHERE session_id = ?1 \
-          UNION ALL SELECT 'todo', COUNT(*) FROM todo WHERE session_id = ?1 \
-          UNION ALL SELECT 'event', COUNT(*) FROM event WHERE aggregate_id = ?1 \
-          UNION ALL SELECT 'event_sequence', COUNT(*) FROM event_sequence WHERE aggregate_id = ?1 \
-          UNION ALL SELECT 'session_share', COUNT(*) FROM session_share WHERE session_id = ?1 \
-          UNION ALL SELECT 'session_input', COUNT(*) FROM session_input WHERE session_id = ?1 \
-          UNION ALL SELECT 'session_message', COUNT(*) FROM session_message WHERE session_id = ?1 \
-          UNION ALL SELECT 'session_context_epoch', COUNT(*) FROM session_context_epoch WHERE session_id = ?1",
-    )?;
-    let rows = stmt.query_map(params![id], |r| {
-        Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
-    })?;
-    Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
 }
 
 #[cfg(test)]
@@ -592,6 +721,134 @@ mod tests {
         .unwrap_err();
         assert_eq!(err.code, 2);
         assert!(err.message.contains("purge"));
+    }
+
+    #[test]
+    fn preview_rows_include_zero_tables() {
+        let con = testdb::create();
+        testdb::insert_session(&con, "s1", "/a", None);
+        testdb::insert_part(&con, "s1", r#"{"type":"text","text":"x"}"#);
+
+        let (total, arr) = preview_impact(&con, &["s1".to_string()]).unwrap();
+        assert_eq!(total, 2); // session row + part row
+        let row = serde_json::to_value(&arr[0]).unwrap();
+        let rows = row["rows"].as_object().unwrap();
+        assert_eq!(rows.len(), 9, "all counted tables present");
+        assert_eq!(rows["part"], 1);
+        assert_eq!(rows["message"], 0);
+        assert_eq!(rows["todo"], 0);
+        assert_eq!(rows["event"], 0);
+    }
+
+    fn fixed_env(db: &str) -> crate::db::EnvStatus {
+        crate::db::EnvStatus {
+            opencode_running: Some(false),
+            pids: Some(vec![]),
+            pid_error: None,
+            db: db.into(),
+        }
+    }
+
+    #[test]
+    fn delete_output_contract() {
+        let mut rows = serde_json::Map::new();
+        rows.insert("part".into(), serde_json::json!(1));
+        rows.insert("message".into(), serde_json::json!(0));
+        let out = DeleteOut {
+            env: fixed_env("/tmp/x.db"),
+            dry_run: true,
+            action: Some("delete".into()),
+            filters: None,
+            total_rows: 2,
+            sessions: vec![DeleteSessionRow {
+                id: "ses_1".into(),
+                rows,
+                total: 2,
+            }],
+            deleted: false,
+            diff_files_removed: None,
+            diff_bytes_removed: None,
+            note: None,
+        };
+        let v = serde_json::to_value(&out).unwrap();
+        let expected = serde_json::json!({
+            "opencode_running": false, "pids": [], "db": "/tmp/x.db",
+            "dry_run": true, "action": "delete", "total_rows": 2,
+            "sessions": [ { "id": "ses_1", "rows": { "part": 1, "message": 0 }, "total": 2 } ],
+            "deleted": false
+        });
+        assert_eq!(v, expected, "delete JSON contract changed");
+        assert!(v.get("filters").is_none(), "no filters on plain delete");
+        assert!(v.get("note").is_none(), "no note on dry-run");
+    }
+
+    #[test]
+    fn strip_output_contract() {
+        let out = StripOut {
+            env: fixed_env("/tmp/x.db"),
+            dry_run: true,
+            action: "strip-reasoning".into(),
+            filters: crate::models::PurgeFilterJson {
+                older_than: Some("30d".into()),
+                subagents: true,
+                paths: vec!["/a".into()],
+                larger_than: None,
+                keep_latest: Some("1".into()),
+            },
+            sessions: vec![StripSession {
+                id: "ses_1".into(),
+                reasoning_parts: 3,
+                reasoning_bytes: 100,
+                reasoning_events: 1,
+                reasoning_event_bytes: 50,
+                messages_rewritten: 2,
+                rewritten_bytes: 5,
+            }],
+            total_sessions: 1,
+            total_reasoning_parts: 3,
+            total_reasoning_bytes: 100,
+            total_reasoning_events: 1,
+            total_reasoning_event_bytes: 50,
+            total_messages_rewritten: 2,
+            total_rewritten_bytes: 5,
+            stripped: false,
+            note: None,
+        };
+        let v = serde_json::to_value(&out).unwrap();
+        let expected = serde_json::json!({
+            "opencode_running": false, "pids": [], "db": "/tmp/x.db",
+            "dry_run": true, "action": "strip-reasoning",
+            "filters": { "older_than": "30d", "subagents": true, "paths": ["/a"],
+                         "larger_than": null, "keep_latest": "1" },
+            "sessions": [ { "id": "ses_1", "reasoning_parts": 3, "reasoning_bytes": 100,
+                            "reasoning_events": 1, "reasoning_event_bytes": 50,
+                            "messages_rewritten": 2, "rewritten_bytes": 5 } ],
+            "total_sessions": 1,
+            "total_reasoning_parts": 3, "total_reasoning_bytes": 100,
+            "total_reasoning_events": 1, "total_reasoning_event_bytes": 50,
+            "total_messages_rewritten": 2, "total_rewritten_bytes": 5,
+            "stripped": false
+        });
+        assert_eq!(v, expected, "strip-reasoning JSON contract changed");
+    }
+
+    #[test]
+    fn bulk_preview_and_delete_with_many_sessions() {
+        // More sessions than one IN chunk (900): exercises the chunked
+        // batch queries and stays under SQLite's variable limit.
+        const N: usize = 1500;
+        let mut con = testdb::create();
+        for i in 0..N {
+            testdb::insert_session(&con, &format!("s{i}"), "/a", None);
+        }
+        let ids: Vec<String> = (0..N).map(|i| format!("s{i}")).collect();
+
+        let (total, arr) = preview_impact(&con, &ids).unwrap();
+        assert_eq!(arr.len(), N);
+        assert_eq!(total, N as i64);
+
+        execute_delete(&mut con, &ids, Path::new("/tmp/x.db")).unwrap();
+        assert_eq!(testdb::session_count(&con), 0);
     }
 
     #[test]
@@ -1088,6 +1345,41 @@ mod tests {
         .is_none());
         assert!(sanitize_assistant_data(r#"{"type":"user"}"#).is_none());
         assert!(sanitize_assistant_data("not json").is_none());
+    }
+
+    #[test]
+    fn verification_detects_reasoning_by_json_semantics() {
+        let con = testdb::create();
+        testdb::insert_session(&con, "s1", "/a", None);
+        // Whitespace-formatted reasoning item: a raw-text LIKE check
+        // would miss this.
+        testdb::insert_session_message(
+            &con,
+            "m1",
+            "s1",
+            "assistant",
+            r#"{"type":"assistant","content":[{"type": "reasoning", "text": "x"}]}"#,
+        );
+        // Literal `"type":"reasoning"` inside a text item is not reasoning.
+        testdb::insert_session_message(
+            &con,
+            "m2",
+            "s1",
+            "assistant",
+            r#"{"type":"assistant","content":[{"type":"text","text":"say {\"type\":\"reasoning\"}"}]}"#,
+        );
+        // Not JSON at all: cannot be stripped, so it counts as left when
+        // it still carries a reasoning marker.
+        testdb::insert_session_message(
+            &con,
+            "m3",
+            "s1",
+            "assistant",
+            r#"not json but "type":"reasoning""#,
+        );
+
+        let ids = vec!["s1".to_string()];
+        assert_eq!(reasoning_messages_left(&con, &ids).unwrap(), 2);
     }
 
     #[test]
