@@ -358,6 +358,7 @@ mod tests {
             .unwrap();
         assert_eq!(jm, "wal");
 
+        drop(con);
         std::fs::remove_file(&backup_path).unwrap();
         std::fs::remove_file(&path).unwrap();
         cleanup(&path);
@@ -390,6 +391,7 @@ mod tests {
             .collect();
         assert!(backups.is_empty(), "no backup file expected");
 
+        drop(con);
         cleanup(&path);
     }
 

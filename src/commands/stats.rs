@@ -341,6 +341,7 @@ mod tests {
         assert_eq!(out["storage"]["snapshot_bytes"], 5);
         assert_eq!(out["storage"]["tool_output_bytes"], 7);
 
+        drop(con);
         fs::remove_dir_all(&dir).unwrap();
     }
 

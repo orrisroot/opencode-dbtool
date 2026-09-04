@@ -1400,6 +1400,7 @@ mod tests {
             "diff of deleted session gone"
         );
         assert!(diff.join("other.json").exists(), "unrelated file kept");
+        drop(con);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -1422,6 +1423,7 @@ mod tests {
         .unwrap();
 
         assert!(!diff.join("s1.json").exists());
+        drop(con);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -1440,6 +1442,7 @@ mod tests {
 
         let sessions = load_sessions(&con, None).unwrap();
         assert_eq!(sessions[0].diff_bytes, 0);
+        drop(con);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -1499,6 +1502,7 @@ mod tests {
         );
         assert!(session_list_value(&con, &db_path, &["--limit".to_string()]).is_err());
         assert!(session_list_value(&con, &db_path, &["--unknown".to_string()]).is_err());
+        drop(con);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

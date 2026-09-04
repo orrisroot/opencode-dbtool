@@ -497,6 +497,7 @@ mod tests {
         assert!(!diff.join("s1.json").exists());
         assert!(!diff.join("s2.json").exists());
         assert!(diff.join("other.json").exists(), "unrelated file kept");
+        drop(con);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

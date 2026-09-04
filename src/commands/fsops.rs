@@ -298,6 +298,7 @@ mod tests {
         assert!(diff.join("alive.json").exists(), "live session file kept");
         assert!(!diff.join("orphan.json").exists(), "orphan removed");
         assert!(!diff.join("other.json").exists(), "orphan removed");
+        drop(con);
         fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -315,6 +316,7 @@ mod tests {
         cmd_fs_clean_orphans(&con, &[], true, &db_path).unwrap();
 
         assert!(diff.join("orphan.json").exists());
+        drop(con);
         fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -327,6 +329,7 @@ mod tests {
 
         cmd_fs_clean_orphans(&con, &[], false, &db_path).unwrap();
         assert!(!dir.join("storage").exists());
+        drop(con);
         fs::remove_dir_all(&dir).unwrap();
     }
 
