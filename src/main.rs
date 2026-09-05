@@ -75,6 +75,7 @@ fn usage() {
     println!("  opencode-dbtool fs clean-tool-output  delete all truncated tool output");
     println!("  opencode-dbtool fs clean-log          truncate log/opencode.log to zero bytes");
     println!("  opencode-dbtool vacuum [--no-backup] [--keep-backups <n>]  run VACUUM (backup + verify by default)");
+    println!("  opencode-dbtool self-update [--dry-run|--yes]  check/apply the latest GitHub release binary");
     println!("  opencode-dbtool [--help]                 show this message");
     println!();
     println!("OUTPUT:");
@@ -134,17 +135,24 @@ fn run() -> Result<()> {
         return Ok(());
     }
 
-    let Some(dir) = config::data_dir() else {
-        return Err(AppError::usage("cannot determine opencode data dir"));
-    };
-    let db_path = dir.join("opencode.db");
-
     let command = filtered.first().cloned().unwrap_or_default();
     let rest: &[String] = if command.is_empty() {
         &[]
     } else {
         &filtered[1..]
     };
+
+    // `self-update` touches neither the database nor the data dir; dispatch it
+    // before either is resolved.
+    if command == "self-update" {
+        return require_confirmation(dry_run, yes, "self-update")
+            .and_then(|_| commands::selfupdate::cmd_self_update(dry_run, rest));
+    }
+
+    let Some(dir) = config::data_dir() else {
+        return Err(AppError::usage("cannot determine opencode data dir"));
+    };
+    let db_path = dir.join("opencode.db");
 
     match command.as_str() {
         "" => {

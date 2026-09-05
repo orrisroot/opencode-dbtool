@@ -2,7 +2,7 @@
 //!
 //! Carries a process exit code (see README "Exit codes") and a
 //! user-facing message. Conversions from library errors are provided
-//! so `?` works directly on rusqlite/serde_json/io failures.
+//! so `?` works directly on rusqlite/serde_json/io/self_update failures.
 
 pub const EXIT_OK: i32 = 0;
 pub const EXIT_RUNNING: i32 = 1;
@@ -66,6 +66,12 @@ impl From<serde_json::Error> for AppError {
 
 impl From<std::io::Error> for AppError {
     fn from(e: std::io::Error) -> Self {
+        AppError::db(e.to_string())
+    }
+}
+
+impl From<self_update::Error> for AppError {
+    fn from(e: self_update::Error) -> Self {
         AppError::db(e.to_string())
     }
 }

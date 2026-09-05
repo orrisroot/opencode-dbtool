@@ -47,6 +47,7 @@ cargo build --release   # -> target/release/opencode-dbtool
 | `fs clean-tool-output` | delete all truncated tool output |
 | `fs clean-log` | truncate log/opencode.log to zero bytes |
 | `vacuum [--no-backup] [--keep-backups <n>]` | run VACUUM (backup + verify by default) |
+| `self-update [--dry-run\|--yes]` | check for / install the latest GitHub release binary |
 
 All ids are matched exactly (no prefix/substring resolution). In `purge` /
 `strip-reasoning`, `--path <dir>` is an exact match against the session
@@ -466,12 +467,46 @@ added on a real run (dry-run reports nothing since no backup is touched):
 "backup_cleanup": { "kept": 3, "removed_files": 7, "removed_bytes": 52428800 }
 ```
 
+### `self-update`
+
+Update the running binary from the [GitHub
+releases](https://github.com/orrisroot/opencode-dbtool/releases) of this
+repository. `--dry-run` only checks (reports what would happen, changes
+nothing); `--yes` downloads the release asset for the current platform
+(`x86_64`/`aarch64` for Linux musl, macOS, and Windows) and replaces the
+running executable in place. `GH_TOKEN`/`GITHUB_TOKEN` is picked up from the
+environment when set, avoiding the unauthenticated GitHub API rate limit.
+
+```json
+{
+  "command": "self-update",
+  "current_version": "0.1.0",
+  "latest_version": "0.2.0",
+  "target": "x86_64-unknown-linux-musl",
+  "update_available": true,
+  "updated": false,
+  "dry_run": true,
+  "status": "update-available",
+  "path": "/home/user/.cargo/bin/opencode-dbtool",
+  "release_url": "https://github.com/orrisroot/opencode-dbtool/releases/tag/v0.2.0"
+}
+```
+
+`status` is `"up-to-date"`, `"update-available"` (dry-run, or nothing
+applied), or `"updated"` (`updated: true`, the binary at `path` was
+replaced). Only stable releases are considered: the reported version is
+the one actually installed (the apply step is pinned to that release). A
+source build whose libc differs from the published ones still updates to
+the static musl build on Linux; an unsupported local platform fails with
+exit code 2, while a release missing this platform's asset, network/API
+failures, and download problems surface as exit code 3.
+
 ## Flags
 
 | flag | meaning |
 | --- | --- |
 | `--dry-run`, `-n` | print actions without changing anything (safe while opencode runs) |
-| `--yes`, `-y` | confirm a destructive command; required for every real (non-dry-run) run of `delete`, `purge`, `strip-reasoning`, `fs clean-*`, and `vacuum` |
+| `--yes`, `-y` | confirm a destructive command; required for every real (non-dry-run) run of `delete`, `purge`, `strip-reasoning`, `fs clean-*`, `vacuum`, and `self-update` |
 | `--no-backup` | `vacuum` only: skip the timestamped backup (dangerous) |
 
 Destructive commands refuse to run without `--yes` or `--dry-run`
@@ -486,7 +521,7 @@ preview the impact before confirming with `--yes`. `--dry-run` and
 | 0 | success |
 | 1 | opencode is running and the command was refused (close opencode and retry) |
 | 2 | not found / bad arguments |
-| 3 | database error, or running-process detection failed |
+| 3 | database or network error, or running-process detection failed |
 
 ## Environment
 
@@ -494,6 +529,7 @@ preview the impact before confirming with `--yes`. `--dry-run` and
 | --- | --- |
 | `OPENCODE_DATA_DIR` | override data dir |
 | `XDG_DATA_HOME` | data dir defaults to `$XDG_DATA_HOME/opencode` |
+| `GH_TOKEN` / `GITHUB_TOKEN` | `self-update` only: GitHub API token (raises the release-check rate limit) |
 
 Default data dir: `~/.local/share/opencode`.
 

@@ -279,6 +279,46 @@ fn destructive_commands_require_yes() {
 }
 
 #[test]
+fn self_update_requires_confirmation() {
+    let dir = temp_dir("self-update");
+
+    // Bare `self-update` must refuse before touching the network (exit 2)
+    // and point at the confirmation flags.
+    let out = run(&["self-update"], &dir);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("--dry-run"), "stderr: {stderr}");
+    assert!(stderr.contains("--yes"), "stderr: {stderr}");
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn self_update_rejects_unknown_options() {
+    let dir = temp_dir("self-update-opts");
+
+    let out = run(&["self-update", "--tag", "v0.0.1", "--dry-run"], &dir);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("unknown option"),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
 fn unknown_command_is_exit_2() {
     let dir = temp_dir("unknown");
     let db = dir.join("opencode.db");
