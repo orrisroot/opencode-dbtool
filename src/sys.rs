@@ -4,7 +4,10 @@ use crate::error::{AppError, Result};
 use std::path::Path;
 use sysinfo::{ProcessesToUpdate, System};
 
-const TARGET_COMMS: [&str; 2] = ["opencode", "opencode-server"];
+/// Executable names of opencode processes: the 1.x/2.x CLI and server
+/// (`opencode`, `opencode-server`, the service is spawned from the same
+/// binary) and the 2.x beta npm executable (`opencode2`).
+const TARGET_COMMS: [&str; 3] = ["opencode", "opencode-server", "opencode2"];
 
 /// File stem of a process name / path ("opencode.exe" -> "opencode").
 fn target_stem(s: &str) -> &str {
@@ -99,6 +102,8 @@ mod tests {
     fn name_matches_known_executables() {
         assert!(name_matches("opencode"));
         assert!(name_matches("opencode-server"));
+        assert!(name_matches("opencode2"));
+        assert!(name_matches("opencode2.exe"));
         assert!(name_matches("opencode.exe"));
         assert!(name_matches("/usr/bin/opencode"));
         // Suffix tolerance also covers names with dots; data files are
@@ -111,10 +116,13 @@ mod tests {
     fn cmd_tokens_match_only_invocations() {
         assert!(cmd_token_matches("opencode"));
         assert!(cmd_token_matches("opencode-server"));
+        assert!(cmd_token_matches("opencode2"));
+        assert!(cmd_token_matches("/home/u/bin/opencode2"));
         assert!(cmd_token_matches("/home/u/bin/opencode"));
         assert!(cmd_token_matches("./opencode"));
         // Files and paths referencing opencode data are not invocations.
         assert!(!cmd_token_matches("opencode.db"));
+        assert!(!cmd_token_matches("opencode2.db"));
         assert!(!cmd_token_matches("~/.local/share/opencode/opencode.db"));
         assert!(!cmd_token_matches("--opencode"));
         assert!(!cmd_token_matches("ls"));

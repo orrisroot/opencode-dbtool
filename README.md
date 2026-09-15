@@ -572,7 +572,8 @@ matching busy timeout, so concurrent reads never wedge.
   `fs clean-orphans`, and `fs clean-tool-output` are safe while opencode
   runs.
 - Running instances are detected by process name, executable path, and
-  command line (`opencode`, `opencode-server`) via the
+  command line (`opencode`, `opencode-server`, `opencode2` — the 2.x beta
+  npm executable) via the
   [sysinfo](https://crates.io/crates/sysinfo) crate, which works on
   Linux, macOS, and Windows. Command-line matching only accepts
   invocations (e.g. `/usr/bin/opencode`), not references to opencode's
