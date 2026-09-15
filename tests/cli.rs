@@ -91,12 +91,24 @@ fn create_db(db_path: &Path) {
     .unwrap();
 }
 
+/// Run with `OPENCODE_DB` set explicitly; `run` below clears it so tests
+/// stay hermetic against a leaked parent-environment value.
+fn run_db_env(args: &[&str], data_dir: &Path, db: Option<&str>) -> Output {
+    let mut cmd = Command::new(bin());
+    cmd.args(args).env("OPENCODE_DATA_DIR", data_dir);
+    match db {
+        Some(value) => {
+            cmd.env("OPENCODE_DB", value);
+        }
+        None => {
+            cmd.env_remove("OPENCODE_DB");
+        }
+    }
+    cmd.output().expect("failed to run binary")
+}
+
 fn run(args: &[&str], data_dir: &Path) -> Output {
-    Command::new(bin())
-        .args(args)
-        .env("OPENCODE_DATA_DIR", data_dir)
-        .output()
-        .expect("failed to run binary")
+    run_db_env(args, data_dir, None)
 }
 
 fn stdout_json(out: &Output) -> Value {
@@ -337,6 +349,86 @@ fn missing_db_is_exit_2() {
     let out = run(&["stats"], &dir);
     assert_eq!(out.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&out.stderr).contains("DB not found"));
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn channel_database_is_used_when_default_is_missing() {
+    let dir = temp_dir("channel-db");
+    create_db(&dir.join("opencode-prod.db"));
+
+    let out = run(&["stats"], &dir);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v = stdout_json(&out);
+    assert_eq!(
+        v["db"],
+        dir.join("opencode-prod.db").to_string_lossy().as_ref()
+    );
+    assert_eq!(v["tables"]["session"], 1);
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn open_code_db_env_overrides_the_database_path() {
+    let dir = temp_dir("db-env");
+    create_db(&dir.join("opencode.db"));
+    let custom = dir.join("custom.db");
+    create_db(&custom);
+
+    // An absolute path wins over the default and channel fallbacks.
+    let out = run_db_env(&["stats"], &dir, Some(custom.to_string_lossy().as_ref()));
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v = stdout_json(&out);
+    assert_eq!(v["db"], custom.to_string_lossy().as_ref());
+    assert_eq!(v["tables"]["session"], 1);
+
+    // A relative path resolves against the data dir.
+    let out = run_db_env(&["stats"], &dir, Some("custom.db"));
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v = stdout_json(&out);
+    assert_eq!(v["db"], dir.join("custom.db").to_string_lossy().as_ref());
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn open_code_db_env_missing_path_is_exit_2() {
+    let dir = temp_dir("db-env-missing");
+    create_db(&dir.join("opencode.db"));
+
+    let out = run_db_env(&["stats"], &dir, Some("does-not-exist.db"));
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("DB not found"));
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn multiple_database_candidates_are_ambiguous_exit_2() {
+    let dir = temp_dir("multi-db");
+    create_db(&dir.join("opencode-prod.db"));
+    create_db(&dir.join("opencode-nightly.db"));
+
+    let out = run(&["stats"], &dir);
+    assert_eq!(out.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("OPENCODE_DB"), "stderr: {stderr}");
+    assert!(stderr.contains("opencode-prod.db"), "stderr: {stderr}");
+    assert!(stderr.contains("opencode-nightly.db"), "stderr: {stderr}");
 
     std::fs::remove_dir_all(&dir).unwrap();
 }

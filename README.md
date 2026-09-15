@@ -15,6 +15,12 @@ current shapes, plus `project_directory`, `workspace`, `event`, ...). Older
 databases fail with exit code 3; open the DB once with opencode >= 1.18.0 so
 its migrations run, then retry.
 
+opencode 2 is supported: it uses the same database file in the same data
+directory and the same table family as 1.18.x. Columns V2 adds are ignored
+by the tool, and the channel-specific database files some opencode
+channels use are resolved automatically (see
+[Database selection](#database-selection)).
+
 ## Install
 
 Prebuilt binaries (Linux musl, macOS, Windows; arm64 + x86_64) are attached to
@@ -528,10 +534,34 @@ preview the impact before confirming with `--yes`. `--dry-run` and
 | variable | meaning |
 | --- | --- |
 | `OPENCODE_DATA_DIR` | override data dir |
+| `OPENCODE_DB` | override database path (same rules as opencode: `:memory:` and absolute paths as-is, relative resolves against the data dir) |
+| `OPENCODE_DISABLE_CHANNEL_DB` | skip the channel-database fallback and always target `opencode.db` |
 | `XDG_DATA_HOME` | data dir defaults to `$XDG_DATA_HOME/opencode` |
 | `GH_TOKEN` / `GITHUB_TOKEN` | `self-update` only: GitHub API token (raises the release-check rate limit) |
 
 Default data dir: `~/.local/share/opencode`.
+
+### Database selection
+
+Commands always print the database they operate on in the environment
+block's `db` field. The path resolves in this order:
+
+1. `$OPENCODE_DB`, exactly like opencode resolves it: `:memory:` and
+   absolute paths are used as-is, a relative path is joined onto the data
+   dir.
+2. `opencode.db` in the data dir (what opencode uses on the
+   `latest`/`beta`/`prod` channels, and with `OPENCODE_DISABLE_CHANNEL_DB`
+   set — the tool honors that variable too).
+3. A single channel database `opencode-<channel>.db` in the data dir
+   (the layout of installs on other channels). Several such files with no
+   `opencode.db` are refused with exit 2 naming them; set `OPENCODE_DB`
+   to pick one. Backup files (`*.backup-*`) and WAL/SHM siblings never
+   count as candidates.
+
+The filesystem storage (`storage/session_diff/`, `snapshot/`,
+`tool-output/`, `log/`) always follows the data dir, never the database
+file's location — matching opencode, which keeps these directories in the
+data dir even when `OPENCODE_DB` points elsewhere.
 
 ## Concurrency
 

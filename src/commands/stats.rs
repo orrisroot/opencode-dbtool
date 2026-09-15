@@ -63,9 +63,9 @@ struct StatsOut {
     subagent: Option<Subagent>,
 }
 
-pub fn cmd_stats(con: &Connection, db_path: &Path, args: &[String]) -> Result<()> {
+pub fn cmd_stats(con: &Connection, data_dir: &Path, db_path: &Path, args: &[String]) -> Result<()> {
     let detail = parse_stats_args(args)?;
-    print_json(&stats_value(con, db_path, detail)?)
+    print_json(&stats_value(con, data_dir, db_path, detail)?)
 }
 
 /// Parse `stats` flags: `--detail`. Unknown options are rejected.
@@ -81,12 +81,17 @@ fn parse_stats_args(args: &[String]) -> Result<bool> {
 }
 
 /// Build the stats object (exposed for tests).
-pub fn stats_value(con: &Connection, db_path: &Path, detail: bool) -> Result<serde_json::Value> {
-    let out = stats_out(con, db_path, detail)?;
+pub fn stats_value(
+    con: &Connection,
+    data_dir: &Path,
+    db_path: &Path,
+    detail: bool,
+) -> Result<serde_json::Value> {
+    let out = stats_out(con, data_dir, db_path, detail)?;
     Ok(serde_json::to_value(&out)?)
 }
 
-fn stats_out(con: &Connection, db_path: &Path, detail: bool) -> Result<StatsOut> {
+fn stats_out(con: &Connection, data_dir: &Path, db_path: &Path, detail: bool) -> Result<StatsOut> {
     let env = env_status(db_path);
     let freelist: i64 = con.query_row("PRAGMA freelist_count", [], |r| r.get(0))?;
 
@@ -154,10 +159,10 @@ fn stats_out(con: &Connection, db_path: &Path, detail: bool) -> Result<StatsOut>
         tables,
         total_data_bytes: total,
         storage: StorageSizes {
-            session_diff_bytes: dir_size(&session_diff_dir(db_path)),
-            snapshot_bytes: dir_size(&snapshot_dir(db_path)),
-            tool_output_bytes: dir_size(&tool_output_dir(db_path)),
-            log_bytes: dir_size(&log_dir(db_path)),
+            session_diff_bytes: dir_size(&session_diff_dir(data_dir)),
+            snapshot_bytes: dir_size(&snapshot_dir(data_dir)),
+            tool_output_bytes: dir_size(&tool_output_dir(data_dir)),
+            log_bytes: dir_size(&log_dir(data_dir)),
         },
         part_types,
         activity: if detail { Some(activity(con)?) } else { None },
@@ -289,7 +294,7 @@ mod tests {
         testdb::insert_session(&con, "s1", "/a", None);
         let part = r#"{"type":"reasoning","text":"r"}"#;
         testdb::insert_part(&con, "s1", part);
-        let mut out = stats_out(&con, Path::new("/tmp/x.db"), false).unwrap();
+        let mut out = stats_out(&con, Path::new("/tmp"), Path::new("/tmp/x.db"), false).unwrap();
         // env and file sizes are host-dependent; fix them for the
         // golden comparison.
         out.env = crate::db::EnvStatus {
@@ -336,7 +341,7 @@ mod tests {
         fs::create_dir_all(dir.join("tool-output")).unwrap();
         fs::write(dir.join("tool-output/x"), vec![0u8; 7]).unwrap();
 
-        let out = stats_value(&con, &db_path, false).unwrap();
+        let out = stats_value(&con, &dir, &db_path, false).unwrap();
         assert_eq!(out["storage"]["session_diff_bytes"], 3);
         assert_eq!(out["storage"]["snapshot_bytes"], 5);
         assert_eq!(out["storage"]["tool_output_bytes"], 7);
@@ -354,7 +359,13 @@ mod tests {
         testdb::insert_part(&con, "s1", r#"{"type":"text","text":"t"}"#);
         testdb::insert_part(&con, "s1", r#"{"type":"tool","text":"o"}"#);
 
-        let out = stats_value(&con, std::path::Path::new("/tmp/x.db"), false).unwrap();
+        let out = stats_value(
+            &con,
+            std::path::Path::new("/tmp"),
+            std::path::Path::new("/tmp/x.db"),
+            false,
+        )
+        .unwrap();
         assert_eq!(out["part_types"]["reasoning"]["count"], 2);
         assert_eq!(
             out["part_types"]["reasoning"]["bytes"],
@@ -373,7 +384,13 @@ mod tests {
         testdb::insert_part(&con, "s1", r#"{"type":"b","text":"xxxxxxxxxx"}"#);
         testdb::insert_part(&con, "s1", r#"{"type":"c","text":"xxxxxxxxxxxxxxxxxxxx"}"#);
 
-        let out = stats_value(&con, std::path::Path::new("/tmp/x.db"), false).unwrap();
+        let out = stats_value(
+            &con,
+            std::path::Path::new("/tmp"),
+            std::path::Path::new("/tmp/x.db"),
+            false,
+        )
+        .unwrap();
         let keys: Vec<&str> = out["part_types"]
             .as_object()
             .unwrap()
@@ -401,11 +418,23 @@ mod tests {
         testdb::insert_session(&con, "child", "/a", Some("root"));
         testdb::insert_part_at(&con, "child", r#"{"type":"text","text":"child"}"#, now);
 
-        let out = stats_value(&con, std::path::Path::new("/tmp/x.db"), false).unwrap();
+        let out = stats_value(
+            &con,
+            std::path::Path::new("/tmp"),
+            std::path::Path::new("/tmp/x.db"),
+            false,
+        )
+        .unwrap();
         assert!(out.get("activity").is_none());
         assert!(out.get("subagent").is_none());
 
-        let out = stats_value(&con, std::path::Path::new("/tmp/x.db"), true).unwrap();
+        let out = stats_value(
+            &con,
+            std::path::Path::new("/tmp"),
+            std::path::Path::new("/tmp/x.db"),
+            true,
+        )
+        .unwrap();
         assert_eq!(out["activity"]["days"], 30);
         let days = out["activity"]["created"].as_array().unwrap();
         // now and now-2d are always on distinct local days, even across

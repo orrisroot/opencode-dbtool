@@ -88,6 +88,7 @@ fn usage() {
     println!();
     println!("ENV:");
     println!("  OPENCODE_DATA_DIR  override data dir (default: XDG_DATA_HOME/opencode, ~/.local/share/opencode)");
+    println!("  OPENCODE_DB        override database path (:memory: or absolute; relative resolves against the data dir)");
 }
 
 fn require_db(db_path: &Path) -> Result<()> {
@@ -152,7 +153,9 @@ fn run() -> Result<()> {
     let Some(dir) = config::data_dir() else {
         return Err(AppError::usage("cannot determine opencode data dir"));
     };
-    let db_path = dir.join("opencode.db");
+    // Database path: `$OPENCODE_DB` if set, then `opencode.db` in the
+    // data dir, then a channel-named `opencode-<channel>.db`.
+    let db_path = config::db_path()?;
 
     match command.as_str() {
         "" => {
@@ -211,7 +214,7 @@ fn run() -> Result<()> {
         }
         "stats" => require_db(&db_path).and_then(|_| {
             let con = db::open_conn(&db_path, true)?;
-            commands::stats::cmd_stats(&con, &db_path, rest)
+            commands::stats::cmd_stats(&con, &dir, &db_path, rest)
         }),
         "doctor" => require_db(&db_path).and_then(|_| {
             let con = db::open_conn(&db_path, true)?;
@@ -242,6 +245,7 @@ fn run() -> Result<()> {
                             &mut con,
                             &rest[1..],
                             dry_run,
+                            &dir,
                             &db_path,
                         )
                     } else {
@@ -249,6 +253,7 @@ fn run() -> Result<()> {
                             &mut con,
                             &rest[1..],
                             dry_run,
+                            &dir,
                             &db_path,
                         )
                     }
@@ -261,11 +266,11 @@ fn run() -> Result<()> {
         "session" => match rest.first().map(|s| s.as_str()).unwrap_or("") {
             "list" => require_db(&db_path).and_then(|_| {
                 let con = db::open_conn(&db_path, true)?;
-                commands::session::cmd_session_list(&con, &db_path, &rest[1..])
+                commands::session::cmd_session_list(&con, &dir, &rest[1..])
             }),
             "show" => require_db(&db_path).and_then(|_| {
                 let con = db::open_conn(&db_path, true)?;
-                commands::session::cmd_session_show(&con, &rest[1..], &db_path)
+                commands::session::cmd_session_show(&con, &dir, &rest[1..])
             }),
             "delete" => require_db(&db_path)
                 .and_then(|_| {
@@ -278,7 +283,13 @@ fn run() -> Result<()> {
                 })
                 .and_then(|_| {
                     let mut con = db::open_conn(&db_path, dry_run)?;
-                    commands::session::cmd_session_delete(&mut con, &rest[1..], dry_run, &db_path)
+                    commands::session::cmd_session_delete(
+                        &mut con,
+                        &rest[1..],
+                        dry_run,
+                        &dir,
+                        &db_path,
+                    )
                 }),
             "purge" | "strip-reasoning" => require_db(&db_path)
                 .and_then(|_| {
@@ -296,6 +307,7 @@ fn run() -> Result<()> {
                             &mut con,
                             &rest[1..],
                             dry_run,
+                            &dir,
                             &db_path,
                         )
                     } else {
@@ -319,7 +331,7 @@ fn run() -> Result<()> {
                     // Unguarded: orphan diff files are never referenced
                     // by a live opencode session.
                     let con = db::open_conn(&db_path, true)?;
-                    commands::fsops::cmd_fs_clean_orphans(&con, &rest[1..], dry_run, &db_path)
+                    commands::fsops::cmd_fs_clean_orphans(&con, &rest[1..], dry_run, &dir, &db_path)
                 }),
             "clean-snapshots" => require_db(&db_path)
                 .and_then(|_| {
@@ -331,13 +343,13 @@ fn run() -> Result<()> {
                     )
                 })
                 .and_then(|_| {
-                    commands::fsops::cmd_fs_clean_snapshots(&rest[1..], dry_run, &db_path)
+                    commands::fsops::cmd_fs_clean_snapshots(&rest[1..], dry_run, &dir, &db_path)
                 }),
             "clean-tool-output" => require_confirmation(dry_run, yes, "fs clean-tool-output")
                 .and_then(|_| {
                     // Unguarded: the same retention-based cleanup opencode
                     // performs itself while running.
-                    commands::fsops::cmd_fs_clean_tool_output(&rest[1..], dry_run, &db_path)
+                    commands::fsops::cmd_fs_clean_tool_output(&rest[1..], dry_run, &dir, &db_path)
                 }),
             "clean-log" => require_db(&db_path)
                 .and_then(|_| {
@@ -348,7 +360,9 @@ fn run() -> Result<()> {
                         "truncating the log while opencode runs is not allowed",
                     )
                 })
-                .and_then(|_| commands::fsops::cmd_fs_clean_log(&rest[1..], dry_run, &db_path)),
+                .and_then(|_| {
+                    commands::fsops::cmd_fs_clean_log(&rest[1..], dry_run, &dir, &db_path)
+                }),
             _ => {
                 usage();
                 Err(AppError::silent(error::EXIT_NOT_FOUND))

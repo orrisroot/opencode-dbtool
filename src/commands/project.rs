@@ -121,6 +121,7 @@ pub fn cmd_project_delete(
     con: &mut Connection,
     args: &[String],
     dry_run: bool,
+    data_dir: &Path,
     db_path: &Path,
 ) -> Result<()> {
     let ids = parse_id_args(args)?;
@@ -137,7 +138,7 @@ pub fn cmd_project_delete(
             None => return Err(AppError::usage(format!("project not found: {id}"))),
         }
     }
-    delete_output(con, &projects, dry_run, db_path, None)
+    delete_output(con, &projects, dry_run, data_dir, db_path, None)
 }
 
 /// Delete the projects selected by filters. At least one filter is
@@ -146,6 +147,7 @@ pub fn cmd_project_purge(
     con: &mut Connection,
     args: &[String],
     dry_run: bool,
+    data_dir: &Path,
     db_path: &Path,
 ) -> Result<()> {
     let filters = parse_purge_args(args)?;
@@ -158,7 +160,7 @@ pub fn cmd_project_purge(
         .into_iter()
         .filter(|p| filters.matches(p))
         .collect();
-    delete_output(con, &projects, dry_run, db_path, Some(&filters))
+    delete_output(con, &projects, dry_run, data_dir, db_path, Some(&filters))
 }
 
 /// Parse `project delete` args: ids only; flags are rejected.
@@ -227,6 +229,7 @@ fn delete_output(
     con: &mut Connection,
     projects: &[ProjectRow],
     dry_run: bool,
+    data_dir: &Path,
     db_path: &Path,
     filters: Option<&ProjectFilter>,
 ) -> Result<()> {
@@ -317,7 +320,7 @@ fn delete_output(
             "some project data still exists after delete",
         ));
     }
-    let (diff_files, diff_bytes) = remove_diff_files(db_path, &session_ids);
+    let (diff_files, diff_bytes) = remove_diff_files(data_dir, &session_ids);
     out.deleted = true;
     out.diff_files_removed = Some(diff_files);
     out.diff_bytes_removed = Some(diff_bytes);
@@ -327,8 +330,8 @@ fn delete_output(
 
 /// Best-effort removal of `storage/session_diff/<id>.json` files;
 /// missing files are ignored. Returns (files removed, bytes removed).
-fn remove_diff_files(db_path: &Path, ids: &[String]) -> (usize, u64) {
-    let dir = crate::util::session_diff_dir(db_path);
+fn remove_diff_files(data_dir: &Path, ids: &[String]) -> (usize, u64) {
+    let dir = crate::util::session_diff_dir(data_dir);
     let mut removed = 0;
     let mut bytes = 0;
     for id in ids {
@@ -355,7 +358,14 @@ mod tests {
         testdb::insert_project(&con, "p1", "/a");
         testdb::insert_project_session(&con, "s1", "/a", "p1", 0);
 
-        cmd_project_delete(&mut con, &["p1".to_string()], false, Path::new("/tmp/x.db")).unwrap();
+        cmd_project_delete(
+            &mut con,
+            &["p1".to_string()],
+            false,
+            Path::new("/tmp"),
+            Path::new("/tmp/x.db"),
+        )
+        .unwrap();
 
         assert_eq!(testdb::project_count(&con), 0);
         assert_eq!(testdb::session_count(&con), 0);
@@ -370,6 +380,7 @@ mod tests {
             &mut con,
             &["--path".to_string(), "/a".to_string()],
             false,
+            Path::new("/tmp"),
             Path::new("/tmp/x.db"),
         )
         .unwrap_err();
@@ -388,6 +399,7 @@ mod tests {
             &mut con,
             &["--path".to_string(), "/a".to_string()],
             false,
+            Path::new("/tmp"),
             Path::new("/tmp/x.db"),
         )
         .unwrap();
@@ -404,7 +416,14 @@ mod tests {
         let mut con = testdb::create();
         testdb::insert_project(&con, "p1", "/a");
 
-        let err = cmd_project_purge(&mut con, &[], false, Path::new("/tmp/x.db")).unwrap_err();
+        let err = cmd_project_purge(
+            &mut con,
+            &[],
+            false,
+            Path::new("/tmp"),
+            Path::new("/tmp/x.db"),
+        )
+        .unwrap_err();
         assert_eq!(err.code, 2);
     }
 
@@ -422,6 +441,7 @@ mod tests {
             &mut con,
             &["--older-than".to_string(), "30d".to_string()],
             false,
+            Path::new("/tmp"),
             Path::new("/tmp/x.db"),
         )
         .unwrap();
@@ -443,6 +463,7 @@ mod tests {
             &mut con,
             &["--path".to_string(), "/a".to_string()],
             true,
+            Path::new("/tmp"),
             Path::new("/tmp/x.db"),
         )
         .unwrap();
@@ -492,7 +513,7 @@ mod tests {
         std::fs::write(diff.join("s2.json"), vec![0u8; 6]).unwrap();
         std::fs::write(diff.join("other.json"), vec![0u8; 8]).unwrap();
 
-        cmd_project_delete(&mut con, &["p1".to_string()], false, &db_path).unwrap();
+        cmd_project_delete(&mut con, &["p1".to_string()], false, &dir, &db_path).unwrap();
 
         assert!(!diff.join("s1.json").exists());
         assert!(!diff.join("s2.json").exists());

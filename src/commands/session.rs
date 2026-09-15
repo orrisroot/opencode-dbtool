@@ -103,14 +103,14 @@ struct StripOut {
     note: Option<String>,
 }
 
-pub fn cmd_session_list(con: &Connection, db_path: &Path, args: &[String]) -> Result<()> {
-    print_json(&session_list_value(con, db_path, args)?)
+pub fn cmd_session_list(con: &Connection, data_dir: &Path, args: &[String]) -> Result<()> {
+    print_json(&session_list_value(con, data_dir, args)?)
 }
 
 /// Build the session list array (exposed for tests).
 pub fn session_list_value(
     con: &Connection,
-    db_path: &Path,
+    data_dir: &Path,
     args: &[String],
 ) -> Result<serde_json::Value> {
     let mut limit: Option<usize> = None;
@@ -143,7 +143,7 @@ pub fn session_list_value(
             other => return Err(AppError::usage(format!("unknown option: {other}"))),
         }
     }
-    let mut sessions = load_sessions(con, Some(&session_diff_dir(db_path)))?;
+    let mut sessions = load_sessions(con, Some(&session_diff_dir(data_dir)))?;
     if sort_size {
         sessions.sort_by(|a, b| {
             b.size_bytes()
@@ -158,14 +158,14 @@ pub fn session_list_value(
     Ok(serde_json::to_value(out)?)
 }
 
-pub fn cmd_session_show(con: &Connection, args: &[String], db_path: &Path) -> Result<()> {
+pub fn cmd_session_show(con: &Connection, data_dir: &Path, args: &[String]) -> Result<()> {
     if args.len() != 1 {
         return Err(AppError::usage(
             "usage: opencode-dbtool session show <session-id>",
         ));
     }
     let id = args[0].trim();
-    let s = load_session(con, id, Some(&session_diff_dir(db_path)))?
+    let s = load_session(con, id, Some(&session_diff_dir(data_dir)))?
         .ok_or_else(|| AppError::usage(format!("session not found: {id}")))?;
     print_json(&serde_json::to_value(session_json(&s))?)
 }
@@ -174,6 +174,7 @@ pub fn cmd_session_delete(
     con: &mut Connection,
     args: &[String],
     dry_run: bool,
+    data_dir: &Path,
     db_path: &Path,
 ) -> Result<()> {
     let ids = parse_id_args(args)?;
@@ -192,7 +193,7 @@ pub fn cmd_session_delete(
         return print_json(&serde_json::to_value(&out)?);
     }
 
-    let (diff_files, diff_bytes) = execute_delete(con, &resolved, db_path)?;
+    let (diff_files, diff_bytes) = execute_delete(con, &resolved, data_dir)?;
     out.deleted = true;
     out.diff_files_removed = Some(diff_files);
     out.diff_bytes_removed = Some(diff_bytes);
@@ -205,6 +206,7 @@ pub fn cmd_session_purge(
     con: &mut Connection,
     args: &[String],
     dry_run: bool,
+    data_dir: &Path,
     db_path: &Path,
 ) -> Result<()> {
     let filters = parse_purge_args(args)?;
@@ -229,7 +231,7 @@ pub fn cmd_session_purge(
         return print_json(&serde_json::to_value(&out)?);
     }
 
-    let (diff_files, diff_bytes) = execute_delete(con, &selected, db_path)?;
+    let (diff_files, diff_bytes) = execute_delete(con, &selected, data_dir)?;
     out.deleted = true;
     out.diff_files_removed = Some(diff_files);
     out.diff_bytes_removed = Some(diff_bytes);
@@ -598,7 +600,7 @@ fn placeholders(n: usize) -> String {
 fn execute_delete(
     con: &mut Connection,
     resolved: &[String],
-    db_path: &Path,
+    data_dir: &Path,
 ) -> Result<(usize, u64)> {
     con.execute_batch("PRAGMA foreign_keys = ON;")?;
     let tx = con.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
@@ -636,13 +638,13 @@ fn execute_delete(
             "sessions still exist after delete: {remaining}"
         )));
     }
-    Ok(remove_diff_files(db_path, resolved))
+    Ok(remove_diff_files(data_dir, resolved))
 }
 
 /// Best-effort removal of `storage/session_diff/<id>.json` files;
 /// missing files are ignored. Returns (files removed, bytes removed).
-fn remove_diff_files(db_path: &Path, ids: &[String]) -> (usize, u64) {
-    let dir = session_diff_dir(db_path);
+fn remove_diff_files(data_dir: &Path, ids: &[String]) -> (usize, u64) {
+    let dir = session_diff_dir(data_dir);
     let mut removed = 0;
     let mut bytes = 0;
     for id in ids {
@@ -675,6 +677,7 @@ mod tests {
             &mut con,
             &["parent".to_string()],
             false,
+            Path::new("/tmp"),
             Path::new("/tmp/x.db"),
         )
         .unwrap();
@@ -696,6 +699,7 @@ mod tests {
             &mut con,
             &["child".to_string()],
             false,
+            Path::new("/tmp"),
             Path::new("/tmp/x.db"),
         )
         .unwrap();
@@ -716,6 +720,7 @@ mod tests {
             &mut con,
             &["--path".to_string(), "/a".to_string()],
             false,
+            Path::new("/tmp"),
             Path::new("/tmp/x.db"),
         )
         .unwrap_err();
@@ -861,6 +866,7 @@ mod tests {
             &mut con,
             &["--path".to_string(), "/a".to_string()],
             false,
+            Path::new("/tmp"),
             Path::new("/tmp/x.db"),
         )
         .unwrap();
@@ -873,7 +879,14 @@ mod tests {
         let mut con = testdb::create();
         testdb::insert_session(&con, "s1", "/a", None);
 
-        let err = cmd_session_purge(&mut con, &[], false, Path::new("/tmp/x.db")).unwrap_err();
+        let err = cmd_session_purge(
+            &mut con,
+            &[],
+            false,
+            Path::new("/tmp"),
+            Path::new("/tmp/x.db"),
+        )
+        .unwrap_err();
         assert_eq!(err.code, 2);
     }
 
@@ -887,6 +900,7 @@ mod tests {
             &mut con,
             &["--subagents".to_string()],
             false,
+            Path::new("/tmp"),
             Path::new("/tmp/x.db"),
         )
         .unwrap();
@@ -909,6 +923,7 @@ mod tests {
             &mut con,
             &["--older-than".to_string(), "30d".to_string()],
             false,
+            Path::new("/tmp"),
             Path::new("/tmp/x.db"),
         )
         .unwrap();
@@ -934,6 +949,7 @@ mod tests {
             &mut con,
             &["--older-than".to_string(), "30d".to_string()],
             false,
+            Path::new("/tmp"),
             Path::new("/tmp/x.db"),
         )
         .unwrap();
@@ -961,6 +977,7 @@ mod tests {
                 "--subagents".to_string(),
             ],
             false,
+            Path::new("/tmp"),
             Path::new("/tmp/x.db"),
         )
         .unwrap();
@@ -985,6 +1002,7 @@ mod tests {
             &mut con,
             &["--path".to_string(), "/a".to_string()],
             true,
+            Path::new("/tmp"),
             Path::new("/tmp/x.db"),
         )
         .unwrap();
@@ -1004,6 +1022,7 @@ mod tests {
             &mut con,
             &["--larger-than".to_string(), "4".to_string()],
             false,
+            Path::new("/tmp"),
             Path::new("/tmp/x.db"),
         )
         .unwrap();
@@ -1026,6 +1045,7 @@ mod tests {
             &mut con,
             &["--keep-latest".to_string(), "2".to_string()],
             false,
+            Path::new("/tmp"),
             Path::new("/tmp/x.db"),
         )
         .unwrap();
@@ -1051,6 +1071,7 @@ mod tests {
             &mut con,
             &["--keep-latest".to_string(), "1".to_string()],
             false,
+            Path::new("/tmp"),
             Path::new("/tmp/x.db"),
         )
         .unwrap();
@@ -1069,6 +1090,7 @@ mod tests {
             &mut con,
             &["--keep-latest".to_string(), "1".to_string()],
             false,
+            Path::new("/tmp"),
             Path::new("/tmp/x.db"),
         )
         .unwrap();
@@ -1090,6 +1112,7 @@ mod tests {
             &mut con,
             &["--keep-latest".to_string(), "0".to_string()],
             false,
+            Path::new("/tmp"),
             Path::new("/tmp/x.db"),
         )
         .unwrap();
@@ -1106,6 +1129,7 @@ mod tests {
             &mut con,
             &["--keep-latest".to_string(), "5".to_string()],
             false,
+            Path::new("/tmp"),
             Path::new("/tmp/x.db"),
         )
         .unwrap();
@@ -1128,6 +1152,7 @@ mod tests {
                 "1".to_string(),
             ],
             false,
+            Path::new("/tmp"),
             Path::new("/tmp/x.db"),
         )
         .unwrap();
@@ -1393,7 +1418,7 @@ mod tests {
         std::fs::write(diff.join("s1.json"), vec![0u8; 4]).unwrap();
         std::fs::write(diff.join("other.json"), vec![0u8; 8]).unwrap();
 
-        cmd_session_delete(&mut con, &["s1".to_string()], false, &db_path).unwrap();
+        cmd_session_delete(&mut con, &["s1".to_string()], false, &dir, &db_path).unwrap();
 
         assert!(
             !diff.join("s1.json").exists(),
@@ -1418,6 +1443,7 @@ mod tests {
             &mut con,
             &["--path".to_string(), "/a".to_string()],
             false,
+            &dir,
             &db_path,
         )
         .unwrap();
@@ -1437,7 +1463,7 @@ mod tests {
         std::fs::create_dir_all(&diff).unwrap();
         std::fs::write(diff.join("s1.json"), vec![0u8; 6]).unwrap();
 
-        let sessions = load_sessions(&con, Some(&session_diff_dir(&db_path))).unwrap();
+        let sessions = load_sessions(&con, Some(&session_diff_dir(&dir))).unwrap();
         assert_eq!(sessions[0].diff_bytes, 6);
 
         let sessions = load_sessions(&con, None).unwrap();

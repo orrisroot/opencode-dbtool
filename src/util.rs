@@ -102,37 +102,30 @@ pub fn dir_size(path: &std::path::Path) -> u64 {
     total
 }
 
-/// `storage/session_diff` dir for a database path (one `<id>.json` per
-/// session).
-pub fn session_diff_dir(db_path: &Path) -> PathBuf {
-    db_path
-        .parent()
-        .unwrap_or(Path::new("."))
-        .join("storage")
-        .join("session_diff")
+/// `storage/session_diff` dir under the opencode data dir (one
+/// `<id>.json` per session).
+pub fn session_diff_dir(data_dir: &Path) -> PathBuf {
+    data_dir.join("storage").join("session_diff")
 }
 
-/// `snapshot` dir for a database path (git object packs per project).
-pub fn snapshot_dir(db_path: &Path) -> PathBuf {
-    db_path.parent().unwrap_or(Path::new(".")).join("snapshot")
+/// `snapshot` dir under the data dir (git object packs per project).
+pub fn snapshot_dir(data_dir: &Path) -> PathBuf {
+    data_dir.join("snapshot")
 }
 
-/// `tool-output` dir for a database path.
-pub fn tool_output_dir(db_path: &Path) -> PathBuf {
-    db_path
-        .parent()
-        .unwrap_or(Path::new("."))
-        .join("tool-output")
+/// `tool-output` dir under the data dir.
+pub fn tool_output_dir(data_dir: &Path) -> PathBuf {
+    data_dir.join("tool-output")
 }
 
-/// `log` dir for a database path.
-pub fn log_dir(db_path: &Path) -> PathBuf {
-    db_path.parent().unwrap_or(Path::new(".")).join("log")
+/// `log` dir under the data dir.
+pub fn log_dir(data_dir: &Path) -> PathBuf {
+    data_dir.join("log")
 }
 
-/// `log/opencode.log` file for a database path.
-pub fn log_file(db_path: &Path) -> PathBuf {
-    log_dir(db_path).join("opencode.log")
+/// `log/opencode.log` file under the data dir.
+pub fn log_file(data_dir: &Path) -> PathBuf {
+    log_dir(data_dir).join("opencode.log")
 }
 
 /// Decompose a unix-millis timestamp into UTC calendar fields.

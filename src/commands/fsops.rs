@@ -85,10 +85,11 @@ pub fn cmd_fs_clean_orphans(
     con: &Connection,
     args: &[String],
     dry_run: bool,
+    data_dir: &Path,
     db_path: &Path,
 ) -> Result<()> {
     expect_no_args(args, "fs clean-orphans")?;
-    let dir = session_diff_dir(db_path);
+    let dir = session_diff_dir(data_dir);
 
     let mut ids: HashSet<String> = HashSet::new();
     if dir.exists() {
@@ -148,9 +149,14 @@ pub fn cmd_fs_clean_orphans(
 /// command. Safe while opencode runs: these files are never read back,
 /// only referenced by marker text, and opencode itself deletes them
 /// regardless of references after 7 days.
-pub fn cmd_fs_clean_tool_output(args: &[String], dry_run: bool, db_path: &Path) -> Result<()> {
+pub fn cmd_fs_clean_tool_output(
+    args: &[String],
+    dry_run: bool,
+    data_dir: &Path,
+    db_path: &Path,
+) -> Result<()> {
     expect_no_args(args, "fs clean-tool-output")?;
-    let dir = tool_output_dir(db_path);
+    let dir = tool_output_dir(data_dir);
     let mut files: Vec<FileEntry> = Vec::new();
     let mut total_bytes: u64 = 0;
     if let Ok(rd) = std::fs::read_dir(&dir) {
@@ -194,9 +200,14 @@ pub fn cmd_fs_clean_tool_output(args: &[String], dry_run: bool, db_path: &Path) 
 /// leave the running opencode writing to the old file, so truncation is
 /// the only option; it is guarded while opencode runs for the same
 /// reason as `clean-snapshots`.
-pub fn cmd_fs_clean_log(args: &[String], dry_run: bool, db_path: &Path) -> Result<()> {
+pub fn cmd_fs_clean_log(
+    args: &[String],
+    dry_run: bool,
+    data_dir: &Path,
+    db_path: &Path,
+) -> Result<()> {
     expect_no_args(args, "fs clean-log")?;
-    let file = log_file(db_path);
+    let file = log_file(data_dir);
 
     let mut out = LogOut {
         env: env_status(db_path),
@@ -221,9 +232,14 @@ pub fn cmd_fs_clean_log(args: &[String], dry_run: bool, db_path: &Path) -> Resul
 
 /// Delete all snapshot storage (undo/redo history). Guarded while
 /// opencode runs because snapshots are in use during revert operations.
-pub fn cmd_fs_clean_snapshots(args: &[String], dry_run: bool, db_path: &Path) -> Result<()> {
+pub fn cmd_fs_clean_snapshots(
+    args: &[String],
+    dry_run: bool,
+    data_dir: &Path,
+    db_path: &Path,
+) -> Result<()> {
     expect_no_args(args, "fs clean-snapshots")?;
-    let dir = snapshot_dir(db_path);
+    let dir = snapshot_dir(data_dir);
 
     let mut entries: Vec<SnapshotEntry> = Vec::new();
     let mut total_bytes: u64 = 0;
@@ -293,7 +309,7 @@ mod tests {
         fs::write(diff.join("orphan.json"), vec![0u8; 7]).unwrap();
         fs::write(diff.join("other.json"), vec![0u8; 11]).unwrap();
 
-        cmd_fs_clean_orphans(&con, &[], false, &db_path).unwrap();
+        cmd_fs_clean_orphans(&con, &[], false, &dir, &db_path).unwrap();
 
         assert!(diff.join("alive.json").exists(), "live session file kept");
         assert!(!diff.join("orphan.json").exists(), "orphan removed");
@@ -313,7 +329,7 @@ mod tests {
         fs::create_dir_all(&diff).unwrap();
         fs::write(diff.join("orphan.json"), vec![0u8; 7]).unwrap();
 
-        cmd_fs_clean_orphans(&con, &[], true, &db_path).unwrap();
+        cmd_fs_clean_orphans(&con, &[], true, &dir, &db_path).unwrap();
 
         assert!(diff.join("orphan.json").exists());
         drop(con);
@@ -327,7 +343,7 @@ mod tests {
         let con = testdb::create_at(&db_path);
         testdb::insert_session(&con, "alive", "/a", None);
 
-        cmd_fs_clean_orphans(&con, &[], false, &db_path).unwrap();
+        cmd_fs_clean_orphans(&con, &[], false, &dir, &db_path).unwrap();
         assert!(!dir.join("storage").exists());
         drop(con);
         fs::remove_dir_all(&dir).unwrap();
@@ -342,7 +358,7 @@ mod tests {
         fs::create_dir_all(dir.join("snapshot/p2/h")).unwrap();
         fs::write(dir.join("snapshot/p2/h/obj"), vec![0u8; 3]).unwrap();
 
-        cmd_fs_clean_snapshots(&[], false, &db_path).unwrap();
+        cmd_fs_clean_snapshots(&[], false, &dir, &db_path).unwrap();
 
         assert!(!dir.join("snapshot/p1").exists());
         assert!(!dir.join("snapshot/p2").exists());
@@ -355,7 +371,7 @@ mod tests {
         let db_path = dir.join("opencode.db");
         fs::create_dir_all(dir.join("snapshot/p1")).unwrap();
 
-        cmd_fs_clean_snapshots(&[], true, &db_path).unwrap();
+        cmd_fs_clean_snapshots(&[], true, &dir, &db_path).unwrap();
 
         assert!(dir.join("snapshot/p1").exists());
         fs::remove_dir_all(&dir).unwrap();
@@ -366,7 +382,7 @@ mod tests {
         let dir = temp_data_dir("snap-missing");
         let db_path = dir.join("opencode.db");
 
-        cmd_fs_clean_snapshots(&[], false, &db_path).unwrap();
+        cmd_fs_clean_snapshots(&[], false, &dir, &db_path).unwrap();
         fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -425,7 +441,7 @@ mod tests {
         fs::write(&recent, vec![0u8; 3]).unwrap();
         fs::write(&other, vec![0u8; 2]).unwrap();
 
-        cmd_fs_clean_tool_output(&[], false, &db_path).unwrap();
+        cmd_fs_clean_tool_output(&[], false, &dir, &db_path).unwrap();
 
         assert!(!old.exists(), "old tool file removed");
         assert!(!recent.exists(), "recent tool file removed");
@@ -442,7 +458,7 @@ mod tests {
         let old = out_dir.join("tool_x");
         fs::write(&old, vec![0u8; 5]).unwrap();
 
-        cmd_fs_clean_tool_output(&[], true, &db_path).unwrap();
+        cmd_fs_clean_tool_output(&[], true, &dir, &db_path).unwrap();
 
         assert!(old.exists());
         fs::remove_dir_all(&dir).unwrap();
@@ -453,7 +469,7 @@ mod tests {
         let dir = temp_data_dir("toolout-missing");
         let db_path = dir.join("opencode.db");
 
-        cmd_fs_clean_tool_output(&[], false, &db_path).unwrap();
+        cmd_fs_clean_tool_output(&[], false, &dir, &db_path).unwrap();
         fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -465,7 +481,7 @@ mod tests {
         fs::create_dir_all(dir.join("log")).unwrap();
         fs::write(&log, vec![0u8; 100]).unwrap();
 
-        cmd_fs_clean_log(&[], false, &db_path).unwrap();
+        cmd_fs_clean_log(&[], false, &dir, &db_path).unwrap();
 
         assert!(log.exists(), "file kept, only truncated");
         assert_eq!(fs::metadata(&log).unwrap().len(), 0);
@@ -480,7 +496,7 @@ mod tests {
         fs::create_dir_all(dir.join("log")).unwrap();
         fs::write(&log, vec![0u8; 100]).unwrap();
 
-        cmd_fs_clean_log(&[], true, &db_path).unwrap();
+        cmd_fs_clean_log(&[], true, &dir, &db_path).unwrap();
 
         assert_eq!(fs::metadata(&log).unwrap().len(), 100);
         fs::remove_dir_all(&dir).unwrap();
@@ -491,7 +507,7 @@ mod tests {
         let dir = temp_data_dir("log-missing");
         let db_path = dir.join("opencode.db");
 
-        cmd_fs_clean_log(&[], false, &db_path).unwrap();
+        cmd_fs_clean_log(&[], false, &dir, &db_path).unwrap();
         fs::remove_dir_all(&dir).unwrap();
     }
 }
