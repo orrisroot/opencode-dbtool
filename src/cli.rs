@@ -45,6 +45,11 @@ pub struct Cli {
     /// Suppress progress and confirmation messages on stderr
     #[arg(long, global = true)]
     pub quiet: bool,
+
+    /// Stop the opencode service before maintenance and restart it after
+    /// (applies to commands that otherwise require opencode to be closed)
+    #[arg(long, global = true)]
+    pub restart_service: bool,
 }
 
 #[derive(Subcommand)]
@@ -493,6 +498,8 @@ mod tests {
         assert!(cli.yes);
         let cli = parse(&["opencode-dbtool", "stats", "--format", "table"]);
         assert_eq!(cli.format, Some(Format::Table));
+        let cli = parse(&["opencode-dbtool", "vacuum", "--restart-service"]);
+        assert!(cli.restart_service);
     }
 
     #[test]

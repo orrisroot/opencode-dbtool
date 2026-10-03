@@ -1022,3 +1022,77 @@ fn session_delete_routes_through_the_running_service() {
 
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+#[test]
+fn restart_service_requires_a_registered_service() {
+    let dir = temp_dir("restart-missing");
+    create_db(&dir.join("opencode.db"));
+
+    let out = run(
+        &[
+            "session",
+            "purge",
+            "--older-than",
+            "30d",
+            "--restart-service",
+            "--yes",
+        ],
+        &dir,
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("no running opencode service"),
+        "stderr: {stderr}"
+    );
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn restart_service_dry_run_previews_without_stopping() {
+    let dir = temp_dir("restart-dry");
+    create_db(&dir.join("opencode.db"));
+
+    let out = run(
+        &[
+            "session",
+            "purge",
+            "--older-than",
+            "30d",
+            "--restart-service",
+            "--dry-run",
+        ],
+        &dir,
+    );
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v = stdout_json(&out);
+    assert_eq!(v["deleted"], false);
+    assert_eq!(v["sessions"].as_array().unwrap().len(), 1);
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn restart_service_is_ignored_by_read_only_commands() {
+    let dir = temp_dir("restart-stats");
+    create_db(&dir.join("opencode.db"));
+
+    let out = run(&["stats", "--restart-service"], &dir);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}

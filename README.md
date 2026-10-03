@@ -135,10 +135,18 @@ tool adapts:
 - **`vacuum --online`** attempts a VACUUM while opencode runs with a long
   busy timeout; the server may block writes for the duration, and the
   command fails cleanly if it cannot win the lock.
+- **`--restart-service`** (global flag) stops the registered service
+  through its own `opencode service stop`, runs the command, and starts it
+  again afterwards — even if the command fails. Use it for the commands
+  that still need exclusive access (`project delete/purge`, `session
+  strip-reasoning`, `kv delete`, `fs clean-log`, full `fs
+  clean-snapshots`/`clean-shell`, `vacuum`, and `cleanup` including its
+  VACUUM). A running TUI may need to be restarted if the service comes
+  back on a different port.
 - `project delete/purge`, `session strip-reasoning`, `kv delete`,
   `fs clean-log`, `fs clean-snapshots` without `--orphans-only`, and
   `fs clean-shell` without `--older-than` still require stopping opencode
-  (exit 1).
+  (exit 1) unless `--restart-service` is passed.
 
 To stop and restart the service manually:
 
@@ -147,6 +155,12 @@ opencode service status   # prints the server URL, or "stopped"
 opencode service stop
 opencode-dbtool vacuum --yes
 opencode service start
+```
+
+`--restart-service` automates exactly this sequence:
+
+```sh
+opencode-dbtool cleanup --older-than 30d --subagents --restart-service
 ```
 
 The tool discovers the service through `service.json` (or `server.json`)
@@ -630,6 +644,8 @@ command and reports each step's result. Steps, in order:
    write lock; run `opencode-dbtool vacuum --online` afterwards, or stop
    the service. The purge step is routed through the server API, so a
    `cleanup` with session filters is safe online.
+   `cleanup --restart-service` stops the service first instead: the purge
+   then uses the direct database path and the final VACUUM runs too.
 
 All `session purge` filters are accepted directly. `--keep-backups <n>`
 prunes older backups after the pre-run backup. The output embeds each step's
@@ -695,6 +711,7 @@ failures, and download problems surface as exit code 3.
 | `--quiet` | suppress progress and confirmation messages on stderr |
 | `--no-backup` | `vacuum`/`cleanup`: skip the timestamped backup (dangerous) |
 | `--online` | `vacuum` only: attempt VACUUM while opencode runs (may block the server briefly) |
+| `--restart-service` | stop the registered opencode service for the run and restart it afterwards (for commands that need exclusive access) |
 
 Destructive commands refuse to run without `--yes`, `--dry-run`, or an
 interactive terminal (exit code 2): use `--dry-run` to preview the impact
@@ -723,6 +740,9 @@ opencode-dbtool session purge --older-than 30d --subagents
 
 # Reclaim the database file size (VACUUM needs the write lock)
 opencode-dbtool vacuum --online
+
+# Full cleanup including VACUUM, with an automatic service restart
+opencode-dbtool cleanup --older-than 30d --subagents --restart-service
 
 # Inspect a huge cache key
 opencode-dbtool kv list

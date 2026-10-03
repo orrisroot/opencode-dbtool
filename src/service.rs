@@ -72,6 +72,150 @@ fn process_alive(pid: i32) -> bool {
     sys.process(pid).is_some()
 }
 
+/// Executable path of a running process (used to invoke its own
+/// `service stop` / `service start` subcommands).
+fn process_exe(pid: i32) -> Option<PathBuf> {
+    let pid = sysinfo::Pid::from_u32(pid as u32);
+    let mut sys = sysinfo::System::new();
+    sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+    sys.process(pid)
+        .and_then(|p| p.exe().map(Path::to_path_buf))
+}
+
+/// Last-resort termination if the CLI's own `service stop` did not end
+/// the process.
+fn kill_process(pid: i32) -> bool {
+    let pid = sysinfo::Pid::from_u32(pid as u32);
+    let mut sys = sysinfo::System::new();
+    sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+    match sys.process(pid) {
+        Some(process) => process.kill(),
+        None => false,
+    }
+}
+
+/// Pids (other than `exclude`) that have `db_path` open. Linux only:
+/// elsewhere the list is empty and the post-stop check is skipped.
+pub fn processes_with_db_open(db_path: &Path, exclude: &[i32]) -> Vec<i32> {
+    #[cfg(target_os = "linux")]
+    {
+        let mut out = Vec::new();
+        for pid in crate::sys::running_pids().unwrap_or_default() {
+            if exclude.contains(&pid) {
+                continue;
+            }
+            if linux_process_has_open(pid, db_path) {
+                out.push(pid);
+            }
+        }
+        out
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (db_path, exclude);
+        Vec::new()
+    }
+}
+
+/// A service stopped for maintenance, restarted explicitly (and, best
+/// effort, when dropped) so opencode is never left stopped silently.
+pub struct ServiceRestart {
+    service: ServiceInfo,
+    exe: PathBuf,
+    stopped: bool,
+}
+
+impl ServiceRestart {
+    /// Stop the registered service through its own `service stop`
+    /// command, falling back to terminating the pid if it does not exit.
+    pub fn stop(service: &ServiceInfo) -> Result<Self> {
+        let exe = process_exe(service.pid).ok_or_else(|| {
+            AppError::usage(format!(
+                "--restart-service: cannot locate the opencode executable for pid {}",
+                service.pid
+            ))
+        })?;
+        let output = std::process::Command::new(&exe)
+            .args(["service", "stop"])
+            .output()
+            .map_err(|e| {
+                AppError::db(format!(
+                    "--restart-service: cannot run {} service stop: {e}",
+                    exe.display()
+                ))
+            })?;
+        if !output.status.success() {
+            return Err(AppError::db(format!(
+                "--restart-service: {} service stop failed: {}",
+                exe.display(),
+                String::from_utf8_lossy(&output.stderr).trim()
+            )));
+        }
+        wait_for_exit(service.pid, 100);
+        if process_alive(service.pid) {
+            kill_process(service.pid);
+            wait_for_exit(service.pid, 50);
+        }
+        if process_alive(service.pid) {
+            return Err(AppError::db(format!(
+                "--restart-service: opencode service (pid {}) did not stop",
+                service.pid
+            )));
+        }
+        Ok(ServiceRestart {
+            service: service.clone(),
+            exe,
+            stopped: true,
+        })
+    }
+
+    /// Start the service again with its own `service start`.
+    pub fn restart(&mut self) -> Result<()> {
+        if !self.stopped {
+            return Ok(());
+        }
+        let output = std::process::Command::new(&self.exe)
+            .args(["service", "start"])
+            .output()
+            .map_err(|e| {
+                AppError::db(format!(
+                    "--restart-service: cannot run {} service start: {e}",
+                    self.exe.display()
+                ))
+            })?;
+        if !output.status.success() {
+            return Err(AppError::db(format!(
+                "--restart-service: {} service start failed: {}",
+                self.exe.display(),
+                String::from_utf8_lossy(&output.stderr).trim()
+            )));
+        }
+        self.stopped = false;
+        Ok(())
+    }
+
+    pub fn pid(&self) -> i32 {
+        self.service.pid
+    }
+}
+
+impl Drop for ServiceRestart {
+    fn drop(&mut self) {
+        if self.stopped {
+            let _ = self.restart();
+        }
+    }
+}
+
+fn wait_for_exit(pid: i32, steps: usize) {
+    for _ in 0..steps {
+        if !process_alive(pid) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
 impl ServiceInfo {
     fn auth_header(&self) -> Option<String> {
         self.password.as_ref().map(|password| {
@@ -206,6 +350,12 @@ mod tests {
         assert_eq!(svc.url, "http://127.0.0.1:4321");
         assert_eq!(svc.password.as_deref(), Some("from-file"));
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn process_exe_finds_the_current_process() {
+        let exe = process_exe(std::process::id() as i32).expect("current process has an exe");
+        assert!(exe.is_absolute(), "got: {}", exe.display());
     }
 
     #[test]

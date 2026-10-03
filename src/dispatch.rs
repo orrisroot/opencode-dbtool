@@ -26,7 +26,7 @@ pub fn execute(cli: Cli) -> Result<()> {
         return Ok(());
     }
     if matches!(command, Command::SelfUpdate) {
-        return with_confirmation(&cli, "self-update", None, |dry| {
+        return run_guarded(&cli, "self-update", None, None, false, None, |dry| {
             commands::selfupdate::cmd_self_update(dry)
         });
     }
@@ -37,11 +37,24 @@ pub fn execute(cli: Cli) -> Result<()> {
     let db_path = config::db_path()?;
     require_db(&db_path)?;
     let service = service::discover();
+    let restart = cli.restart_service;
 
-    match mutation_guard(command, service.as_ref(), &db_path) {
-        Some((what, idle)) => with_confirmation(&cli, what, idle, |dry| {
-            dispatch(command, &dir, &db_path, dry, cli.quiet, service.as_ref())
-        }),
+    match mutation_guard(command, service.as_ref(), &db_path, restart) {
+        Some((what, idle)) => {
+            let stop_service = restart && idle.is_some();
+            // When the service is stopped for maintenance, run the direct
+            // (offline) path instead of the server API.
+            let service_for_run = if stop_service { None } else { service.as_ref() };
+            run_guarded(
+                &cli,
+                what,
+                idle,
+                service.as_ref(),
+                stop_service,
+                Some(&db_path),
+                |dry| dispatch(command, &dir, &db_path, dry, cli.quiet, service_for_run),
+            )
+        }
         None => dispatch(command, &dir, &db_path, false, cli.quiet, service.as_ref()),
     }
 }
@@ -67,15 +80,18 @@ const IDLE_DELETE: &str = "deleting while opencode is running is not allowed";
 /// Commands that modify data or storage, with the guard message shown
 /// when opencode is running. `idle` is `None` for operations that are
 /// safe while opencode runs (online backups, orphan/old-file cleanup, and
-/// session deletes routed through the running server).
+/// session deletes routed through the running server). `restart` forces
+/// the offline path: the service is stopped first, so the API route and
+/// the online exceptions do not apply.
 fn mutation_guard<'a>(
     cmd: &Command,
     service: Option<&ServiceInfo>,
     db_path: &Path,
+    restart: bool,
 ) -> Option<(&'static str, Option<&'a str>)> {
     // Session deletes can go through the server API when the service
     // operates on the same database file.
-    let api_online = service.is_some_and(|s| s.targets_db(db_path));
+    let api_online = !restart && service.is_some_and(|s| s.targets_db(db_path));
     match cmd {
         Command::Project(ProjectCmd::Delete(_)) => Some(("project delete", Some(IDLE_DELETE))),
         Command::Project(ProjectCmd::Purge(_)) => Some(("project purge", Some(IDLE_DELETE))),
@@ -135,13 +151,25 @@ fn mutation_guard<'a>(
     }
 }
 
-/// Confirmation rules:
-/// - `--dry-run`: preview only, always allowed.
-/// - `--yes`: execute for real; the running-instance guard applies when
-///   the command is not safe online.
+/// Confirmation and guard rules:
+/// - `--dry-run`: preview only, always allowed (never stops the service).
+/// - `--yes`: execute for real.
 /// - neither, on a terminal: preview, ask `Proceed? [y/N]`, then execute.
 /// - neither, not a terminal: usage error (exit 2) as before.
-fn with_confirmation<F>(cli: &Cli, what: &str, idle: Option<&str>, mut run: F) -> Result<()>
+///
+/// For a real run, the running-instance guard applies unless the command
+/// is safe online. With `--restart-service` the registered service is
+/// stopped first and restarted afterwards (even on failure).
+#[allow(clippy::too_many_arguments)]
+fn run_guarded<F>(
+    cli: &Cli,
+    what: &str,
+    idle: Option<&str>,
+    service: Option<&ServiceInfo>,
+    restart: bool,
+    db_path: Option<&Path>,
+    mut run: F,
+) -> Result<()>
 where
     F: FnMut(bool) -> Result<()>,
 {
@@ -149,10 +177,7 @@ where
         return run(true);
     }
     if cli.yes {
-        if let Some(message) = idle {
-            sys::require_idle(message)?;
-        }
-        return run(false);
+        return execute_confirmed(cli, idle, service, restart, db_path, &mut run);
     }
     let interactive = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
     if !interactive {
@@ -160,18 +185,75 @@ where
             "{what} modifies data; pass `--dry-run` to preview the impact or `--yes` to confirm"
         )));
     }
-    if let Some(message) = idle {
-        sys::require_idle(message)?;
-    }
     run(true)?;
     if confirm::ask("Proceed?")? {
-        run(false)
+        execute_confirmed(cli, idle, service, restart, db_path, &mut run)
     } else {
         if !cli.quiet {
             eprintln!("aborted");
         }
         Ok(())
     }
+}
+
+fn execute_confirmed<F>(
+    cli: &Cli,
+    idle: Option<&str>,
+    service: Option<&ServiceInfo>,
+    restart: bool,
+    db_path: Option<&Path>,
+    run: &mut F,
+) -> Result<()>
+where
+    F: FnMut(bool) -> Result<()>,
+{
+    if restart {
+        let svc = service.ok_or_else(|| {
+            AppError::usage(
+                "--restart-service: no running opencode service was found; start it with \
+                 `opencode service start` or stop opencode manually",
+            )
+        })?;
+        let mut guard = service::ServiceRestart::stop(svc)?;
+        // Another process (e.g. a v1 instance) could still hold the
+        // database open; refuse rather than run maintenance behind it.
+        if let Some(db_path) = db_path {
+            let others = service::processes_with_db_open(db_path, &[svc.pid]);
+            if !others.is_empty() {
+                let _ = guard.restart();
+                return Err(AppError::busy(format!(
+                    "other opencode processes still have the database open (pid={}) - stop them and retry",
+                    others
+                        .iter()
+                        .map(|p| p.to_string())
+                        .collect::<Vec<_>>()
+                        .join(",")
+                )));
+            }
+        }
+        if !cli.quiet {
+            eprintln!("opencode service stopped (pid {})", guard.pid());
+        }
+        let result = run(false);
+        let restart_result = guard.restart();
+        return match (result, restart_result) {
+            (Ok(()), Ok(())) => {
+                if !cli.quiet {
+                    eprintln!("opencode service restarted");
+                }
+                Ok(())
+            }
+            (Err(e), Ok(())) => Err(e),
+            (Ok(()), Err(e)) => Err(e),
+            (Err(e), Err(restart_error)) => Err(AppError::db(format!(
+                "{e}; additionally, restarting opencode failed: {restart_error}"
+            ))),
+        };
+    }
+    if let Some(message) = idle {
+        sys::require_idle(message)?;
+    }
+    run(false)
 }
 
 fn dispatch(
