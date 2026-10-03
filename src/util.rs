@@ -155,7 +155,9 @@ pub fn parse_log_ts(line: &str) -> Option<i64> {
         time.get(6..)?,
     );
     // Seconds, then optional `.mmm`, then a zone (`Z` or end).
-    let sec_end = ss_millis.find(|c: char| !c.is_ascii_digit()).unwrap_or(ss_millis.len());
+    let sec_end = ss_millis
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(ss_millis.len());
     let ss: i64 = ss_millis.get(..sec_end)?.parse().ok()?;
     let mut millis: i64 = 0;
     let mut tail = ss_millis.get(sec_end..).unwrap_or("");

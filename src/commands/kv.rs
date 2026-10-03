@@ -114,15 +114,13 @@ pub fn cmd_kv_show(con: &Connection, args: &[String]) -> Result<()> {
     let bytes = value.len() as i64;
     let truncated = value.chars().count() > SHOW_PREVIEW_CHARS;
     let preview: String = value.chars().take(SHOW_PREVIEW_CHARS).collect();
-    print_json(
-        &serde_json::to_value(KvShow {
-            key: key.to_string(),
-            bytes,
-            updated: dt(updated),
-            value: preview,
-            truncated,
-        })?,
-    )
+    print_json(&serde_json::to_value(KvShow {
+        key: key.to_string(),
+        bytes,
+        updated: dt(updated),
+        value: preview,
+        truncated,
+    })?)
 }
 
 pub fn cmd_kv_delete(
@@ -214,13 +212,7 @@ mod tests {
     #[test]
     fn delete_previews_and_removes() {
         let mut con = kv_db();
-        cmd_kv_delete(
-            &mut con,
-            &["big".to_string()],
-            true,
-            Path::new("/tmp/x.db"),
-        )
-        .unwrap();
+        cmd_kv_delete(&mut con, &["big".to_string()], true, Path::new("/tmp/x.db")).unwrap();
         let n: i64 = con
             .query_row("SELECT COUNT(*) FROM kv", [], |r| r.get(0))
             .unwrap();
@@ -237,13 +229,25 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM kv", [], |r| r.get(0))
             .unwrap();
         assert_eq!(n, 1);
-        assert!(cmd_kv_delete(&mut con, &["big".to_string()], false, Path::new("/tmp/x.db")).is_err());
+        assert!(cmd_kv_delete(
+            &mut con,
+            &["big".to_string()],
+            false,
+            Path::new("/tmp/x.db")
+        )
+        .is_err());
     }
 
     #[test]
     fn delete_rejects_flags_and_empty() {
         let mut con = kv_db();
         assert!(cmd_kv_delete(&mut con, &[], true, Path::new("/tmp/x.db")).is_err());
-        assert!(cmd_kv_delete(&mut con, &["--older-than".to_string()], true, Path::new("/tmp/x.db")).is_err());
+        assert!(cmd_kv_delete(
+            &mut con,
+            &["--older-than".to_string()],
+            true,
+            Path::new("/tmp/x.db")
+        )
+        .is_err());
     }
 }

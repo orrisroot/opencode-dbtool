@@ -227,7 +227,11 @@ fn activity(con: &Connection) -> Result<Activity> {
     }
     let created: Vec<ActivityDay> = days
         .into_iter()
-        .map(|(day, (messages, message_bytes))| ActivityDay { day, messages, message_bytes })
+        .map(|(day, (messages, message_bytes))| ActivityDay {
+            day,
+            messages,
+            message_bytes,
+        })
         .collect();
     Ok(Activity { days: 30, created })
 }

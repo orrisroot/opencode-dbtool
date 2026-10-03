@@ -323,13 +323,7 @@ mod tests {
         testdb::insert_project(&con, "p1", "/a");
         testdb::insert_project_session(&con, "s1", "/a", "p1", 0);
 
-        cmd_project_delete(
-            &mut con,
-            &["p1".to_string()],
-            false,
-            Path::new("/tmp/x.db"),
-        )
-        .unwrap();
+        cmd_project_delete(&mut con, &["p1".to_string()], false, Path::new("/tmp/x.db")).unwrap();
 
         assert_eq!(testdb::project_count(&con), 0);
         assert_eq!(testdb::session_count(&con), 0);

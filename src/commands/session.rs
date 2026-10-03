@@ -7,17 +7,15 @@ use crate::models::{session_json, PurgeFilter, PurgeFilterJson, SessionOut};
 use crate::output::print_json;
 use crate::repo::{
     assistant_messages, child_session_ids, load_session, load_session_meta, load_sessions,
-    reasoning_event_counts, reasoning_events_left, reasoning_messages_left,
-    resolve_session_ids, rewrite_message, session_sizes, strip_reasoning_events,
+    reasoning_event_counts, reasoning_events_left, reasoning_messages_left, resolve_session_ids,
+    rewrite_message, session_sizes, strip_reasoning_events,
 };
 use rusqlite::Connection;
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
-use crate::util::{
-    now_ms, parse_age_ms, parse_count, parse_size_bytes, SQL_VAR_CHUNK,
-};
+use crate::util::{now_ms, parse_age_ms, parse_count, parse_size_bytes, SQL_VAR_CHUNK};
 
 /// One session in a delete/purge preview.
 #[derive(Serialize)]
@@ -98,10 +96,7 @@ pub fn cmd_session_list(con: &Connection, args: &[String]) -> Result<()> {
 }
 
 /// Build the session list array (exposed for tests).
-pub fn session_list_value(
-    con: &Connection,
-    args: &[String],
-) -> Result<serde_json::Value> {
+pub fn session_list_value(con: &Connection, args: &[String]) -> Result<serde_json::Value> {
     let mut limit: Option<usize> = None;
     let mut sort_size = false;
     let mut i = 0;
@@ -481,9 +476,9 @@ fn parse_purge_args(args: &[String]) -> Result<PurgeFilter> {
                 i += 2;
             }
             "--keep-latest-per-project" => {
-                let n = args.get(i + 1).ok_or_else(|| {
-                    AppError::usage("--keep-latest-per-project requires a count")
-                })?;
+                let n = args
+                    .get(i + 1)
+                    .ok_or_else(|| AppError::usage("--keep-latest-per-project requires a count"))?;
                 let c = parse_count(n)?;
                 f.keep_latest_per_project_raw = Some(n.clone());
                 f.keep_latest_per_project = Some(c);
@@ -919,8 +914,13 @@ mod tests {
         testdb::insert_session(&con, "root", "/a", None);
         testdb::insert_session(&con, "child", "/a", Some("root"));
 
-        cmd_session_purge(&mut con, &["--subagents".to_string()], false, Path::new("/tmp/x.db"))
-            .unwrap();
+        cmd_session_purge(
+            &mut con,
+            &["--subagents".to_string()],
+            false,
+            Path::new("/tmp/x.db"),
+        )
+        .unwrap();
 
         assert_eq!(testdb::session_count(&con), 1);
         let remaining: String = con
@@ -1388,7 +1388,10 @@ mod tests {
 
         cmd_session_strip_reasoning(&mut con, &[], true, Path::new("/tmp/x.db")).unwrap();
 
-        assert_eq!(reasoning_messages_left(&con, &["s1".to_string()]).unwrap(), 1);
+        assert_eq!(
+            reasoning_messages_left(&con, &["s1".to_string()]).unwrap(),
+            1
+        );
     }
 
     #[test]
@@ -1448,8 +1451,7 @@ mod tests {
             .collect();
         assert_eq!(ids.len(), 3);
 
-        let sized =
-            session_list_value(&con, &["--sort".to_string(), "size".to_string()]).unwrap();
+        let sized = session_list_value(&con, &["--sort".to_string(), "size".to_string()]).unwrap();
         let ids: Vec<&str> = sized
             .as_array()
             .unwrap()
@@ -1489,13 +1491,7 @@ mod tests {
         testdb::insert_inbox(&con, "i1", "s1", "payload");
         con.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
 
-        cmd_session_delete(
-            &mut con,
-            &["s1".to_string()],
-            false,
-            Path::new("/tmp/x.db"),
-        )
-        .unwrap();
+        cmd_session_delete(&mut con, &["s1".to_string()], false, Path::new("/tmp/x.db")).unwrap();
 
         assert_eq!(testdb::session_count(&con), 0);
         let sm: i64 = con
@@ -1597,11 +1593,9 @@ mod tests {
                 assert!(parse_purge_args(&args).is_err(), "should reject: {args:?}");
             }
         }
-        assert!(parse_purge_args(&[
-            "--keep-latest-per-project".to_string(),
-            "2".to_string()
-        ])
-        .is_ok());
+        assert!(
+            parse_purge_args(&["--keep-latest-per-project".to_string(), "2".to_string()]).is_ok()
+        );
     }
 
     #[test]
@@ -1698,10 +1692,7 @@ mod tests {
 
         cmd_session_purge(
             &mut con,
-            &[
-                "--keep-latest-per-project".to_string(),
-                "1".to_string(),
-            ],
+            &["--keep-latest-per-project".to_string(), "1".to_string()],
             false,
             Path::new("/tmp/x.db"),
         )

@@ -26,11 +26,7 @@ pub struct SessionRow {
 
 impl SessionRow {
     pub fn size_bytes(&self) -> i64 {
-        self.event_bytes
-            + self.sm_bytes
-            + self.inbox_bytes
-            + self.pending_bytes
-            + self.instr_bytes
+        self.event_bytes + self.sm_bytes + self.inbox_bytes + self.pending_bytes + self.instr_bytes
     }
 }
 

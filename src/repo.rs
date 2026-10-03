@@ -43,8 +43,7 @@ fn session_cols() -> String {
         "s.time_archived IS NOT NULL".to_string(),
     ];
     for (table, id_col, contents) in PER_SESSION_TABLES {
-        let count =
-            format!("(SELECT COUNT(*) FROM \"{table}\" t WHERE t.\"{id_col}\" = s.id)");
+        let count = format!("(SELECT COUNT(*) FROM \"{table}\" t WHERE t.\"{id_col}\" = s.id)");
         cols.push(count);
         let per_row: Vec<String> = contents
             .iter()
@@ -209,9 +208,8 @@ pub fn resolve_session_ids(con: &Connection, id_args: &[&str]) -> Result<Vec<Str
 /// All sessions with per-session counts and sizes.
 pub fn load_sessions(con: &Connection) -> Result<Vec<SessionRow>> {
     let cols = session_cols();
-    let sql = format!(
-        "SELECT {cols} FROM \"{SESSION_TABLE}\" s ORDER BY s.time_updated DESC, s.id"
-    );
+    let sql =
+        format!("SELECT {cols} FROM \"{SESSION_TABLE}\" s ORDER BY s.time_updated DESC, s.id");
     let mut stmt = con.prepare(&sql)?;
     let rows = stmt.query_map([], read_session_row)?;
     let mut out = Vec::new();
@@ -345,10 +343,7 @@ fn reasoning_event_params(ids: &[String]) -> Vec<rusqlite::types::Value> {
 
 /// Per-session reasoning event counts and bytes for the given ids.
 /// Sessions without matching events are omitted.
-pub fn reasoning_event_counts(
-    con: &Connection,
-    ids: &[String],
-) -> Result<Vec<(String, i64, i64)>> {
+pub fn reasoning_event_counts(con: &Connection, ids: &[String]) -> Result<Vec<(String, i64, i64)>> {
     if ids.is_empty() {
         return Ok(Vec::new());
     }
@@ -511,7 +506,10 @@ pub fn delete_blob_orphans(con: &mut Connection) -> Result<(usize, u64)> {
         if refs > 0 {
             continue;
         }
-        rows += tx.execute("DELETE FROM instruction_blob WHERE hash = ?1", params![hash])?;
+        rows += tx.execute(
+            "DELETE FROM instruction_blob WHERE hash = ?1",
+            params![hash],
+        )?;
         bytes += *b as u64;
     }
     tx.commit()?;
@@ -554,10 +552,7 @@ pub fn list_messages(
             data: r.get(5)?,
         })
     })?;
-    Ok((
-        total,
-        rows.collect::<std::result::Result<Vec<_>, _>>()?,
-    ))
+    Ok((total, rows.collect::<std::result::Result<Vec<_>, _>>()?))
 }
 
 /// Per-table row counts for a project delete preview, including the
@@ -650,10 +645,16 @@ mod tests {
             [],
         )
         .unwrap();
-        con.execute("INSERT INTO instruction_blob (hash, value) VALUES ('aaa', 'live')", [])
-            .unwrap();
-        con.execute("INSERT INTO instruction_blob (hash, value) VALUES ('zzz', 'orphan!')", [])
-            .unwrap();
+        con.execute(
+            "INSERT INTO instruction_blob (hash, value) VALUES ('aaa', 'live')",
+            [],
+        )
+        .unwrap();
+        con.execute(
+            "INSERT INTO instruction_blob (hash, value) VALUES ('zzz', 'orphan!')",
+            [],
+        )
+        .unwrap();
 
         let orphans = blob_orphans(&con).unwrap();
         assert_eq!(orphans, vec![("zzz".to_string(), 7)]);

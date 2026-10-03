@@ -449,10 +449,7 @@ fn removed_fs_commands_are_unknown() {
     let dir = temp_dir("removed-fs");
     create_db(&dir.join("opencode.db"));
 
-    for args in [
-        vec!["fs", "clean-orphans"],
-        vec!["fs", "clean-tool-output"],
-    ] {
+    for args in [vec!["fs", "clean-orphans"], vec!["fs", "clean-tool-output"]] {
         let out = run(&args, &dir);
         assert_eq!(out.status.code(), Some(2), "args: {args:?}");
     }
@@ -475,7 +472,11 @@ fn kv_commands_round_trip() {
     }
 
     let out = run(&["kv", "list"], &dir);
-    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let arr = stdout_json(&out);
     assert_eq!(arr.as_array().unwrap().len(), 1);
     assert_eq!(arr[0]["key"], "cache:a");
@@ -501,10 +502,17 @@ fn backup_dry_run_reports_planned_path() {
     create_db(&dir.join("opencode.db"));
 
     let out = run(&["backup", "--dry-run"], &dir);
-    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let v = stdout_json(&out);
     assert_eq!(v["dry_run"], true);
-    assert!(v["backup"]["path"].as_str().unwrap().contains("opencode.db.backup-"));
+    assert!(v["backup"]["path"]
+        .as_str()
+        .unwrap()
+        .contains("opencode.db.backup-"));
 
     std::fs::remove_dir_all(&dir).unwrap();
 }
@@ -517,11 +525,18 @@ fn clean_shell_dry_run_lists_files() {
     std::fs::write(dir.join("shell/p1/sh_x.out"), vec![0u8; 6]).unwrap();
 
     let out = run(&["fs", "clean-shell", "--dry-run"], &dir);
-    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let v = stdout_json(&out);
     assert_eq!(v["total_files"], 1);
     assert_eq!(v["total_bytes"], 6);
-    assert!(dir.join("shell/p1/sh_x.out").exists(), "dry-run changes nothing");
+    assert!(
+        dir.join("shell/p1/sh_x.out").exists(),
+        "dry-run changes nothing"
+    );
 
     std::fs::remove_dir_all(&dir).unwrap();
 }
@@ -536,7 +551,11 @@ fn show_messages_flag_attaches_previews() {
     assert!(stdout_json(&plain).get("messages").is_none());
 
     let out = run(&["session", "show", "ses_1", "--messages"], &dir);
-    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let v = stdout_json(&out);
     assert_eq!(v["total_messages"], 1);
     assert_eq!(v["messages"].as_array().unwrap().len(), 1);
@@ -551,8 +570,15 @@ fn new_purge_filters_work_end_to_end() {
     create_db(&dir.join("opencode.db"));
 
     // --path-prefix matches the session directory subtree.
-    let out = run(&["session", "purge", "--path-prefix", "/work", "--dry-run"], &dir);
-    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let out = run(
+        &["session", "purge", "--path-prefix", "/work", "--dry-run"],
+        &dir,
+    );
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     assert_eq!(stdout_json(&out)["sessions"].as_array().unwrap().len(), 1);
 
     // --empty selects nothing here (the session has content).
@@ -562,7 +588,14 @@ fn new_purge_filters_work_end_to_end() {
 
     // --keep-latest and --keep-latest-per-project conflict.
     let out = run(
-        &["session", "purge", "--keep-latest", "1", "--keep-latest-per-project", "1"],
+        &[
+            "session",
+            "purge",
+            "--keep-latest",
+            "1",
+            "--keep-latest-per-project",
+            "1",
+        ],
         &dir,
     );
     assert_eq!(out.status.code(), Some(2));

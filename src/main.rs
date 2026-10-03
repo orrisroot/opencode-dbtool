@@ -77,7 +77,9 @@ fn usage() {
     println!("  opencode-dbtool fs clean-snapshots [--project <id>...] [--orphans-only]  delete snapshot storage");
     println!("  opencode-dbtool fs clean-shell [--older-than <age>]  delete shell output files");
     println!("  opencode-dbtool fs clean-blob-orphans  delete unreferenced instruction blobs");
-    println!("  opencode-dbtool fs clean-log [--older-than <age>]  truncate or prune log/opencode.log");
+    println!(
+        "  opencode-dbtool fs clean-log [--older-than <age>]  truncate or prune log/opencode.log"
+    );
     println!("  opencode-dbtool vacuum [--no-backup] [--keep-backups <n>]  run VACUUM (backup + verify by default)");
     println!("  opencode-dbtool self-update [--dry-run|--yes]  check/apply the latest GitHub release binary");
     println!("  opencode-dbtool [--help]                 show this message");
@@ -253,12 +255,7 @@ fn run() -> Result<()> {
         },
         "backup" => require_db(&db_path)
             .and_then(|_| {
-                require_mutation_guard(
-                    dry_run,
-                    yes,
-                    "backup",
-                    "backup needs exclusive access",
-                )
+                require_mutation_guard(dry_run, yes, "backup", "backup needs exclusive access")
             })
             .and_then(|_| commands::vacuum::cmd_backup(&db_path, dry_run, rest)),
         "project" => match rest.first().map(|s| s.as_str()).unwrap_or("") {
@@ -322,12 +319,7 @@ fn run() -> Result<()> {
                 })
                 .and_then(|_| {
                     let mut con = db::open_conn(&db_path, dry_run)?;
-                    commands::session::cmd_session_delete(
-                        &mut con,
-                        &rest[1..],
-                        dry_run,
-                        &db_path,
-                    )
+                    commands::session::cmd_session_delete(&mut con, &rest[1..], dry_run, &db_path)
                 }),
             "purge" | "strip-reasoning" => require_db(&db_path)
                 .and_then(|_| {
@@ -373,7 +365,13 @@ fn run() -> Result<()> {
                 })
                 .and_then(|_| {
                     let con = db::open_conn(&db_path, true)?;
-                    commands::fsops::cmd_fs_clean_snapshots(&con, &rest[1..], dry_run, &dir, &db_path)
+                    commands::fsops::cmd_fs_clean_snapshots(
+                        &con,
+                        &rest[1..],
+                        dry_run,
+                        &dir,
+                        &db_path,
+                    )
                 }),
             "clean-shell" => require_db(&db_path)
                 .and_then(|_| {
@@ -398,7 +396,12 @@ fn run() -> Result<()> {
                 })
                 .and_then(|_| {
                     let mut con = db::open_conn(&db_path, dry_run)?;
-                    commands::fsops::cmd_fs_clean_blob_orphans(&mut con, &rest[1..], dry_run, &db_path)
+                    commands::fsops::cmd_fs_clean_blob_orphans(
+                        &mut con,
+                        &rest[1..],
+                        dry_run,
+                        &db_path,
+                    )
                 }),
             "clean-log" => require_db(&db_path)
                 .and_then(|_| {

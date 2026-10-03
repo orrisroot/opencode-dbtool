@@ -112,9 +112,7 @@ pub fn cmd_fs_clean_log(
                 let age = args.get(i + 1).ok_or_else(|| {
                     crate::error::AppError::usage("--older-than requires an age (e.g. 30d)")
                 })?;
-                cutoff = Some(
-                    crate::util::now_ms()? - crate::util::parse_age_ms(age)?,
-                );
+                cutoff = Some(crate::util::now_ms()? - crate::util::parse_age_ms(age)?);
                 older_than_raw = Some(age.clone());
                 i += 2;
             }
@@ -280,8 +278,9 @@ pub fn cmd_fs_clean_snapshots(
 
     for e in &out.entries {
         let p = dir.join(&e.name);
-        std::fs::remove_dir_all(&p)
-            .map_err(|err| crate::error::AppError::db(format!("cannot remove snapshot {}: {err}", e.name)))?;
+        std::fs::remove_dir_all(&p).map_err(|err| {
+            crate::error::AppError::db(format!("cannot remove snapshot {}: {err}", e.name))
+        })?;
     }
     print_json(&serde_json::to_value(&out)?)
 }
@@ -339,8 +338,7 @@ pub fn cmd_fs_clean_shell(
     // Fail fast like `clean-snapshots`, but report how far the run got:
     // re-running converges, since already-removed files simply drop out of
     // the next scan.
-    let mut removed = 0;
-    for f in &out.files {
+    for (removed, f) in out.files.iter().enumerate() {
         if let Err(e) = std::fs::remove_file(dir.join(&f.file)) {
             return Err(crate::error::AppError::db(format!(
                 "cannot remove {}: {e} ({removed} of {} file(s) already removed; re-run to converge)",
@@ -348,7 +346,6 @@ pub fn cmd_fs_clean_shell(
                 out.files.len(),
             )));
         }
-        removed += 1;
     }
     remove_empty_dirs(&dir);
     print_json(&serde_json::to_value(&out)?)
@@ -532,14 +529,8 @@ mod tests {
         // --orphans-only removes only unknown projects (p2; p3 was recreated
         // as known below... here p2/p3 are both unknown, p1 dir is gone).
         testdb::insert_project(&con, "p2", "/b");
-        cmd_fs_clean_snapshots(
-            &con,
-            &["--orphans-only".to_string()],
-            false,
-            &dir,
-            &db_path,
-        )
-        .unwrap();
+        cmd_fs_clean_snapshots(&con, &["--orphans-only".to_string()], false, &dir, &db_path)
+            .unwrap();
         assert!(dir.join("snapshot/p2").exists(), "known project kept");
         assert!(!dir.join("snapshot/p3").exists(), "orphan removed");
         drop(con);

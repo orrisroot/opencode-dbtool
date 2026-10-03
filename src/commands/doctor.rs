@@ -275,8 +275,11 @@ mod tests {
     #[test]
     fn orphan_blobs_fail_doctor_until_cleaned() {
         let con = testdb::create();
-        con.execute("INSERT INTO instruction_blob (hash, value) VALUES ('zzz', 'orphan')", [])
-            .unwrap();
+        con.execute(
+            "INSERT INTO instruction_blob (hash, value) VALUES ('zzz', 'orphan')",
+            [],
+        )
+        .unwrap();
         assert!(cmd_doctor(&con, Path::new("/tmp/x.db"), &[]).is_err());
     }
 }
