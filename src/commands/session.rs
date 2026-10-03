@@ -93,15 +93,20 @@ struct StripOut {
     note: Option<String>,
 }
 
-pub fn cmd_session_list(
-    con: &Connection,
-    sort: Option<SortKey>,
-    limit: Option<usize>,
-    search: Option<&str>,
-    min_size: Option<i64>,
-) -> Result<()> {
+/// Options for `session list`.
+#[derive(Default, Clone, Copy)]
+pub struct ListOptions<'a> {
+    pub sort: Option<SortKey>,
+    pub limit: Option<usize>,
+    pub search: Option<&'a str>,
+    pub min_size: Option<i64>,
+    pub project: Option<&'a str>,
+    pub parent: Option<&'a str>,
+}
+
+pub fn cmd_session_list(con: &Connection, opts: &ListOptions) -> Result<()> {
     output::emit_cols(
-        &session_list_value(con, sort, limit, search, min_size)?,
+        &session_list_value(con, opts)?,
         &[
             "id",
             "title",
@@ -115,24 +120,41 @@ pub fn cmd_session_list(
 }
 
 /// Build the session list array (exposed for tests).
-pub fn session_list_value(
-    con: &Connection,
-    sort: Option<SortKey>,
-    limit: Option<usize>,
-    search: Option<&str>,
-    min_size: Option<i64>,
-) -> Result<serde_json::Value> {
+pub fn session_list_value(con: &Connection, opts: &ListOptions) -> Result<serde_json::Value> {
     let mut sessions = load_sessions(con)?;
-    if let Some(search) = search {
+    if let Some(search) = opts.search {
         let needle = search.to_lowercase();
         sessions.retain(|s| {
             s.title.to_lowercase().contains(&needle) || s.directory.to_lowercase().contains(&needle)
         });
     }
-    if let Some(min) = min_size {
+    if let Some(min) = opts.min_size {
         sessions.retain(|s| s.size_bytes() >= min);
     }
-    match sort {
+    if opts.project.is_some() || opts.parent.is_some() {
+        let project_id = match opts.project {
+            Some(reference) => Some(crate::repo::resolve_project(con, reference)?.id),
+            None => None,
+        };
+        let parent_id = match opts.parent {
+            Some(reference) => Some(crate::repo::resolve_session_id(con, reference)?),
+            None => None,
+        };
+        let allowed: HashSet<String> = load_session_meta(con)?
+            .iter()
+            .filter(|m| {
+                project_id
+                    .as_deref()
+                    .is_none_or(|p| m.project_id.as_deref() == Some(p))
+                    && parent_id
+                        .as_deref()
+                        .is_none_or(|p| m.parent_id.as_deref() == Some(p))
+            })
+            .map(|m| m.id.clone())
+            .collect();
+        sessions.retain(|s| allowed.contains(&s.id));
+    }
+    match opts.sort {
         Some(SortKey::Size) => sessions.sort_by(|a, b| {
             b.size_bytes()
                 .cmp(&a.size_bytes())
@@ -147,7 +169,7 @@ pub fn session_list_value(
         // `Updated` is the default order from `load_sessions`.
         Some(SortKey::Updated) | None => {}
     }
-    if let Some(n) = limit {
+    if let Some(n) = opts.limit {
         sessions.truncate(n);
     }
     let out: Vec<SessionOut> = sessions.iter().map(session_json).collect();
@@ -1548,7 +1570,7 @@ mod tests {
         testdb::insert_session(&con, "medium", "/a", None);
         testdb::insert_session_message(&con, "m3", "medium", "assistant", "xxxxxxxx");
 
-        let all = session_list_value(&con, None, None, None, None).unwrap();
+        let all = session_list_value(&con, &ListOptions::default()).unwrap();
         let ids: Vec<&str> = all
             .as_array()
             .unwrap()
@@ -1557,7 +1579,14 @@ mod tests {
             .collect();
         assert_eq!(ids.len(), 3);
 
-        let sized = session_list_value(&con, Some(SortKey::Size), None, None, None).unwrap();
+        let sized = session_list_value(
+            &con,
+            &ListOptions {
+                sort: Some(SortKey::Size),
+                ..Default::default()
+            },
+        )
+        .unwrap();
         let ids: Vec<&str> = sized
             .as_array()
             .unwrap()
@@ -1566,7 +1595,15 @@ mod tests {
             .collect();
         assert_eq!(ids, vec!["big", "medium", "small"]);
 
-        let limited = session_list_value(&con, Some(SortKey::Size), Some(2), None, None).unwrap();
+        let limited = session_list_value(
+            &con,
+            &ListOptions {
+                sort: Some(SortKey::Size),
+                limit: Some(2),
+                ..Default::default()
+            },
+        )
+        .unwrap();
         let ids: Vec<&str> = limited
             .as_array()
             .unwrap()
@@ -1576,7 +1613,14 @@ mod tests {
         assert_eq!(ids, vec!["big", "medium"]);
 
         // Search matches title or directory (case-insensitive).
-        let searched = session_list_value(&con, None, None, Some("MED"), None).unwrap();
+        let searched = session_list_value(
+            &con,
+            &ListOptions {
+                search: Some("MED"),
+                ..Default::default()
+            },
+        )
+        .unwrap();
         let ids: Vec<&str> = searched
             .as_array()
             .unwrap()
@@ -1584,11 +1628,17 @@ mod tests {
             .map(|s| s["id"].as_str().unwrap())
             .collect();
         assert_eq!(ids, vec!["medium"]);
-        assert!(session_list_value(&con, None, None, Some("nope"), None)
-            .unwrap()
-            .as_array()
-            .unwrap()
-            .is_empty());
+        assert!(session_list_value(
+            &con,
+            &ListOptions {
+                search: Some("nope"),
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .as_array()
+        .unwrap()
+        .is_empty());
     }
 
     #[test]

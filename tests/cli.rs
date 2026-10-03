@@ -1809,3 +1809,64 @@ fn csv_format_and_fields() {
 
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+#[test]
+fn session_list_filters_by_project_and_parent() {
+    let dir = temp_dir("list-filters");
+    let db = dir.join("opencode.db");
+    create_db(&db);
+    {
+        let con = Connection::open(&db).unwrap();
+        con.execute(
+            "INSERT INTO project (id, worktree, name) VALUES ('p2', '/work/b', 'b')",
+            [],
+        )
+        .unwrap();
+        con.execute(
+            "INSERT INTO session_v2 (id, directory, title, project_id, time_updated, cost) \
+             VALUES ('ses_p2', '/work/b', 'other', 'p2', 0, 0)",
+            [],
+        )
+        .unwrap();
+        con.execute(
+            "INSERT INTO session_v2 (id, directory, title, parent_id, time_updated, cost) \
+             VALUES ('ses_child', '/work/a', 'child', 'ses_1', 0, 0)",
+            [],
+        )
+        .unwrap();
+    }
+
+    let out = run(&["session", "list", "--project", "p2"], &dir);
+    assert!(out.status.success());
+    let v = stdout_json(&out);
+    assert_eq!(v.as_array().unwrap().len(), 1);
+    assert_eq!(v[0]["id"], "ses_p2");
+
+    let out = run(&["session", "list", "--parent", "ses_1"], &dir);
+    assert!(out.status.success());
+    let v = stdout_json(&out);
+    assert_eq!(v.as_array().unwrap().len(), 1);
+    assert_eq!(v[0]["id"], "ses_child");
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn db_path_reports_pragmas() {
+    let dir = temp_dir("db-path");
+    create_db(&dir.join("opencode.db"));
+
+    let out = run(&["db", "path"], &dir);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v = stdout_json(&out);
+    assert!(v["db"].as_str().unwrap().ends_with("opencode.db"));
+    assert!(v["journal_mode"].is_string());
+    assert!(v["page_size"].is_number());
+    assert!(v["auto_vacuum"].is_number());
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}

@@ -408,13 +408,15 @@ fn dispatch(
                     .map(crate::util::parse_size_bytes)
                     .transpose()?;
                 let con = db::open_conn(db_path, true)?;
-                commands::session::cmd_session_list(
-                    &con,
-                    a.sort,
-                    a.limit,
-                    a.search.as_deref(),
+                let opts = commands::session::ListOptions {
+                    sort: a.sort,
+                    limit: a.limit,
+                    search: a.search.as_deref(),
                     min_size,
-                )
+                    project: a.project.as_deref(),
+                    parent: a.parent.as_deref(),
+                };
+                commands::session::cmd_session_list(&con, &opts)
             }
             SessionCmd::Show(a) => {
                 let con = db::open_conn(db_path, true)?;
@@ -453,6 +455,10 @@ fn dispatch(
         Command::Db(cmd) => match cmd {
             DbCmd::Checkpoint(a) => {
                 commands::checkpoint::cmd_checkpoint(db_path, a.truncate, dry_run)
+            }
+            DbCmd::Path => {
+                let con = db::open_conn(db_path, true)?;
+                commands::dbinfo::cmd_db_path(&con, db_path)
             }
         },
         Command::Backup(a) => {

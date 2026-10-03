@@ -245,6 +245,12 @@ pub struct SessionListArgs {
     /// Only sessions at least this large (e.g. 50M)
     #[arg(long = "min-size", value_name = "SIZE", value_parser = size_value)]
     pub min_size: Option<String>,
+    /// Only sessions of this project (id, prefix, or worktree)
+    #[arg(long, value_name = "REF")]
+    pub project: Option<String>,
+    /// Only direct subagent sessions of this parent session
+    #[arg(long, value_name = "REF")]
+    pub parent: Option<String>,
 }
 
 #[derive(Args)]
@@ -378,6 +384,8 @@ pub struct KvDeleteArgs {
 pub enum DbCmd {
     /// Checkpoint the WAL (PASSIVE by default; --truncate shrinks the file)
     Checkpoint(DbCheckpointArgs),
+    /// Show the resolved database path and key pragmas
+    Path,
 }
 
 #[derive(Args)]
