@@ -73,8 +73,8 @@ pub struct Cli {
 pub enum Command {
     /// Database overview: table sizes, totals, storage usage
     Stats(StatsArgs),
-    /// Integrity and consistency checks
-    Doctor,
+    /// Integrity and consistency checks (`--fix` repairs what it can)
+    Doctor(DoctorArgs),
     /// Project commands (list, show, delete, purge)
     #[command(subcommand)]
     Project(ProjectCmd),
@@ -97,6 +97,8 @@ pub enum Command {
     Service(ServiceCmd),
     /// Compact the database, reclaiming space freed by deletes
     Vacuum(VacuumArgs),
+    /// Read-only suggestions for reclaiming space (never deletes)
+    Report,
     /// Update the binary from the latest GitHub release
     SelfUpdate,
     /// Remove old sessions and stale files/storage in one run
@@ -114,6 +116,14 @@ pub struct StatsArgs {
     /// Add message-type breakdown, 30-day activity, and subagent shares
     #[arg(long)]
     pub detail: bool,
+}
+
+#[derive(Args)]
+pub struct DoctorArgs {
+    /// Repair what can be repaired: orphan blobs/events and dangling
+    /// parent/fork/workspace references
+    #[arg(long)]
+    pub fix: bool,
 }
 
 // ---------------------------------------------------------------------------

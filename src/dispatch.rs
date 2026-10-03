@@ -8,6 +8,7 @@ use crate::db;
 use crate::error::{AppError, Result};
 use crate::models::{ProjectFilter, PurgeFilter};
 use crate::service::{self, ServiceInfo};
+use crate::util::shell_quote;
 use crate::{commands, config, output, sys};
 use clap::CommandFactory;
 use std::io::IsTerminal;
@@ -118,6 +119,10 @@ fn mutation_guard<'a>(
     // operates on the same database file.
     let api_online = !restart && service.is_some_and(|s| s.targets_db(db_path));
     match cmd {
+        Command::Doctor(a) if a.fix => Some((
+            "doctor --fix",
+            Some("repairing while opencode is running is not allowed"),
+        )),
         Command::Project(ProjectCmd::Delete(_)) => Some(("project delete", Some(IDLE_DELETE))),
         Command::Project(ProjectCmd::Purge(_)) => Some(("project purge", Some(IDLE_DELETE))),
         Command::Session(SessionCmd::Delete(_)) => Some((
@@ -316,7 +321,7 @@ fn suggested_apply_command(args: &[String]) -> Option<String> {
                         out.push(rewritten);
                     }
                 } else {
-                    out.push(shell_quote(arg));
+                    out.push(crate::util::shell_quote(arg));
                 }
             }
         }
@@ -354,17 +359,6 @@ fn rewrite_short_cluster(arg: &str) -> Option<(String, bool)> {
     Some((rewritten, has_yes))
 }
 
-fn shell_quote(arg: &str) -> String {
-    if !arg.is_empty()
-        && arg
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || "-_./:=@,+".contains(c))
-    {
-        return arg.to_string();
-    }
-    format!("'{}'", arg.replace('\'', "'\\''"))
-}
-
 fn dispatch(
     command: &Command,
     dir: &Path,
@@ -378,9 +372,10 @@ fn dispatch(
             let con = db::open_conn(db_path, true)?;
             commands::stats::cmd_stats(&con, dir, db_path, a.detail)
         }
-        Command::Doctor => {
-            let con = db::open_conn(db_path, true)?;
-            commands::doctor::cmd_doctor(&con, db_path)
+        Command::Doctor(a) => {
+            let read_only = !a.fix || dry_run;
+            let mut con = db::open_conn(db_path, read_only)?;
+            commands::doctor::cmd_doctor(&mut con, db_path, a.fix, dry_run)
         }
         Command::Project(cmd) => match cmd {
             ProjectCmd::List(a) => {
@@ -494,6 +489,10 @@ fn dispatch(
             }
         },
         Command::Vacuum(a) => commands::vacuum::cmd_vacuum_cli(db_path, a, dry_run),
+        Command::Report => {
+            let con = db::open_conn(db_path, true)?;
+            commands::report::cmd_report(&con, db_path)
+        }
         Command::Cleanup(a) => {
             commands::cleanup::cmd_cleanup(dir, db_path, a, dry_run, quiet, service)
         }

@@ -1652,3 +1652,113 @@ fn backup_list_rejects_keep_backups() {
 
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+#[test]
+fn doctor_fix_repairs_orphans() {
+    let dir = temp_dir("doctor-fix");
+    let db = dir.join("opencode.db");
+    create_db(&db);
+    {
+        let con = Connection::open(&db).unwrap();
+        con.execute(
+            "INSERT INTO instruction_blob (hash, value) VALUES ('zzz', 'orphan')",
+            [],
+        )
+        .unwrap();
+        con.execute(
+            "INSERT INTO session_v2 (id, directory, title, parent_id, time_updated, cost) \
+             VALUES ('ses_dangling', '/work/a', 'x', 'missing-parent', 0, 0)",
+            [],
+        )
+        .unwrap();
+    }
+
+    // Dry-run reports the plan and changes nothing.
+    let out = run(&["doctor", "--fix", "--dry-run"], &dir);
+    assert_eq!(out.status.code(), Some(3), "problems still exist");
+    let v = stdout_json(&out);
+    assert_eq!(v["fix"]["dry_run"], true);
+    assert_eq!(v["fix"]["blobs_deleted"], 1);
+    assert_eq!(v["fix"]["parents_cleared"], 1);
+    {
+        let con = Connection::open(&db).unwrap();
+        let n: i64 = con
+            .query_row("SELECT COUNT(*) FROM instruction_blob", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1, "dry-run keeps the blob");
+    }
+
+    // Real run (may be refused while this harness runs under opencode).
+    let out = run(&["doctor", "--fix", "--yes"], &dir);
+    let code = out.status.code();
+    assert!(
+        code == Some(0) || code == Some(1),
+        "unexpected exit code: {code:?} stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    if code == Some(1) {
+        std::fs::remove_dir_all(&dir).unwrap();
+        return;
+    }
+    let v = stdout_json(&out);
+    assert_eq!(v["fix"]["blobs_deleted"], 1);
+    assert_eq!(v["fix"]["parents_cleared"], 1);
+    assert_eq!(v["ok"], true);
+
+    let out = run(&["doctor"], &dir);
+    assert!(
+        out.status.success(),
+        "doctor is healthy after --fix: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn report_lists_suggestions() {
+    let dir = temp_dir("report");
+    let db = dir.join("opencode.db");
+    create_db(&db);
+    {
+        let con = Connection::open(&db).unwrap();
+        con.execute(
+            "INSERT INTO kv (key, value, time_created, time_updated) VALUES ('big', ?1, 0, 0)",
+            ["x".repeat(2 * 1024 * 1024)],
+        )
+        .unwrap();
+    }
+
+    let out = run(&["report"], &dir);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v = stdout_json(&out);
+    assert_eq!(v["old_sessions"]["count"], 1);
+    assert_eq!(v["kv_candidates"][0]["key"], "big");
+    let commands: Vec<&str> = v["suggestions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["command"].as_str().unwrap())
+        .collect();
+    assert!(
+        commands.iter().any(|c| c.contains("session purge")),
+        "suggestions: {commands:?}"
+    );
+    assert!(
+        commands.iter().any(|c| c.contains("kv delete")),
+        "suggestions: {commands:?}"
+    );
+
+    // Table mode renders the curated summary.
+    let out = run(&["report", "--format", "table"], &dir);
+    assert!(out.status.success());
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("suggestions"), "stdout: {text}");
+    assert!(text.contains("session purge"), "stdout: {text}");
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}

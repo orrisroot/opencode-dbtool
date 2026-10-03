@@ -1,0 +1,350 @@
+//! `report`: read-only suggestions for reclaiming space.
+//!
+//! Never deletes anything: it aggregates the usual candidates (WAL,
+//! freelist, old sessions, large kv caches, backups) and pairs each with
+//! the command that would act on it.
+
+use crate::db::{env_status, file_size, EnvStatus};
+use crate::error::Result;
+use crate::output;
+use crate::output::human_bytes;
+use crate::repo;
+use crate::util::{dt, now_ms, shell_quote};
+use rusqlite::Connection;
+use serde::Serialize;
+use std::path::Path;
+
+/// kv entries at least this large are reported (1 MiB).
+const KV_MIN_BYTES: i64 = 1024 * 1024;
+/// Sessions older than this are reported.
+const OLD_DAYS: i64 = 90;
+/// Report the largest N sessions.
+const TOP_SESSIONS: usize = 5;
+
+#[derive(Serialize)]
+struct KvCandidate {
+    key: String,
+    bytes: i64,
+    updated: String,
+    command: String,
+}
+
+#[derive(Serialize)]
+struct SessionCandidate {
+    id: String,
+    title: String,
+    bytes: i64,
+    updated: String,
+}
+
+#[derive(Serialize)]
+struct OldSessions {
+    days: i64,
+    count: usize,
+    bytes: i64,
+    command: String,
+}
+
+#[derive(Serialize)]
+struct BackupsInfo {
+    count: usize,
+    newest: Option<String>,
+    total_bytes: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    command: Option<String>,
+}
+
+#[derive(Serialize)]
+struct Suggestion {
+    action: String,
+    command: String,
+}
+
+#[derive(Serialize)]
+struct ReportOut {
+    #[serde(flatten)]
+    env: EnvStatus,
+    db_bytes: u64,
+    wal_bytes: u64,
+    reclaimable_bytes: i64,
+    old_sessions: OldSessions,
+    largest_sessions: Vec<SessionCandidate>,
+    kv_candidates: Vec<KvCandidate>,
+    backups: BackupsInfo,
+    suggestions: Vec<Suggestion>,
+}
+
+pub fn cmd_report(con: &Connection, db_path: &Path) -> Result<()> {
+    let value = report_value(con, db_path)?;
+    if output::table_mode() {
+        output::emit_text(&report_table(&value))
+    } else {
+        output::emit(&value)
+    }
+}
+
+/// Build the report (exposed for tests).
+pub fn report_value(con: &Connection, db_path: &Path) -> Result<serde_json::Value> {
+    let freelist: i64 = con.query_row("PRAGMA freelist_count", [], |r| r.get(0))?;
+    let page_size: i64 = con.query_row("PRAGMA page_size", [], |r| r.get(0))?;
+    let wal_bytes = file_size(&db_path.with_extension("db-wal"));
+    let reclaimable = freelist * page_size;
+
+    // Old sessions (default 90 days).
+    let cutoff = now_ms()? - OLD_DAYS * 86_400_000;
+    let meta = repo::load_session_meta(con)?;
+    let old_ids: Vec<String> = meta
+        .iter()
+        .filter(|m| m.updated < cutoff)
+        .map(|m| m.id.clone())
+        .collect();
+    let old_sizes = repo::session_sizes(con, &old_ids)?;
+    let old_bytes: i64 = old_sizes.values().sum();
+
+    // Largest sessions.
+    let mut sessions = repo::load_sessions(con)?;
+    sessions.sort_by(|a, b| {
+        b.size_bytes()
+            .cmp(&a.size_bytes())
+            .then_with(|| a.id.cmp(&b.id))
+    });
+    let largest: Vec<SessionCandidate> = sessions
+        .iter()
+        .take(TOP_SESSIONS)
+        .map(|s| SessionCandidate {
+            id: s.id.clone(),
+            title: s.title.clone(),
+            bytes: s.size_bytes(),
+            updated: dt(s.updated),
+        })
+        .collect();
+
+    // Large kv caches.
+    let kv_candidates: Vec<KvCandidate> = {
+        let mut stmt = con.prepare(
+            "SELECT key, COALESCE(length(CAST(value AS BLOB)),0), time_updated FROM kv \
+             WHERE length(CAST(value AS BLOB)) >= ?1 ORDER BY 2 DESC LIMIT 10",
+        )?;
+        let rows = stmt.query_map([KV_MIN_BYTES], |r| {
+            let key: String = r.get(0)?;
+            Ok(KvCandidate {
+                bytes: r.get(1)?,
+                updated: dt(r.get(2)?),
+                command: format!("opencode-dbtool kv delete {} --yes", shell_quote(&key)),
+                key,
+            })
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()?
+    };
+
+    // Backups.
+    let backups = crate::commands::vacuum::list_backup_files(db_path, false)?;
+    let backups_info = BackupsInfo {
+        count: backups.len(),
+        newest: backups.first().map(|b| b.file.clone()),
+        total_bytes: backups.iter().map(|b| b.bytes).sum(),
+        command: (backups.len() > 5)
+            .then(|| "opencode-dbtool backup --keep-backups 3 --yes".to_string()),
+    };
+
+    // Suggestions, most impactful first.
+    let mut suggestions = Vec::new();
+    if wal_bytes >= KV_MIN_BYTES as u64 {
+        suggestions.push(Suggestion {
+            action: format!(
+                "WAL file is {}; checkpoint it",
+                human_bytes(wal_bytes as i64)
+            ),
+            command: "opencode-dbtool db checkpoint --truncate".to_string(),
+        });
+    }
+    if reclaimable >= KV_MIN_BYTES {
+        suggestions.push(Suggestion {
+            action: format!("VACUUM can reclaim {}", human_bytes(reclaimable)),
+            command: "opencode-dbtool vacuum --online --yes".to_string(),
+        });
+    }
+    if !old_ids.is_empty() {
+        suggestions.push(Suggestion {
+            action: format!(
+                "{} session(s) older than {OLD_DAYS}d use {}",
+                old_ids.len(),
+                human_bytes(old_bytes)
+            ),
+            command: format!("opencode-dbtool session purge --older-than {OLD_DAYS}d --dry-run"),
+        });
+    }
+    if let Some(kv) = kv_candidates.first() {
+        suggestions.push(Suggestion {
+            action: format!("kv cache {} is {}", kv.key, human_bytes(kv.bytes)),
+            command: kv.command.clone(),
+        });
+    }
+    if let Some(command) = &backups_info.command {
+        suggestions.push(Suggestion {
+            action: format!(
+                "{} backups use {}",
+                backups.len(),
+                human_bytes(backups_info.total_bytes as i64)
+            ),
+            command: command.clone(),
+        });
+    }
+
+    let out = ReportOut {
+        env: env_status(db_path),
+        db_bytes: file_size(db_path),
+        wal_bytes,
+        reclaimable_bytes: reclaimable,
+        old_sessions: OldSessions {
+            days: OLD_DAYS,
+            count: old_ids.len(),
+            bytes: old_bytes,
+            command: format!("opencode-dbtool session purge --older-than {OLD_DAYS}d --dry-run"),
+        },
+        largest_sessions: largest,
+        kv_candidates,
+        backups: backups_info,
+        suggestions,
+    };
+    Ok(serde_json::to_value(&out)?)
+}
+
+/// Curated table-mode rendering.
+fn report_table(value: &serde_json::Value) -> String {
+    let num = |v: &serde_json::Value, key: &str| v.get(key).and_then(|x| x.as_i64()).unwrap_or(0);
+    let mut lines: Vec<(String, String)> = Vec::new();
+    lines.push(("db".into(), human_bytes(num(value, "db_bytes"))));
+    lines.push(("wal".into(), human_bytes(num(value, "wal_bytes"))));
+    lines.push((
+        "reclaimable".into(),
+        human_bytes(num(value, "reclaimable_bytes")),
+    ));
+    let old = value.get("old_sessions").cloned().unwrap_or_default();
+    lines.push((
+        "old sessions".into(),
+        format!(
+            "{} older than {}d ({})",
+            old.get("count").and_then(|x| x.as_u64()).unwrap_or(0),
+            old.get("days").and_then(|x| x.as_i64()).unwrap_or(0),
+            human_bytes(old.get("bytes").and_then(|x| x.as_i64()).unwrap_or(0)),
+        ),
+    ));
+    if let Some(top) = value
+        .get("largest_sessions")
+        .and_then(|v| v.as_array())
+        .and_then(|a| a.first())
+    {
+        lines.push((
+            "largest session".into(),
+            format!(
+                "{} ({})",
+                top.get("id").and_then(|x| x.as_str()).unwrap_or("-"),
+                human_bytes(top.get("bytes").and_then(|x| x.as_i64()).unwrap_or(0)),
+            ),
+        ));
+    }
+    if let Some(kv) = value
+        .get("kv_candidates")
+        .and_then(|v| v.as_array())
+        .and_then(|a| a.first())
+    {
+        lines.push((
+            "largest kv".into(),
+            format!(
+                "{} ({})",
+                kv.get("key").and_then(|x| x.as_str()).unwrap_or("-"),
+                human_bytes(kv.get("bytes").and_then(|x| x.as_i64()).unwrap_or(0)),
+            ),
+        ));
+    }
+    let backups = value.get("backups").cloned().unwrap_or_default();
+    lines.push((
+        "backups".into(),
+        format!(
+            "{} ({})",
+            backups.get("count").and_then(|x| x.as_u64()).unwrap_or(0),
+            human_bytes(
+                backups
+                    .get("total_bytes")
+                    .and_then(|x| x.as_i64())
+                    .unwrap_or(0)
+            ),
+        ),
+    ));
+    lines.push(("".into(), String::new()));
+    lines.push(("suggestions".into(), String::new()));
+    if let Some(items) = value.get("suggestions").and_then(|v| v.as_array()) {
+        for item in items {
+            lines.push((
+                "".into(),
+                format!(
+                    "- {}: {}",
+                    item.get("action").and_then(|x| x.as_str()).unwrap_or(""),
+                    item.get("command").and_then(|x| x.as_str()).unwrap_or(""),
+                ),
+            ));
+        }
+    }
+    let width = lines
+        .iter()
+        .map(|(k, _)| k.chars().count())
+        .max()
+        .unwrap_or(0);
+    lines
+        .iter()
+        .map(|(k, v)| {
+            if v.is_empty() {
+                k.clone()
+            } else {
+                format!("{k:width$}  {v}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testdb;
+
+    #[test]
+    fn report_lists_candidates_and_suggestions() {
+        let dir = testdb::temp_data_dir("report");
+        let db_path = dir.join("opencode.db");
+        let con = testdb::create_at(&db_path);
+        testdb::insert_session_at(&con, "old", "/a", None, 0);
+        testdb::insert_session_at(&con, "new", "/a", None, crate::util::now_ms().unwrap());
+        con.execute(
+            "INSERT INTO kv (key, value, time_created, time_updated) VALUES ('big', ?1, 0, 0)",
+            ["x".repeat(2 * 1024 * 1024)],
+        )
+        .unwrap();
+
+        let v = report_value(&con, &db_path).unwrap();
+        assert_eq!(v["old_sessions"]["count"], 1);
+        assert_eq!(v["kv_candidates"][0]["key"], "big");
+        assert!(
+            v["suggestions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|s| s["command"].as_str().unwrap().contains("kv delete")),
+            "suggestions: {}",
+            v["suggestions"]
+        );
+        assert!(
+            v["suggestions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|s| s["command"].as_str().unwrap().contains("session purge")),
+            "suggestions: {}",
+            v["suggestions"]
+        );
+
+        drop(con);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+}

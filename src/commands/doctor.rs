@@ -54,16 +54,67 @@ struct DoctorOut {
     foreign_key_violations: Vec<FkViolation>,
     orphans: Orphans,
     ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    fix: Option<FixReport>,
 }
 
-pub fn cmd_doctor(con: &Connection, db_path: &Path) -> Result<()> {
-    let out = doctor_out(con, db_path)?;
+/// What `doctor --fix` repaired (or would repair, in dry-run mode).
+#[derive(Serialize)]
+struct FixReport {
+    dry_run: bool,
+    blobs_deleted: usize,
+    event_rows_deleted: i64,
+    event_sequences_deleted: usize,
+    parents_cleared: usize,
+    forks_cleared: usize,
+    workspaces_cleared: usize,
+}
+
+pub fn cmd_doctor(con: &mut Connection, db_path: &Path, fix: bool, dry_run: bool) -> Result<()> {
+    let mut out = doctor_out(con, db_path)?;
+    if fix {
+        if dry_run {
+            out.fix = Some(FixReport {
+                dry_run: true,
+                blobs_deleted: out.orphans.orphan_instruction_blobs.len(),
+                event_rows_deleted: crate::repo::orphan_event_row_count(con)?,
+                event_sequences_deleted: out.orphans.orphaned_event_sequences.len(),
+                parents_cleared: out.orphans.sessions_missing_parent.len(),
+                forks_cleared: out.orphans.sessions_dangling_fork.len(),
+                workspaces_cleared: out.orphans.sessions_missing_workspace.len(),
+            });
+        } else {
+            let report = apply_fixes(con)?;
+            // Re-diagnose so `ok` reflects the repaired state.
+            out = doctor_out(con, db_path)?;
+            out.fix = Some(report);
+        }
+    }
     let v = serde_json::to_value(&out)?;
     output::emit(&v)?;
     if !out.ok {
         return Err(AppError::db("integrity problems found (see JSON output)"));
     }
     Ok(())
+}
+
+/// Apply every conservative repair `doctor` knows about. Integrity/FK
+/// failures are never touched.
+fn apply_fixes(con: &mut Connection) -> Result<FixReport> {
+    let (blobs, _bytes) = crate::repo::delete_blob_orphans(con)?;
+    let (event_rows, sequences) = crate::repo::delete_orphan_event_sequences(con)?;
+    let parents = crate::repo::clear_missing_parents(con)?;
+    let forks = crate::repo::clear_dangling_forks(con)?;
+    let workspaces = crate::repo::clear_missing_workspaces(con)?;
+    Ok(FixReport {
+        dry_run: false,
+        blobs_deleted: blobs,
+        event_rows_deleted: event_rows as i64,
+        event_sequences_deleted: sequences,
+        parents_cleared: parents,
+        forks_cleared: forks,
+        workspaces_cleared: workspaces,
+    })
 }
 
 /// Build the doctor result (exposed for tests).
@@ -194,6 +245,7 @@ fn doctor_out(con: &Connection, db_path: &Path) -> Result<DoctorOut> {
         foreign_key_violations: fk_violations,
         orphans,
         ok,
+        fix: None,
     })
 }
 
@@ -204,9 +256,9 @@ mod tests {
 
     #[test]
     fn healthy_db_reports_ok() {
-        let con = testdb::create();
+        let mut con = testdb::create();
         testdb::insert_session(&con, "s1", "/a", None);
-        cmd_doctor(&con, Path::new("/tmp/x.db")).unwrap();
+        cmd_doctor(&mut con, Path::new("/tmp/x.db"), false, false).unwrap();
     }
 
     #[test]
@@ -244,7 +296,7 @@ mod tests {
 
     #[test]
     fn project_aggregate_is_not_orphaned() {
-        let con = testdb::create();
+        let mut con = testdb::create();
         con.execute(
             "INSERT INTO project (id, worktree, name) VALUES ('p1','/a','p1')",
             [],
@@ -255,29 +307,87 @@ mod tests {
             [],
         )
         .unwrap();
-        cmd_doctor(&con, Path::new("/tmp/x.db")).unwrap();
+        cmd_doctor(&mut con, Path::new("/tmp/x.db"), false, false).unwrap();
     }
 
     #[test]
     fn dangling_fork_and_workspace_are_detected() {
-        let con = testdb::create();
+        let mut con = testdb::create();
         con.execute(
             "INSERT INTO session_v2 (id, directory, title, fork_session_id, workspace_id, time_updated, cost) \
              VALUES ('s1', '/a', 't', 'missing-parent', 'missing-ws', 0, 0)",
             [],
         )
         .unwrap();
-        assert!(cmd_doctor(&con, Path::new("/tmp/x.db")).is_err());
+        assert!(cmd_doctor(&mut con, Path::new("/tmp/x.db"), false, false).is_err());
     }
 
     #[test]
     fn orphan_blobs_fail_doctor_until_cleaned() {
-        let con = testdb::create();
+        let mut con = testdb::create();
         con.execute(
             "INSERT INTO instruction_blob (hash, value) VALUES ('zzz', 'orphan')",
             [],
         )
         .unwrap();
-        assert!(cmd_doctor(&con, Path::new("/tmp/x.db")).is_err());
+        assert!(cmd_doctor(&mut con, Path::new("/tmp/x.db"), false, false).is_err());
+    }
+
+    #[test]
+    fn fix_repairs_orphans_and_dangling_references() {
+        let mut con = testdb::create();
+        con.execute(
+            "INSERT INTO instruction_blob (hash, value) VALUES ('zzz', 'orphan')",
+            [],
+        )
+        .unwrap();
+        con.execute(
+            "INSERT INTO event (aggregate_id, type, data) VALUES ('gone', 'x', '{}')",
+            [],
+        )
+        .unwrap();
+        con.execute(
+            "INSERT INTO event_sequence (aggregate_id, seq) VALUES ('gone', 1)",
+            [],
+        )
+        .unwrap();
+        con.execute(
+            "INSERT INTO session_v2 (id, directory, title, parent_id, fork_session_id, workspace_id, time_updated, cost) \
+             VALUES ('s1', '/a', 't', 'missing', 'missing-fork', 'missing-ws', 0, 0)",
+            [],
+        )
+        .unwrap();
+
+        // Dry-run reports the plan but changes nothing.
+        assert!(cmd_doctor(&mut con, Path::new("/tmp/x.db"), true, true).is_err());
+        let blobs: i64 = con
+            .query_row("SELECT COUNT(*) FROM instruction_blob", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(blobs, 1, "dry-run keeps the blob");
+
+        cmd_doctor(&mut con, Path::new("/tmp/x.db"), true, false).unwrap();
+        let blobs: i64 = con
+            .query_row("SELECT COUNT(*) FROM instruction_blob", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(blobs, 0);
+        let events: i64 = con
+            .query_row("SELECT COUNT(*) FROM event", [], |r| r.get(0))
+            .unwrap();
+        let sequences: i64 = con
+            .query_row("SELECT COUNT(*) FROM event_sequence", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(events, 0);
+        assert_eq!(sequences, 0);
+        let parent: Option<String> = con
+            .query_row(
+                "SELECT parent_id FROM session_v2 WHERE id = 's1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(parent, None);
+
+        // Now healthy without any fixes.
+        cmd_doctor(&mut con, Path::new("/tmp/x.db"), false, false).unwrap();
     }
 }

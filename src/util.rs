@@ -292,6 +292,19 @@ pub fn round4(x: f64) -> f64 {
     (x * 10000.0).round() / 10000.0
 }
 
+/// Quote a string for a shell command line when it contains anything
+/// outside a conservative safe set.
+pub fn shell_quote(arg: &str) -> String {
+    if !arg.is_empty()
+        && arg
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "-_./:=@,+".contains(c))
+    {
+        return arg.to_string();
+    }
+    format!("'{}'", arg.replace('\'', "'\\''"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

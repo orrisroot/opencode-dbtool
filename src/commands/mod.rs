@@ -6,6 +6,7 @@ pub mod doctor;
 pub mod fsops;
 pub mod kv;
 pub mod project;
+pub mod report;
 pub mod selfupdate;
 pub mod service;
 pub mod session;

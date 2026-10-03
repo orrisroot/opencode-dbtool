@@ -647,6 +647,80 @@ pub fn delete_blob_orphans(con: &mut Connection) -> Result<(usize, u64)> {
     Ok((rows, bytes))
 }
 
+/// Delete `event`/`event_sequence` rows whose aggregate is neither a
+/// session nor a project; returns (event rows, sequence rows). The event
+/// rows are removed first because they reference the sequences.
+pub fn delete_orphan_event_sequences(con: &mut Connection) -> Result<(usize, usize)> {
+    con.execute_batch("PRAGMA foreign_keys = ON;")?;
+    let tx = con.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let events = tx.execute(
+        &format!(
+            "DELETE FROM event WHERE aggregate_id NOT IN (SELECT id FROM \"{SESSION_TABLE}\") \
+             AND aggregate_id NOT IN (SELECT id FROM project)"
+        ),
+        [],
+    )?;
+    let sequences = tx.execute(
+        &format!(
+            "DELETE FROM event_sequence WHERE aggregate_id NOT IN (SELECT id FROM \"{SESSION_TABLE}\") \
+             AND aggregate_id NOT IN (SELECT id FROM project)"
+        ),
+        [],
+    )?;
+    tx.commit()?;
+    Ok((events, sequences))
+}
+
+/// Number of `event` rows whose aggregate is neither a session nor a
+/// project (the rows `delete_orphan_event_sequences` removes).
+pub fn orphan_event_row_count(con: &Connection) -> Result<i64> {
+    Ok(con.query_row(
+        &format!(
+            "SELECT COUNT(*) FROM event WHERE aggregate_id NOT IN (SELECT id FROM \"{SESSION_TABLE}\") \
+             AND aggregate_id NOT IN (SELECT id FROM project)"
+        ),
+        [],
+        |r| r.get(0),
+    )?)
+}
+
+/// Clear `parent_id` of sessions whose parent is missing (they become
+/// top-level sessions); returns the number of rows changed.
+pub fn clear_missing_parents(con: &Connection) -> Result<usize> {
+    Ok(con.execute(
+        &format!(
+            "UPDATE \"{SESSION_TABLE}\" SET parent_id = NULL \
+             WHERE parent_id IS NOT NULL AND parent_id != '' \
+             AND parent_id NOT IN (SELECT id FROM \"{SESSION_TABLE}\")"
+        ),
+        [],
+    )?)
+}
+
+/// Clear `fork_session_id` of sessions whose fork source is missing.
+pub fn clear_dangling_forks(con: &Connection) -> Result<usize> {
+    Ok(con.execute(
+        &format!(
+            "UPDATE \"{SESSION_TABLE}\" SET fork_session_id = NULL \
+             WHERE fork_session_id IS NOT NULL AND fork_session_id != '' \
+             AND fork_session_id NOT IN (SELECT id FROM \"{SESSION_TABLE}\")"
+        ),
+        [],
+    )?)
+}
+
+/// Clear `workspace_id` of sessions whose workspace row is missing.
+pub fn clear_missing_workspaces(con: &Connection) -> Result<usize> {
+    Ok(con.execute(
+        &format!(
+            "UPDATE \"{SESSION_TABLE}\" SET workspace_id = NULL \
+             WHERE workspace_id IS NOT NULL AND workspace_id != '' \
+             AND workspace_id NOT IN (SELECT id FROM workspace)"
+        ),
+        [],
+    )?)
+}
+
 /// One `session_message` row for content previews.
 pub struct ListedMessage {
     pub id: String,
