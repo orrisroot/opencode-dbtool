@@ -25,6 +25,22 @@ pub fn data_dir() -> Option<PathBuf> {
     None
 }
 
+/// Resolve opencode's state dir (service registration, password):
+/// `$XDG_STATE_HOME/opencode` or `~/.local/state/opencode`.
+pub fn state_dir() -> Option<PathBuf> {
+    if let Ok(dir) = env::var("XDG_STATE_HOME") {
+        if !dir.is_empty() {
+            return Some(PathBuf::from(dir).join("opencode"));
+        }
+    }
+    if let Ok(home) = env::var("HOME") {
+        if !home.is_empty() {
+            return Some(PathBuf::from(home).join(".local/state/opencode"));
+        }
+    }
+    None
+}
+
 /// Resolve the opencode database path, mirroring opencode's own
 /// resolution:
 ///

@@ -8,6 +8,7 @@ use crate::util::{now_ms, timestamp_utc};
 use rusqlite::Connection;
 use serde::Serialize;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 /// JSON shape of the `backup` field.
 #[derive(Serialize)]
@@ -70,6 +71,8 @@ struct VacuumCmdOut {
     #[serde(flatten)]
     env: EnvStatus,
     dry_run: bool,
+    /// `--online`: attempted while opencode runs.
+    online: bool,
     db_bytes_before: u64,
     free_pages_before: i64,
     backup: Option<BackupOut>,
@@ -92,7 +95,13 @@ pub fn cmd_vacuum_cli(db_path: &Path, args: &VacuumArgs, dry_run: bool) -> Resul
         keep_backups: args.keep_backups,
     };
     let con = crate::db::open_conn(db_path, dry_run)?;
-    output::emit(&vacuum_value(&con, db_path, &opts, dry_run)?)
+    if args.online {
+        // Give VACUUM a long window to win the write lock from a running
+        // opencode instead of failing after the default 5 seconds.
+        con.busy_timeout(Duration::from_secs(60))
+            .map_err(|e| AppError::db(format!("busy_timeout: {e}")))?;
+    }
+    output::emit(&vacuum_value(&con, db_path, &opts, dry_run, args.online)?)
 }
 
 /// Build (and, when not a dry run, execute) the vacuum output value.
@@ -102,6 +111,7 @@ pub fn vacuum_value(
     db_path: &Path,
     opts: &VacuumOpts,
     dry_run: bool,
+    online: bool,
 ) -> Result<serde_json::Value> {
     let integrity = quick_check(con);
     if integrity != "ok" {
@@ -113,6 +123,7 @@ pub fn vacuum_value(
     let mut out = VacuumCmdOut {
         env: crate::db::env_status(db_path),
         dry_run,
+        online,
         db_bytes_before: file_size(db_path),
         free_pages_before: freelist,
         backup: if opts.backup {
@@ -209,11 +220,12 @@ pub struct BackupCmdOut {
 }
 
 /// Create a verified timestamped backup without touching table data:
-/// checkpoint, integrity check, copy + verify, optional backup pruning.
-/// Returns the output value (also used by `cleanup`).
+/// integrity check, online copy + verify, optional backup pruning.
+/// Returns the output value (also used by `cleanup`). The online backup
+/// API takes a consistent snapshot of a live WAL database, so this works
+/// while opencode runs.
 pub fn backup_value(db_path: &Path, dry_run: bool, keep: Option<i64>) -> Result<BackupCmdOut> {
-    let con = crate::db::open_conn(db_path, dry_run)?;
-    checkpoint(&con);
+    let con = crate::db::open_conn(db_path, true)?;
     if quick_check(&con) != "ok" {
         return Err(AppError::db("integrity check not ok - abort"));
     }
@@ -311,9 +323,10 @@ struct BackupInfo {
     integrity: String,
 }
 
-/// Copy the (already checkpointed) database file to a timestamped
-/// backup in the same directory and verify it with quick_check. Any
-/// failure aborts the vacuum.
+/// Copy the database to a timestamped backup with SQLite's online backup
+/// API and verify it with quick_check. Works on a live WAL database (no
+/// exclusive access), so a running opencode does not block it. Any
+/// failure removes the partial file and aborts.
 fn create_backup(db_path: &Path) -> Result<BackupInfo> {
     let path = backup_path(db_path, &timestamp_utc(now_ms()?));
     if path.exists() {
@@ -322,15 +335,29 @@ fn create_backup(db_path: &Path) -> Result<BackupInfo> {
             path.display()
         )));
     }
-    // The caller checkpointed the WAL first, so a plain file copy of
-    // the main database is a consistent snapshot.
-    std::fs::copy(db_path, &path)
-        .map_err(|e| AppError::db(format!("backup failed ({}): {e}", path.display())))?;
+    let src = crate::db::open_conn(db_path, true)?;
+    let copied = (|| -> Result<()> {
+        let mut dst = Connection::open(&path)
+            .map_err(|e| AppError::db(format!("backup failed ({}): {e}", path.display())))?;
+        {
+            let backup = rusqlite::backup::Backup::new(&src, &mut dst)
+                .map_err(|e| AppError::db(format!("backup failed ({}): {e}", path.display())))?;
+            backup
+                .run_to_completion(256, Duration::from_millis(0), None)
+                .map_err(|e| AppError::db(format!("backup failed ({}): {e}", path.display())))?;
+        }
+        Ok(())
+    })();
+    if let Err(e) = copied {
+        let _ = std::fs::remove_file(&path);
+        return Err(e);
+    }
     let check = {
         let backup_con = crate::db::open_conn(&path, true)?;
         quick_check(&backup_con)
     };
     if check != "ok" {
+        let _ = std::fs::remove_file(&path);
         return Err(AppError::db(format!(
             "backup integrity check failed ({check}) - abort"
         )));

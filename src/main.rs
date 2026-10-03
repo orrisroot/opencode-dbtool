@@ -24,6 +24,7 @@ mod error;
 mod models;
 mod output;
 mod repo;
+mod service;
 mod sys;
 #[cfg(test)]
 mod testdb;

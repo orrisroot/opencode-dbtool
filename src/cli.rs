@@ -62,6 +62,9 @@ pub enum Command {
     /// Global kv cache entries (list, show, delete)
     #[command(subcommand)]
     Kv(KvCmd),
+    /// Database housekeeping (WAL checkpoint)
+    #[command(subcommand)]
+    Db(DbCmd),
     /// Create a verified timestamped backup of the database
     Backup(BackupArgs),
     /// Filesystem storage cleanup (snapshots, shell, blobs, log)
@@ -302,6 +305,23 @@ pub struct KvDeleteArgs {
 }
 
 // ---------------------------------------------------------------------------
+// db
+// ---------------------------------------------------------------------------
+
+#[derive(Subcommand)]
+pub enum DbCmd {
+    /// Checkpoint the WAL (PASSIVE by default; --truncate shrinks the file)
+    Checkpoint(DbCheckpointArgs),
+}
+
+#[derive(Args)]
+pub struct DbCheckpointArgs {
+    /// Truncate the WAL file after checkpointing (needs no active readers)
+    #[arg(long)]
+    pub truncate: bool,
+}
+
+// ---------------------------------------------------------------------------
 // backup / vacuum
 // ---------------------------------------------------------------------------
 
@@ -328,6 +348,9 @@ pub struct VacuumArgs {
         value_parser = keep_backups_value
     )]
     pub keep_backups: Option<i64>,
+    /// Attempt VACUUM while opencode runs (may block the server briefly)
+    #[arg(long)]
+    pub online: bool,
 }
 
 // ---------------------------------------------------------------------------

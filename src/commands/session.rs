@@ -10,6 +10,7 @@ use crate::repo::{
     reasoning_event_counts, reasoning_events_left, reasoning_messages_left, resolve_session_id,
     resolve_session_ids, rewrite_message, session_sizes, strip_reasoning_events,
 };
+use crate::service::ServiceInfo;
 use rusqlite::Connection;
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
@@ -173,6 +174,7 @@ pub fn cmd_session_delete(
     ids: &[String],
     dry_run: bool,
     db_path: &Path,
+    service: Option<&ServiceInfo>,
 ) -> Result<()> {
     let refs: Vec<&str> = ids.iter().map(|s| s.as_str()).collect();
     let mut resolved = resolve_session_ids(con, &refs)?;
@@ -184,10 +186,21 @@ pub fn cmd_session_delete(
         return output::emit(&serde_json::to_value(&out)?);
     }
 
-    execute_delete(con, &resolved)?;
+    match service {
+        Some(svc) => execute_delete_via_api(con, &resolved, svc)?,
+        None => execute_delete(con, &resolved)?,
+    }
     out.deleted = true;
-    out.note = Some("file size is unchanged until `opencode-dbtool vacuum` is run".into());
+    out.note = Some(delete_note(service.is_some()));
     output::emit(&serde_json::to_value(&out)?)
+}
+
+fn delete_note(via_api: bool) -> String {
+    if via_api {
+        "deleted through the running opencode server".to_string()
+    } else {
+        "file size is unchanged until `opencode-dbtool vacuum` is run".to_string()
+    }
 }
 
 /// Delete sessions selected by filters. At least one filter is required.
@@ -196,8 +209,11 @@ pub fn cmd_session_purge(
     filters: &PurgeFilter,
     dry_run: bool,
     db_path: &Path,
+    service: Option<&ServiceInfo>,
 ) -> Result<()> {
-    output::emit(&session_purge_value(con, filters, dry_run, db_path)?)
+    output::emit(&session_purge_value(
+        con, filters, dry_run, db_path, service,
+    )?)
 }
 
 /// Delete sessions selected by filters and return the output value
@@ -207,6 +223,7 @@ pub fn session_purge_value(
     filters: &PurgeFilter,
     dry_run: bool,
     db_path: &Path,
+    service: Option<&ServiceInfo>,
 ) -> Result<serde_json::Value> {
     if filters.is_empty() {
         return Err(AppError::usage(
@@ -229,9 +246,12 @@ pub fn session_purge_value(
         return Ok(serde_json::to_value(&out)?);
     }
 
-    execute_delete(con, &selected)?;
+    match service {
+        Some(svc) => execute_delete_via_api(con, &selected, svc)?,
+        None => execute_delete(con, &selected)?,
+    }
     out.deleted = true;
-    out.note = Some("file size is unchanged until `opencode-dbtool vacuum` is run".into());
+    out.note = Some(delete_note(service.is_some()));
     Ok(serde_json::to_value(&out)?)
 }
 
@@ -553,6 +573,93 @@ fn execute_delete(con: &mut Connection, resolved: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// Delete the given sessions through the running opencode server, deepest
+/// children first, then verify the rows are gone. The server owns its
+/// caches and event log, so no stale-state or FK failures arise.
+fn execute_delete_via_api(
+    con: &Connection,
+    resolved: &[String],
+    service: &ServiceInfo,
+) -> Result<()> {
+    let order = delete_order(con, resolved)?;
+    let total = order.len();
+    for (done, id) in order.iter().enumerate() {
+        service.delete_session(id).map_err(|e| {
+            AppError::db(format!(
+                "{e} ({done} of {total} session(s) already deleted; re-run to converge)"
+            ))
+        })?;
+    }
+    let mut remaining: i64 = 0;
+    for chunk in resolved.chunks(SQL_VAR_CHUNK) {
+        let in_sql = placeholders(chunk.len());
+        let left: i64 = con.query_row(
+            &format!("SELECT COUNT(*) FROM \"{SESSION_TABLE}\" WHERE id IN ({in_sql})"),
+            rusqlite::params_from_iter(chunk),
+            |r| r.get(0),
+        )?;
+        remaining += left;
+    }
+    if remaining != 0 {
+        return Err(AppError::db(format!(
+            "sessions still exist after API delete: {remaining}"
+        )));
+    }
+    Ok(())
+}
+
+/// Deepest-first order: deleting a parent before its children would leave
+/// the children pointing at a missing parent.
+fn delete_order(con: &Connection, ids: &[String]) -> Result<Vec<String>> {
+    let mut parents: HashMap<String, Option<String>> = HashMap::new();
+    for chunk in ids.chunks(SQL_VAR_CHUNK) {
+        let sql = format!(
+            "SELECT id, parent_id FROM \"{SESSION_TABLE}\" WHERE id IN ({})",
+            placeholders(chunk.len())
+        );
+        let mut stmt = con.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(chunk), |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
+        })?;
+        for row in rows {
+            let (id, parent) = row?;
+            parents.insert(id, parent);
+        }
+    }
+    let mut memo: HashMap<String, i64> = HashMap::new();
+    let mut depths: HashMap<String, i64> = HashMap::new();
+    for id in ids {
+        depths.insert(id.clone(), depth_of(id, &parents, &mut memo));
+    }
+    let mut order = ids.to_vec();
+    order.sort_by(|a, b| {
+        depths
+            .get(b)
+            .unwrap_or(&0)
+            .cmp(depths.get(a).unwrap_or(&0))
+            .then_with(|| a.cmp(b))
+    });
+    Ok(order)
+}
+
+fn depth_of(
+    id: &str,
+    parents: &HashMap<String, Option<String>>,
+    memo: &mut HashMap<String, i64>,
+) -> i64 {
+    if let Some(depth) = memo.get(id) {
+        return *depth;
+    }
+    // Cycle guard: a parent loop counts as depth 0.
+    memo.insert(id.to_string(), 0);
+    let depth = match parents.get(id).and_then(|p| p.as_deref()) {
+        Some(parent) if parents.contains_key(parent) => depth_of(parent, parents, memo) + 1,
+        _ => 0,
+    };
+    memo.insert(id.to_string(), depth);
+    depth
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -619,6 +726,7 @@ mod tests {
             &["parent".to_string()],
             false,
             Path::new("/tmp/x.db"),
+            None,
         )
         .unwrap();
 
@@ -640,6 +748,7 @@ mod tests {
             &["child".to_string()],
             false,
             Path::new("/tmp/x.db"),
+            None,
         )
         .unwrap();
 
@@ -660,6 +769,7 @@ mod tests {
             &["does-not-exist".to_string()],
             false,
             Path::new("/tmp/x.db"),
+            None,
         )
         .unwrap_err();
         assert_eq!(err.code, 2);
@@ -804,6 +914,7 @@ mod tests {
             &filter(&["--path".to_string(), "/a".to_string()]),
             false,
             Path::new("/tmp/x.db"),
+            None,
         )
         .unwrap();
 
@@ -815,8 +926,8 @@ mod tests {
         let mut con = testdb::create();
         testdb::insert_session(&con, "s1", "/a", None);
 
-        let err =
-            cmd_session_purge(&mut con, &filter(&[]), false, Path::new("/tmp/x.db")).unwrap_err();
+        let err = cmd_session_purge(&mut con, &filter(&[]), false, Path::new("/tmp/x.db"), None)
+            .unwrap_err();
         assert_eq!(err.code, 2);
     }
 
@@ -831,6 +942,7 @@ mod tests {
             &filter(&["--subagents".to_string()]),
             false,
             Path::new("/tmp/x.db"),
+            None,
         )
         .unwrap();
 
@@ -853,6 +965,7 @@ mod tests {
             &filter(&["--older-than".to_string(), "30d".to_string()]),
             false,
             Path::new("/tmp/x.db"),
+            None,
         )
         .unwrap();
 
@@ -878,6 +991,7 @@ mod tests {
             &filter(&["--older-than".to_string(), "30d".to_string()]),
             false,
             Path::new("/tmp/x.db"),
+            None,
         )
         .unwrap();
 
@@ -905,6 +1019,7 @@ mod tests {
             ]),
             false,
             Path::new("/tmp/x.db"),
+            None,
         )
         .unwrap();
 
@@ -929,6 +1044,7 @@ mod tests {
             &filter(&["--path".to_string(), "/a".to_string()]),
             true,
             Path::new("/tmp/x.db"),
+            None,
         )
         .unwrap();
 
@@ -948,6 +1064,7 @@ mod tests {
             &filter(&["--larger-than".to_string(), "4".to_string()]),
             false,
             Path::new("/tmp/x.db"),
+            None,
         )
         .unwrap();
 
@@ -970,6 +1087,7 @@ mod tests {
             &filter(&["--keep-latest".to_string(), "2".to_string()]),
             false,
             Path::new("/tmp/x.db"),
+            None,
         )
         .unwrap();
 
@@ -995,6 +1113,7 @@ mod tests {
             &filter(&["--keep-latest".to_string(), "1".to_string()]),
             false,
             Path::new("/tmp/x.db"),
+            None,
         )
         .unwrap();
 
@@ -1013,6 +1132,7 @@ mod tests {
             &filter(&["--keep-latest".to_string(), "1".to_string()]),
             false,
             Path::new("/tmp/x.db"),
+            None,
         )
         .unwrap();
 
@@ -1034,6 +1154,7 @@ mod tests {
             &filter(&["--keep-latest".to_string(), "0".to_string()]),
             false,
             Path::new("/tmp/x.db"),
+            None,
         )
         .unwrap();
 
@@ -1050,6 +1171,7 @@ mod tests {
             &filter(&["--keep-latest".to_string(), "5".to_string()]),
             false,
             Path::new("/tmp/x.db"),
+            None,
         )
         .unwrap();
 
@@ -1072,6 +1194,7 @@ mod tests {
             ]),
             false,
             Path::new("/tmp/x.db"),
+            None,
         )
         .unwrap();
 
@@ -1409,7 +1532,14 @@ mod tests {
         testdb::insert_inbox(&con, "i1", "s1", "payload");
         con.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
 
-        cmd_session_delete(&mut con, &["s1".to_string()], false, Path::new("/tmp/x.db")).unwrap();
+        cmd_session_delete(
+            &mut con,
+            &["s1".to_string()],
+            false,
+            Path::new("/tmp/x.db"),
+            None,
+        )
+        .unwrap();
 
         assert_eq!(testdb::session_count(&con), 0);
         let sm: i64 = con
@@ -1448,6 +1578,7 @@ mod tests {
             &filter(&["--larger-than".to_string(), "4".to_string()]),
             false,
             Path::new("/tmp/x.db"),
+            None,
         )
         .unwrap();
 
@@ -1528,6 +1659,7 @@ mod tests {
             &filter(&["--path-prefix".to_string(), "/a".to_string()]),
             false,
             Path::new("/tmp/x.db"),
+            None,
         )
         .unwrap();
 
@@ -1550,6 +1682,7 @@ mod tests {
             &filter(&["--empty".to_string()]),
             false,
             Path::new("/tmp/x.db"),
+            None,
         )
         .unwrap();
 
@@ -1576,6 +1709,7 @@ mod tests {
             &filter(&["--archived".to_string()]),
             false,
             Path::new("/tmp/x.db"),
+            None,
         )
         .unwrap();
 
@@ -1613,6 +1747,7 @@ mod tests {
             &filter(&["--keep-latest-per-project".to_string(), "1".to_string()]),
             false,
             Path::new("/tmp/x.db"),
+            None,
         )
         .unwrap();
 

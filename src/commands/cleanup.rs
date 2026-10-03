@@ -12,6 +12,7 @@ use crate::db::{env_status, EnvStatus};
 use crate::error::Result;
 use crate::models::{PurgeFilter, PurgeFilterJson};
 use crate::output;
+use crate::service::ServiceInfo;
 use crate::{commands, db};
 use serde::Serialize;
 use std::io::IsTerminal;
@@ -64,13 +65,16 @@ pub fn cmd_cleanup(
     args: &CleanupArgs,
     dry_run: bool,
     quiet: bool,
+    service: Option<&ServiceInfo>,
 ) -> Result<()> {
     let filters = PurgeFilter::try_from(&args.purge)?;
     let fs_age = args.fs_older_than.as_str();
+    let service_running = service.is_some();
     let mut con = db::open_conn(db_path, dry_run)?;
 
     // 1. Backup before any session deletion (the VACUUM at the end skips
     //    its own backup: this one already covers the pre-change state).
+    //    The online backup API works while opencode runs.
     let backup = if !filters.is_empty() && !args.no_backup {
         progress(quiet, dry_run, "creating verified backup");
         Some(without_env(serde_json::to_value(
@@ -81,13 +85,14 @@ pub fn cmd_cleanup(
     };
 
     // 2. Session purge (skipped without session filters: a bare cleanup
-    //    never deletes sessions).
+    //    never deletes sessions). With a running server the deletes are
+    //    routed through its API so caches and the event log stay intact.
     let purge = if filters.is_empty() {
         None
     } else {
         progress(quiet, dry_run, "purging matching sessions");
         Some(without_env(commands::session::session_purge_value(
-            &mut con, &filters, dry_run, db_path,
+            &mut con, &filters, dry_run, db_path, service,
         )?))
     };
 
@@ -125,7 +130,10 @@ pub fn cmd_cleanup(
     )?);
 
     // 6. Final VACUUM (no second backup; the pre-run one is kept).
-    let vacuum = if args.no_vacuum {
+    //    Skipped while opencode runs: VACUUM needs the write lock, so it
+    //    is left to the explicit `vacuum --online` command.
+    let vacuum_skipped = service_running && !args.no_vacuum;
+    let vacuum = if args.no_vacuum || service_running {
         None
     } else {
         progress(quiet, dry_run, "vacuuming the database");
@@ -134,12 +142,24 @@ pub fn cmd_cleanup(
             keep_backups: None,
         };
         Some(without_env(commands::vacuum::vacuum_value(
-            &con, db_path, &opts, dry_run,
+            &con, db_path, &opts, dry_run, false,
         )?))
     };
 
     let note = if dry_run {
-        Some("preview only; re-run with --yes to apply".to_string())
+        if vacuum_skipped {
+            Some(
+                "preview only; VACUUM will be skipped while opencode is running (use `vacuum --online`)"
+                    .to_string(),
+            )
+        } else {
+            Some("preview only; re-run with --yes to apply".to_string())
+        }
+    } else if vacuum_skipped {
+        Some(
+            "VACUUM skipped while opencode is running; run `opencode-dbtool vacuum --online` or stop the service"
+                .to_string(),
+        )
     } else if args.no_vacuum {
         Some(
             "deleted rows free space only after `opencode-dbtool vacuum` (skipped with --no-vacuum)"
@@ -211,7 +231,15 @@ mod tests {
         std::fs::create_dir_all(dir.join("shell/p1")).unwrap();
         std::fs::write(dir.join("shell/p1/sh_x.out"), b"x").unwrap();
 
-        cmd_cleanup(&dir, &db_path, &cleanup_args(&["--no-backup"]), true, true).unwrap();
+        cmd_cleanup(
+            &dir,
+            &db_path,
+            &cleanup_args(&["--no-backup"]),
+            true,
+            true,
+            None,
+        )
+        .unwrap();
 
         let con = crate::db::open_conn(&db_path, true).unwrap();
         assert_eq!(testdb::session_count(&con), 1, "dry-run keeps sessions");
@@ -241,6 +269,7 @@ mod tests {
             &cleanup_args(&["--older-than", "30d", "--no-backup"]),
             false,
             true,
+            None,
         )
         .unwrap();
 

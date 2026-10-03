@@ -47,12 +47,13 @@ cargo build --release   # -> target/release/opencode-dbtool
 | `kv list [--older-than <age>]` | list global kv entries with sizes (large caches first) |
 | `kv show <key>` | show a kv value (truncated) |
 | `kv delete <key>...` | delete kv entries (caches regenerate on demand) |
-| `backup [--keep-backups <n>]` | verified timestamped backup without touching table data |
+| `backup [--keep-backups <n>]` | online verified backup (safe while opencode runs) |
 | `fs clean-snapshots [--project <id>...] [--orphans-only]` | delete snapshot storage, optionally scoped |
 | `fs clean-shell [--older-than <age>]` | delete shell output files, optionally only old ones |
 | `fs clean-blob-orphans` | delete instruction blobs referenced by no state |
 | `fs clean-log [--older-than <age>]` | truncate log/opencode.log, or prune only old lines |
-| `vacuum [--no-backup] [--keep-backups <n>]` | run VACUUM (backup + verify by default) |
+| `vacuum [--no-backup] [--keep-backups <n>] [--online]` | run VACUUM (backup + verify by default; `--online` attempts it while opencode runs) |
+| `db checkpoint [--truncate]` | checkpoint the WAL; `--truncate` shrinks the file (online) |
 | `cleanup [filters] [--fs-older-than <age>] [--no-backup] [--no-vacuum] [--keep-backups <n>]` | backup → optional purge → orphan/file cleanup → VACUUM, in one run |
 | `completions <shell>` | print a shell completion script (bash, zsh, fish, ...) |
 | `self-update [--dry-run\|--yes]` | check for / install the latest GitHub release binary |
@@ -78,7 +79,7 @@ Commands that print a single result object (`stats`, `doctor`, `project
 delete`, `project purge`, `session delete`, `session purge`, `session
 strip-reasoning`, `kv delete`, `backup`, `fs clean-snapshots`,
 `fs clean-shell`, `fs clean-blob-orphans`, `fs clean-log`, `vacuum`,
-`cleanup`)
+`cleanup`, `db checkpoint`)
 start with an environment block;
 `project/session list` print a bare array and `project/session show` a bare
 object:
@@ -113,6 +114,47 @@ Destructive commands (`session`/`project delete` and `purge`,
 - neither, on a terminal: print the preview, ask `Proceed? [y/N]`, then
   execute or abort.
 - neither, not a terminal: exit 2 with a message pointing at both flags.
+
+### Online maintenance (opencode running)
+
+opencode 2.x keeps a background server (`opencode serve --service`) running
+after the TUI exits, so maintenance cannot assume an idle database. This
+tool adapts:
+
+- **Session deletes and purges are routed through the running server's API**
+  (`DELETE /api/session/<id>`) when the server operates on the same database
+  file. The server owns its caches and event log, so no stale-state or
+  foreign-key failures arise; children are deleted before their parents.
+- **`backup` works online**: SQLite's online backup API takes a consistent
+  snapshot of a live WAL database.
+- **`db checkpoint [--truncate]`** moves committed WAL frames into the
+  database file and can shrink the WAL while opencode runs (best effort:
+  `busy: 1` means active readers held it back).
+- **`fs clean-shell --older-than`**, **`fs clean-snapshots --orphans-only`**,
+  and **`fs clean-blob-orphans`** are safe online.
+- **`vacuum --online`** attempts a VACUUM while opencode runs with a long
+  busy timeout; the server may block writes for the duration, and the
+  command fails cleanly if it cannot win the lock.
+- `project delete/purge`, `session strip-reasoning`, `kv delete`,
+  `fs clean-log`, `fs clean-snapshots` without `--orphans-only`, and
+  `fs clean-shell` without `--older-than` still require stopping opencode
+  (exit 1).
+
+To stop and restart the service manually:
+
+```sh
+opencode service status   # prints the server URL, or "stopped"
+opencode service stop
+opencode-dbtool vacuum --yes
+opencode service start
+```
+
+The tool discovers the service through `service.json` (or `server.json`)
+under `$XDG_STATE_HOME/opencode` (`~/.local/state/opencode`). On Linux it
+only routes through the server after verifying, via `/proc/<pid>/fd`, that
+the server has the target database open; elsewhere it trusts the service
+only for the default database location (no `OPENCODE_DB` /
+`OPENCODE_DATA_DIR` override).
 
 ### `stats`
 
@@ -310,7 +352,8 @@ purge` and `project delete` behave the same.
 ```
 
 On success, `deleted: true` plus a note that the file size only shrinks
-after `vacuum`.
+after `vacuum`. When the opencode server is running against the same
+database, the deletes go through its API and the note says so.
 
 ### `session purge`
 
@@ -485,9 +528,9 @@ both modes are **refused while opencode runs** (exit 1), like
 ### `backup`
 
 Create a verified timestamped backup (`opencode.db.backup-<UTC>`) without
-touching table data: checkpoint, integrity check, copy, verify the copy,
-optional `--keep-backups <n>` pruning. Use it before `purge`/`delete` runs.
-Refused while opencode runs (the checkpoint needs exclusive access).
+touching table data: integrity check, **online copy** (SQLite's backup API
+takes a consistent snapshot of a live WAL database), verify the copy, and
+optional `--keep-backups <n>` pruning. Safe while opencode runs.
 
 ```json
 {
@@ -521,9 +564,16 @@ deletes the older `opencode.db.backup-*` files (it cannot be combined
 with `--no-backup`). In dry-run mode the
 planned backup path and size are reported and nothing is written.
 
+Add `--online` to attempt the VACUUM while opencode runs: the tool waits up
+to 60 seconds for the write lock. The server may block writes for the
+duration; if the lock cannot be won, the command fails with a database
+error (nothing is corrupted). Without `--online`, VACUUM is refused while
+opencode runs (exit 1).
+
 ```json
 {
   "dry_run": false,
+  "online": false,
   "db_bytes_before": 8388608,
   "free_pages_before": 120,
   "backup": { "path": "/path/opencode.db.backup-20260830T120000Z", "bytes": 8388608, "integrity": "ok" },
@@ -539,6 +589,24 @@ added on a real run (dry-run reports nothing since no backup is touched):
 
 ```json
 "backup_cleanup": { "kept": 3, "removed_files": 7, "removed_bytes": 52428800 }
+```
+
+### `db checkpoint`
+
+Checkpoint the WAL into the database file. PASSIVE (the default) never
+blocks; `--truncate` additionally shrinks `opencode.db-wal` when no
+connection holds a read snapshot. Both are safe while opencode runs and
+report the lock state instead of failing:
+
+```json
+{
+  "mode": "truncate",
+  "busy": 0,
+  "log_frames": 0,
+  "checkpointed_frames": 0,
+  "wal_bytes_before": 10098152,
+  "wal_bytes_after": 0
+}
 ```
 
 ### `cleanup`
@@ -557,7 +625,11 @@ command and reports each step's result. Steps, in order:
    `--fs-older-than`);
 6. `fs clean-log --older-than <age>` (same cutoff);
 7. `vacuum` (skipped with `--no-vacuum`; no second backup is taken because
-   step 1 already backed up the pre-change database).
+   step 1 already backed up the pre-change database). **While opencode
+   runs, the final VACUUM is skipped** with a note, because it needs the
+   write lock; run `opencode-dbtool vacuum --online` afterwards, or stop
+   the service. The purge step is routed through the server API, so a
+   `cleanup` with session filters is safe online.
 
 All `session purge` filters are accepted directly. `--keep-backups <n>`
 prunes older backups after the pre-run backup. The output embeds each step's
@@ -622,6 +694,7 @@ failures, and download problems surface as exit code 3.
 | `--format <table\|json>` | output format (default: table on a terminal, JSON when piped) |
 | `--quiet` | suppress progress and confirmation messages on stderr |
 | `--no-backup` | `vacuum`/`cleanup`: skip the timestamped backup (dangerous) |
+| `--online` | `vacuum` only: attempt VACUUM while opencode runs (may block the server briefly) |
 
 Destructive commands refuse to run without `--yes`, `--dry-run`, or an
 interactive terminal (exit code 2): use `--dry-run` to preview the impact
@@ -643,6 +716,14 @@ opencode-dbtool session purge --older-than 30d --keep-latest-per-project 5
 # One-shot cleanup (backup, purge, orphan/file cleanup, VACUUM)
 opencode-dbtool cleanup --older-than 30d --subagents
 
+# Maintenance while the opencode service keeps running
+opencode-dbtool db checkpoint --truncate
+opencode-dbtool backup
+opencode-dbtool session purge --older-than 30d --subagents
+
+# Reclaim the database file size (VACUUM needs the write lock)
+opencode-dbtool vacuum --online
+
 # Inspect a huge cache key
 opencode-dbtool kv list
 opencode-dbtool kv show models-dev:catalog
@@ -656,7 +737,7 @@ source <(opencode-dbtool completions bash)
 | code | meaning |
 | --- | --- |
 | 0 | success |
-| 1 | opencode is running and the command was refused (close opencode and retry) |
+| 1 | opencode is running and the command is not safe online (see "Online maintenance"; `--dry-run` still works) |
 | 2 | not found / bad arguments |
 | 3 | database or network error, or running-process detection failed |
 
@@ -668,6 +749,7 @@ source <(opencode-dbtool completions bash)
 | `OPENCODE_DB` | override database path (same rules as opencode: `:memory:` and absolute paths as-is, relative resolves against the data dir) |
 | `OPENCODE_DISABLE_CHANNEL_DB` | skip the channel-database fallback and always target `opencode.db` |
 | `XDG_DATA_HOME` | data dir defaults to `$XDG_DATA_HOME/opencode` |
+| `XDG_STATE_HOME` | state dir for service discovery defaults to `$XDG_STATE_HOME/opencode` (`~/.local/state/opencode`) |
 | `GH_TOKEN` / `GITHUB_TOKEN` | `self-update` only: GitHub API token (raises the release-check rate limit) |
 
 Default data dir: `~/.local/share/opencode`.
@@ -706,17 +788,22 @@ matching busy timeout, so concurrent reads never wedge.
   Linux, macOS, and Windows. Command-line matching only accepts
   invocations (e.g. `/usr/bin/opencode`), not references to opencode's
   data files.
-- `delete`, `purge`, `strip-reasoning`, `kv delete`, `backup`,
-  `fs clean-snapshots`, `fs clean-shell`, `fs clean-blob-orphans`,
-  `fs clean-log`, `vacuum`, and `cleanup` are **refused while opencode
-  runs** (exit 1); close opencode and retry.
-  Deleting a session a running instance is using is not safe: the row is
-  not resurrected, later writes fail FK checks, and the TUI keeps showing
-  the cached session until refreshed. If detection itself fails, guarded
-  commands fail with exit 3 instead of guessing.
+- Safe online: `backup`, `db checkpoint`, `fs clean-shell --older-than`,
+  `fs clean-snapshots --orphans-only`, `fs clean-blob-orphans`, and
+  `session delete`/`purge` (also the purge step of `cleanup`) when the
+  running server's API is available — see "Online maintenance" above.
+- Still refused while opencode runs (exit 1): `project delete/purge`,
+  `session strip-reasoning`, `kv delete`, `fs clean-log`, `fs
+  clean-snapshots` without `--orphans-only`, `fs clean-shell` without
+  `--older-than`, and `vacuum` without `--online`.
+  Deleting a session a running instance is using directly is not safe: the
+  row is not resurrected, later writes fail FK checks, and the TUI keeps
+  showing the cached session until refreshed. If detection itself fails,
+  guarded commands fail with exit 3 instead of guessing.
 - `--dry-run` is exempt from the running-instance guard: it only reads the DB
   and previews the impact, so it works while opencode runs.
-- Deleted rows free space only after `vacuum`.
+- Deleted rows free space only after `vacuum` (or, for the WAL itself,
+  `db checkpoint --truncate`).
 
 ## Delete semantics
 
@@ -729,6 +816,11 @@ Deletes run in a single immediate transaction with `PRAGMA foreign_keys=ON`:
   `ON DELETE CASCADE`.
 - After commit the tool verifies the rows are gone and reports an error
   (exit 2) if not.
+
+When a matching opencode server is running (same database file), `session
+delete`/`purge` use `DELETE /api/session/<id>` instead, deepest children
+first. The server removes the same rows (including `event`/`event_sequence`)
+and keeps its caches consistent; the tool verifies the result the same way.
 
 Child sessions (subagent sessions) carry a `parent_id` pointing at their
 parent. Deleting a parent session also deletes its children recursively

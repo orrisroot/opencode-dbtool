@@ -1,10 +1,11 @@
 //! Command dispatch, confirmation flow, and running-instance guards.
 
-use crate::cli::{Cli, Command, FsCmd, KvCmd, ProjectCmd, SessionCmd, SortKey};
+use crate::cli::{Cli, Command, DbCmd, FsCmd, KvCmd, ProjectCmd, SessionCmd, SortKey};
 use crate::confirm;
 use crate::db;
 use crate::error::{AppError, Result};
 use crate::models::{ProjectFilter, PurgeFilter};
+use crate::service::{self, ServiceInfo};
 use crate::{commands, config, output, sys};
 use clap::CommandFactory;
 use std::io::IsTerminal;
@@ -35,12 +36,13 @@ pub fn execute(cli: Cli) -> Result<()> {
     };
     let db_path = config::db_path()?;
     require_db(&db_path)?;
+    let service = service::discover();
 
-    match mutation_guard(command) {
-        Some((what, idle)) => with_confirmation(&cli, what, Some(idle), |dry| {
-            dispatch(command, &dir, &db_path, dry, cli.quiet)
+    match mutation_guard(command, service.as_ref(), &db_path) {
+        Some((what, idle)) => with_confirmation(&cli, what, idle, |dry| {
+            dispatch(command, &dir, &db_path, dry, cli.quiet, service.as_ref())
         }),
-        None => dispatch(command, &dir, &db_path, false, cli.quiet),
+        None => dispatch(command, &dir, &db_path, false, cli.quiet, service.as_ref()),
     }
 }
 
@@ -60,60 +62,83 @@ fn require_db(db_path: &Path) -> Result<()> {
     Ok(())
 }
 
+const IDLE_DELETE: &str = "deleting while opencode is running is not allowed";
+
 /// Commands that modify data or storage, with the guard message shown
-/// when opencode is running.
-fn mutation_guard(cmd: &Command) -> Option<(&'static str, &'static str)> {
+/// when opencode is running. `idle` is `None` for operations that are
+/// safe while opencode runs (online backups, orphan/old-file cleanup, and
+/// session deletes routed through the running server).
+fn mutation_guard<'a>(
+    cmd: &Command,
+    service: Option<&ServiceInfo>,
+    db_path: &Path,
+) -> Option<(&'static str, Option<&'a str>)> {
+    // Session deletes can go through the server API when the service
+    // operates on the same database file.
+    let api_online = service.is_some_and(|s| s.targets_db(db_path));
     match cmd {
-        Command::Project(ProjectCmd::Delete(_)) => Some((
-            "project delete",
-            "deleting while opencode is running is not allowed",
-        )),
-        Command::Project(ProjectCmd::Purge(_)) => Some((
-            "project purge",
-            "deleting while opencode is running is not allowed",
-        )),
+        Command::Project(ProjectCmd::Delete(_)) => Some(("project delete", Some(IDLE_DELETE))),
+        Command::Project(ProjectCmd::Purge(_)) => Some(("project purge", Some(IDLE_DELETE))),
         Command::Session(SessionCmd::Delete(_)) => Some((
             "session delete",
-            "deleting while opencode is running is not allowed",
+            if api_online { None } else { Some(IDLE_DELETE) },
         )),
         Command::Session(SessionCmd::Purge(_)) => Some((
             "session purge",
-            "deleting while opencode is running is not allowed",
+            if api_online { None } else { Some(IDLE_DELETE) },
         )),
-        Command::Session(SessionCmd::StripReasoning(_)) => Some((
-            "session strip-reasoning",
-            "deleting while opencode is running is not allowed",
-        )),
-        Command::Kv(KvCmd::Delete(_)) => Some((
-            "kv delete",
-            "deleting while opencode is running is not allowed",
-        )),
-        Command::Backup(_) => Some(("backup", "backup needs exclusive access")),
-        Command::Fs(FsCmd::Snapshots(_)) => Some((
+        Command::Session(SessionCmd::StripReasoning(_)) => {
+            Some(("session strip-reasoning", Some(IDLE_DELETE)))
+        }
+        Command::Kv(KvCmd::Delete(_)) => Some(("kv delete", Some(IDLE_DELETE))),
+        // Online backup: consistent snapshots of a live WAL database.
+        Command::Backup(_) => Some(("backup", None)),
+        Command::Fs(FsCmd::Snapshots(a)) => Some((
             "fs clean-snapshots",
-            "snapshots are in use while opencode runs",
+            if a.orphans_only {
+                None
+            } else {
+                Some("snapshots are in use while opencode runs")
+            },
         )),
-        Command::Fs(FsCmd::Shell(_)) => Some((
+        Command::Fs(FsCmd::Shell(a)) => Some((
             "fs clean-shell",
-            "shell outputs are in use while opencode runs",
+            if a.older_than.is_some() {
+                None
+            } else {
+                Some("shell outputs are in use while opencode runs")
+            },
         )),
-        Command::Fs(FsCmd::BlobOrphans) => Some((
-            "fs clean-blob-orphans",
-            "blob cleanup needs exclusive access",
-        )),
+        // Blob cleanup re-checks references inside its transaction.
+        Command::Fs(FsCmd::BlobOrphans) => Some(("fs clean-blob-orphans", None)),
         Command::Fs(FsCmd::Log(_)) => Some((
             "fs clean-log",
-            "truncating the log while opencode runs is not allowed",
+            Some("truncating the log while opencode runs is not allowed"),
         )),
-        Command::Vacuum(_) => Some(("VACUUM", "VACUUM needs exclusive access")),
-        Command::Cleanup(_) => Some(("cleanup", "cleanup needs exclusive access")),
+        Command::Vacuum(a) => Some((
+            "VACUUM",
+            if a.online {
+                None
+            } else {
+                Some("VACUUM needs exclusive access")
+            },
+        )),
+        Command::Cleanup(_) => Some((
+            "cleanup",
+            if api_online {
+                None
+            } else {
+                Some("cleanup needs exclusive access")
+            },
+        )),
         _ => None,
     }
 }
 
 /// Confirmation rules:
 /// - `--dry-run`: preview only, always allowed.
-/// - `--yes`: execute for real; the running-instance guard applies.
+/// - `--yes`: execute for real; the running-instance guard applies when
+///   the command is not safe online.
 /// - neither, on a terminal: preview, ask `Proceed? [y/N]`, then execute.
 /// - neither, not a terminal: usage error (exit 2) as before.
 fn with_confirmation<F>(cli: &Cli, what: &str, idle: Option<&str>, mut run: F) -> Result<()>
@@ -155,6 +180,7 @@ fn dispatch(
     db_path: &Path,
     dry_run: bool,
     quiet: bool,
+    service: Option<&ServiceInfo>,
 ) -> Result<()> {
     match command {
         Command::Stats(a) => {
@@ -201,12 +227,12 @@ fn dispatch(
             }
             SessionCmd::Delete(a) => {
                 let mut con = db::open_conn(db_path, dry_run)?;
-                commands::session::cmd_session_delete(&mut con, &a.ids, dry_run, db_path)
+                commands::session::cmd_session_delete(&mut con, &a.ids, dry_run, db_path, service)
             }
             SessionCmd::Purge(a) => {
                 let filters = PurgeFilter::try_from(a)?;
                 let mut con = db::open_conn(db_path, dry_run)?;
-                commands::session::cmd_session_purge(&mut con, &filters, dry_run, db_path)
+                commands::session::cmd_session_purge(&mut con, &filters, dry_run, db_path, service)
             }
             SessionCmd::StripReasoning(a) => {
                 let filters = PurgeFilter::try_from(a)?;
@@ -227,6 +253,9 @@ fn dispatch(
                 let mut con = db::open_conn(db_path, dry_run)?;
                 commands::kv::cmd_kv_delete(&mut con, &a.keys, dry_run, db_path)
             }
+        },
+        Command::Db(cmd) => match cmd {
+            DbCmd::Checkpoint(a) => commands::checkpoint::cmd_checkpoint(db_path, a.truncate),
         },
         Command::Backup(a) => commands::vacuum::cmd_backup(db_path, dry_run, a.keep_backups),
         Command::Fs(cmd) => match cmd {
@@ -253,7 +282,9 @@ fn dispatch(
             }
         },
         Command::Vacuum(a) => commands::vacuum::cmd_vacuum_cli(db_path, a, dry_run),
-        Command::Cleanup(a) => commands::cleanup::cmd_cleanup(dir, db_path, a, dry_run, quiet),
+        Command::Cleanup(a) => {
+            commands::cleanup::cmd_cleanup(dir, db_path, a, dry_run, quiet, service)
+        }
         Command::SelfUpdate | Command::Completions(_) => {
             unreachable!("handled before database resolution")
         }

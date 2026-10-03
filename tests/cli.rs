@@ -80,10 +80,13 @@ fn create_db(db_path: &Path) {
 }
 
 /// Run with `OPENCODE_DB` set explicitly; `run` below clears it so tests
-/// stay hermetic against a leaked parent-environment value.
+/// stay hermetic against a leaked parent-environment value. The state dir
+/// is isolated too, so a real running opencode service is never contacted.
 fn run_db_env(args: &[&str], data_dir: &Path, db: Option<&str>) -> Output {
     let mut cmd = Command::new(bin());
-    cmd.args(args).env("OPENCODE_DATA_DIR", data_dir);
+    cmd.args(args)
+        .env("OPENCODE_DATA_DIR", data_dir)
+        .env("XDG_STATE_HOME", data_dir.join("state"));
     match db {
         Some(value) => {
             cmd.env("OPENCODE_DB", value);
@@ -807,6 +810,215 @@ fn completions_emit_a_script() {
     );
     let text = String::from_utf8_lossy(&out.stdout);
     assert!(text.contains("opencode-dbtool"), "stdout: {text}");
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn backup_runs_while_opencode_is_running() {
+    let dir = temp_dir("backup-online");
+    create_db(&dir.join("opencode.db"));
+
+    // The online backup API does not need exclusive access, so the
+    // running-instance guard no longer blocks `backup`.
+    let out = run(&["backup", "--yes"], &dir);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v = stdout_json(&out);
+    assert_eq!(v["backup"]["integrity"], "ok");
+    let path = v["backup"]["path"].as_str().unwrap();
+    assert!(Path::new(path).exists(), "backup file missing: {path}");
+
+    let con = Connection::open(path).unwrap();
+    let n: i64 = con
+        .query_row("SELECT COUNT(*) FROM session_v2", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(n, 1, "backup contains the session");
+    drop(con);
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn db_checkpoint_reports_wal_state() {
+    let dir = temp_dir("checkpoint");
+    create_db(&dir.join("opencode.db"));
+
+    let out = run(&["db", "checkpoint", "--truncate"], &dir);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v = stdout_json(&out);
+    assert_eq!(v["mode"], "truncate");
+    assert!(v["busy"].is_number());
+    assert!(v["wal_bytes_after"].is_number());
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn fs_clean_shell_older_than_runs_while_opencode_runs() {
+    let dir = temp_dir("shell-online");
+    create_db(&dir.join("opencode.db"));
+    std::fs::create_dir_all(dir.join("shell/p1")).unwrap();
+    let old = dir.join("shell/p1/sh_old.out");
+    std::fs::write(&old, vec![0u8; 4]).unwrap();
+    // Backdate by two days so --older-than 1d selects it.
+    let past = std::time::SystemTime::now() - std::time::Duration::from_secs(2 * 86_400);
+    std::fs::File::options()
+        .write(true)
+        .open(&old)
+        .unwrap()
+        .set_modified(past)
+        .unwrap();
+
+    let out = run(&["fs", "clean-shell", "--older-than", "1d", "--yes"], &dir);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !old.exists(),
+        "old shell output removed while opencode runs"
+    );
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A running service whose DB is the target gets session deletes routed
+/// through its HTTP API (Linux: the fd check proves it owns the DB).
+#[test]
+#[cfg(target_os = "linux")]
+fn session_delete_routes_through_the_running_service() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::{Arc, Mutex};
+
+    let dir = temp_dir("api-delete");
+    let db = dir.join("opencode.db");
+    create_db(&db);
+    {
+        let con = Connection::open(&db).unwrap();
+        con.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        con.execute(
+            "INSERT INTO session_v2 (id, directory, title, parent_id, time_updated, cost) \
+             VALUES ('ses_api_parent', '/work/a', 'parent', NULL, 0, 0)",
+            [],
+        )
+        .unwrap();
+        con.execute(
+            "INSERT INTO session_v2 (id, directory, title, parent_id, time_updated, cost) \
+             VALUES ('ses_api_child', '/work/a', 'child', 'ses_api_parent', 0, 0)",
+            [],
+        )
+        .unwrap();
+    }
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let order: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let order_thread = Arc::clone(&order);
+    let db_thread = db.clone();
+    let server = std::thread::spawn(move || {
+        // Hold the database open for the whole test: the tool only trusts
+        // a service that has the target DB among its open files.
+        let con = Connection::open(&db_thread).unwrap();
+        con.busy_timeout(std::time::Duration::from_secs(5)).unwrap();
+        con.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        for _ in 0..2 {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf: Vec<u8> = Vec::new();
+            let mut tmp = [0u8; 1024];
+            loop {
+                let n = stream.read(&mut tmp).unwrap();
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&tmp[..n]);
+                if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let request = String::from_utf8_lossy(&buf).to_string();
+            let first = request.lines().next().unwrap_or("");
+            let id = first
+                .split_whitespace()
+                .nth(1)
+                .unwrap()
+                .rsplit('/')
+                .next()
+                .unwrap()
+                .to_string();
+            order_thread.lock().unwrap().push(id.clone());
+            con.execute(
+                "DELETE FROM session_v2 WHERE id = ?1",
+                rusqlite::params![id],
+            )
+            .unwrap();
+            let body = "{}";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        }
+    });
+
+    let state = dir.join("state/opencode");
+    std::fs::create_dir_all(&state).unwrap();
+    std::fs::write(
+        state.join("service.json"),
+        serde_json::json!({
+            "pid": std::process::id(),
+            "url": format!("http://{addr}"),
+            "version": "2.0.22",
+            "password": "pw",
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let out = run(&["session", "delete", "ses_api_parent", "--yes"], &dir);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v = stdout_json(&out);
+    assert_eq!(v["deleted"], true);
+    assert!(
+        v["note"]
+            .as_str()
+            .unwrap()
+            .contains("running opencode server"),
+        "note: {}",
+        v["note"]
+    );
+
+    server.join().unwrap();
+    let deleted = order.lock().unwrap().clone();
+    assert_eq!(
+        deleted,
+        vec!["ses_api_child", "ses_api_parent"],
+        "children must be deleted before their parent"
+    );
+
+    let con = Connection::open(&db).unwrap();
+    let left: i64 = con
+        .query_row(
+            "SELECT COUNT(*) FROM session_v2 WHERE id LIKE 'ses_api_%'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(left, 0, "API deletes removed the rows");
+    drop(con);
 
     std::fs::remove_dir_all(&dir).unwrap();
 }
