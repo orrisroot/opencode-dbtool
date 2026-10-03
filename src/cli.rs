@@ -107,7 +107,7 @@ pub enum Command {
     /// Compact the database, reclaiming space freed by deletes
     Vacuum(VacuumArgs),
     /// Read-only suggestions for reclaiming space (never deletes)
-    Report,
+    Report(ReportArgs),
     /// Update the binary from the latest GitHub release
     SelfUpdate,
     /// Remove old sessions and stale files/storage in one run
@@ -133,6 +133,13 @@ pub struct DoctorArgs {
     /// parent/fork/workspace references
     #[arg(long)]
     pub fix: bool,
+}
+
+#[derive(Args)]
+pub struct ReportArgs {
+    /// Add cost aggregates by project and day
+    #[arg(long)]
+    pub costs: bool,
 }
 
 // ---------------------------------------------------------------------------

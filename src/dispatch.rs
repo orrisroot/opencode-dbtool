@@ -540,9 +540,9 @@ fn dispatch(
             }
         },
         Command::Vacuum(a) => commands::vacuum::cmd_vacuum_cli(db_path, a, dry_run),
-        Command::Report => {
+        Command::Report(a) => {
             let con = db::open_conn(db_path, true)?;
-            commands::report::cmd_report(&con, db_path)
+            commands::report::cmd_report(&con, db_path, a.costs)
         }
         Command::Cleanup(a) => {
             commands::cleanup::cmd_cleanup(dir, db_path, a, dry_run, quiet, service)

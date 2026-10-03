@@ -61,6 +61,28 @@ struct Suggestion {
 }
 
 #[derive(Serialize)]
+struct ProjectCost {
+    id: String,
+    name: String,
+    worktree: String,
+    cost: f64,
+}
+
+#[derive(Serialize)]
+struct DayCost {
+    day: String,
+    cost: f64,
+    sessions: i64,
+}
+
+#[derive(Serialize)]
+struct CostsOut {
+    total: f64,
+    by_project: Vec<ProjectCost>,
+    by_day: Vec<DayCost>,
+}
+
+#[derive(Serialize)]
 struct ReportOut {
     #[serde(flatten)]
     env: EnvStatus,
@@ -72,10 +94,12 @@ struct ReportOut {
     kv_candidates: Vec<KvCandidate>,
     backups: BackupsInfo,
     suggestions: Vec<Suggestion>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    costs: Option<CostsOut>,
 }
 
-pub fn cmd_report(con: &Connection, db_path: &Path) -> Result<()> {
-    let value = report_value(con, db_path)?;
+pub fn cmd_report(con: &Connection, db_path: &Path, costs: bool) -> Result<()> {
+    let value = report_value(con, db_path, costs)?;
     if output::table_mode() {
         output::emit_text(&report_table(&value))
     } else {
@@ -84,7 +108,7 @@ pub fn cmd_report(con: &Connection, db_path: &Path) -> Result<()> {
 }
 
 /// Build the report (exposed for tests).
-pub fn report_value(con: &Connection, db_path: &Path) -> Result<serde_json::Value> {
+pub fn report_value(con: &Connection, db_path: &Path, costs: bool) -> Result<serde_json::Value> {
     let freelist: i64 = con.query_row("PRAGMA freelist_count", [], |r| r.get(0))?;
     let page_size: i64 = con.query_row("PRAGMA page_size", [], |r| r.get(0))?;
     let wal_bytes = file_size(&db_path.with_extension("db-wal"));
@@ -206,10 +230,52 @@ pub fn report_value(con: &Connection, db_path: &Path) -> Result<serde_json::Valu
         kv_candidates,
         backups: backups_info,
         suggestions,
+        costs: if costs { Some(costs_out(con)?) } else { None },
     };
     Ok(serde_json::to_value(&out)?)
 }
 
+/// Cost aggregates by project and by update day.
+fn costs_out(con: &Connection) -> Result<CostsOut> {
+    let projects = repo::load_projects(con)?;
+    let total = crate::util::round4(projects.iter().map(|p| p.cost).sum());
+    let mut by_project: Vec<ProjectCost> = projects
+        .into_iter()
+        .map(|p| ProjectCost {
+            id: p.id,
+            name: p.name,
+            worktree: p.worktree,
+            cost: crate::util::round4(p.cost),
+        })
+        .collect();
+    by_project.sort_by(|a, b| {
+        b.cost
+            .total_cmp(&a.cost)
+            .then_with(|| a.worktree.cmp(&b.worktree))
+    });
+    by_project.truncate(10);
+
+    let by_day: Vec<DayCost> = {
+        let mut stmt = con.prepare(
+            "SELECT date(time_updated/1000, 'unixepoch', 'localtime'), \
+             COALESCE(SUM(cost),0), COUNT(*) \
+             FROM \"session_v2\" GROUP BY 1 ORDER BY 1 DESC LIMIT 30",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(DayCost {
+                day: r.get(0)?,
+                cost: crate::util::round4(r.get(1)?),
+                sessions: r.get(2)?,
+            })
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()?
+    };
+    Ok(CostsOut {
+        total,
+        by_project,
+        by_day,
+    })
+}
 /// Curated table-mode rendering.
 fn report_table(value: &serde_json::Value) -> String {
     let num = |v: &serde_json::Value, key: &str| v.get(key).and_then(|x| x.as_i64()).unwrap_or(0);
@@ -286,6 +352,28 @@ fn report_table(value: &serde_json::Value) -> String {
             ));
         }
     }
+    if let Some(costs) = value.get("costs") {
+        lines.push(("".into(), String::new()));
+        lines.push((
+            "costs".into(),
+            format!(
+                "total {}",
+                costs.get("total").and_then(|x| x.as_f64()).unwrap_or(0.0)
+            ),
+        ));
+        if let Some(items) = costs.get("by_project").and_then(|v| v.as_array()) {
+            for item in items.iter().take(5) {
+                lines.push((
+                    "".into(),
+                    format!(
+                        "- {}: {}",
+                        item.get("worktree").and_then(|x| x.as_str()).unwrap_or(""),
+                        item.get("cost").and_then(|x| x.as_f64()).unwrap_or(0.0),
+                    ),
+                ));
+            }
+        }
+    }
     let width = lines
         .iter()
         .map(|(k, _)| k.chars().count())
@@ -322,9 +410,12 @@ mod tests {
         )
         .unwrap();
 
-        let v = report_value(&con, &db_path).unwrap();
+        let v = report_value(&con, &db_path, true).unwrap();
         assert_eq!(v["old_sessions"]["count"], 1);
         assert_eq!(v["kv_candidates"][0]["key"], "big");
+        assert!(v["costs"]["total"].is_number());
+        assert!(v["costs"]["by_project"].is_array());
+        assert!(v["costs"]["by_day"].is_array());
         assert!(
             v["suggestions"]
                 .as_array()

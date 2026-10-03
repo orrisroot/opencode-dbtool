@@ -2140,3 +2140,28 @@ fn purge_export_dir_plans_and_requires_the_service() {
 
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+#[test]
+fn report_costs_lists_projects() {
+    let dir = temp_dir("report-costs");
+    let db = dir.join("opencode.db");
+    create_db(&db);
+    {
+        let con = Connection::open(&db).unwrap();
+        con.execute("UPDATE session_v2 SET cost = 1.5 WHERE id = 'ses_1'", [])
+            .unwrap();
+    }
+
+    let out = run(&["report", "--costs"], &dir);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v = stdout_json(&out);
+    assert_eq!(v["costs"]["total"], 1.5);
+    assert_eq!(v["costs"]["by_project"][0]["id"], "p1");
+    assert!(!v["costs"]["by_day"].as_array().unwrap().is_empty());
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
