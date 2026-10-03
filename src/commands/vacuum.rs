@@ -392,16 +392,23 @@ struct RestoreOut {
 /// corrupt database can still be recovered), and stale WAL/SHM files are
 /// removed so old frames cannot be replayed over the restored file.
 pub fn cmd_restore(db_path: &Path, source: &Path, dry_run: bool) -> Result<()> {
-    if source == db_path {
-        return Err(AppError::usage("cannot restore a database over itself"));
-    }
     if !source.is_file() {
         return Err(AppError::usage(format!(
             "backup file not found: {}",
             source.display()
         )));
     }
-    if source
+    // Compare resolved paths: a symlink, a relative path, or a different
+    // spelling of the target database must not pass as a "different file"
+    // (copying a file over itself truncates it).
+    let source_abs = std::fs::canonicalize(source)
+        .map_err(|e| AppError::usage(format!("cannot resolve {}: {e}", source.display())))?;
+    let db_abs = std::fs::canonicalize(db_path)
+        .map_err(|e| AppError::usage(format!("cannot resolve {}: {e}", db_path.display())))?;
+    if source_abs == db_abs {
+        return Err(AppError::usage("cannot restore a database over itself"));
+    }
+    if source_abs
         .file_name()
         .map(|n| is_backup_sidecar(&n.to_string_lossy()))
         .unwrap_or(false)
@@ -447,10 +454,10 @@ pub fn cmd_restore(db_path: &Path, source: &Path, dry_run: bool) -> Result<()> {
         let con = crate::db::open_conn(db_path, false)?;
         let _ = con.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
     }
-    let _ = std::fs::remove_file(db_path.with_extension("db-wal"));
-    let _ = std::fs::remove_file(db_path.with_extension("db-shm"));
+    let _ = std::fs::remove_file(sidecar_path(db_path, "-wal"));
+    let _ = std::fs::remove_file(sidecar_path(db_path, "-shm"));
 
-    std::fs::copy(source, db_path)
+    std::fs::copy(&source_abs, db_path)
         .map_err(|e| AppError::db(format!("cannot restore {}: {e}", db_path.display())))?;
     #[cfg(unix)]
     {

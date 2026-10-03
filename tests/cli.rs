@@ -1382,7 +1382,25 @@ fn service_status_with_mock_service() {
     let server = std::thread::spawn(move || {
         // Hold the DB open so the fd check reports a match.
         let _held = Connection::open(&db_thread).unwrap();
-        let (mut stream, _) = listener.accept().unwrap();
+        // Never block forever: a regression that stops sending the request
+        // must fail the test rather than hang it.
+        listener.set_nonblocking(true).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut stream = loop {
+            match listener.accept() {
+                Ok((stream, _)) => break stream,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    if std::time::Instant::now() >= deadline {
+                        panic!("mock server received no request");
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(e) => panic!("mock server accept failed: {e}"),
+            }
+        };
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
         let mut buf = [0u8; 4096];
         let _ = stream.read(&mut buf).unwrap();
         let body = r#"{"version":"2.0.22","pid":1,"urls":[]}"#;
@@ -1582,6 +1600,54 @@ fn table_relative_time_and_absolute_flag() {
     assert!(
         text.contains("2023-11-14T22:13:20Z"),
         "absolute flag: {text}"
+    );
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+#[cfg(unix)]
+fn restore_rejects_a_symlink_to_the_database() {
+    let dir = temp_dir("restore-self");
+    let db = dir.join("opencode.db");
+    create_db(&db);
+    let link = dir.join("link.db");
+    std::os::unix::fs::symlink(&db, &link).unwrap();
+
+    let out = run(
+        &["backup", "restore", link.to_str().unwrap(), "--dry-run"],
+        &dir,
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("over itself"), "stderr: {stderr}");
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn backup_list_rejects_keep_backups() {
+    let dir = temp_dir("backup-list-flag");
+    create_db(&dir.join("opencode.db"));
+
+    // The flag is accepted only before the subcommand (clap rejects it
+    // after `list`); in that position it must be refused explicitly.
+    let out = run(&["backup", "--keep-backups", "1", "list"], &dir);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("only applies when creating"),
+        "stderr: {stderr}"
     );
 
     std::fs::remove_dir_all(&dir).unwrap();

@@ -309,13 +309,49 @@ fn suggested_apply_command(args: &[String]) -> Option<String> {
                 has_yes = true;
                 out.push(arg.clone());
             }
-            _ => out.push(shell_quote(arg)),
+            _ => {
+                if let Some((rewritten, contains_yes)) = rewrite_short_cluster(arg) {
+                    has_yes |= contains_yes;
+                    if !rewritten.is_empty() {
+                        out.push(rewritten);
+                    }
+                } else {
+                    out.push(shell_quote(arg));
+                }
+            }
         }
     }
     if !has_yes {
         out.push("--yes".to_string());
     }
     Some(out.join(" "))
+}
+
+/// Strip `n` from a combined short-flag cluster (`-ny` -> `-y`). Returns
+/// `None` when the argument is not a cluster; an empty rewritten string
+/// means the whole argument should be dropped.
+fn rewrite_short_cluster(arg: &str) -> Option<(String, bool)> {
+    if !arg.starts_with('-') || arg.starts_with("--") || arg.chars().count() <= 2 {
+        return None;
+    }
+    let mut kept = String::new();
+    let mut has_yes = false;
+    for c in arg[1..].chars() {
+        match c {
+            'n' => {}
+            'y' => {
+                has_yes = true;
+                kept.push(c);
+            }
+            other => kept.push(other),
+        }
+    }
+    let rewritten = if kept.is_empty() {
+        String::new()
+    } else {
+        format!("-{kept}")
+    };
+    Some((rewritten, has_yes))
 }
 
 fn shell_quote(arg: &str) -> String {
@@ -420,11 +456,20 @@ fn dispatch(
                 commands::checkpoint::cmd_checkpoint(db_path, a.truncate, dry_run)
             }
         },
-        Command::Backup(a) => match &a.command {
-            Some(BackupCmd::List(l)) => commands::vacuum::cmd_backup_list(db_path, l.verify),
-            Some(BackupCmd::Restore(r)) => commands::vacuum::cmd_restore(db_path, &r.file, dry_run),
-            None => commands::vacuum::cmd_backup(db_path, dry_run, a.keep_backups),
-        },
+        Command::Backup(a) => {
+            if a.keep_backups.is_some() && a.command.is_some() {
+                return Err(AppError::usage(
+                    "--keep-backups only applies when creating a backup",
+                ));
+            }
+            match &a.command {
+                Some(BackupCmd::List(l)) => commands::vacuum::cmd_backup_list(db_path, l.verify),
+                Some(BackupCmd::Restore(r)) => {
+                    commands::vacuum::cmd_restore(db_path, &r.file, dry_run)
+                }
+                None => commands::vacuum::cmd_backup(db_path, dry_run, a.keep_backups),
+            }
+        }
         Command::Fs(cmd) => match cmd {
             FsCmd::Snapshots(a) => {
                 let con = db::open_conn(db_path, true)?;
@@ -500,5 +545,16 @@ mod tests {
     #[test]
     fn suggested_command_needs_a_program() {
         assert!(suggested_apply_command(&[]).is_none());
+    }
+
+    #[test]
+    fn suggested_command_handles_combined_short_flags() {
+        let out = suggested_apply_command(&args(&["opencode-dbtool", "session", "purge", "-ny"]))
+            .unwrap();
+        assert_eq!(out, "opencode-dbtool session purge -y");
+        let out = suggested_apply_command(&args(&["opencode-dbtool", "vacuum", "-yn"])).unwrap();
+        assert_eq!(out, "opencode-dbtool vacuum -y");
+        let out = suggested_apply_command(&args(&["opencode-dbtool", "vacuum", "-n"])).unwrap();
+        assert_eq!(out, "opencode-dbtool vacuum --yes");
     }
 }
