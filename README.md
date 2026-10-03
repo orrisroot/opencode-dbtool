@@ -4,8 +4,10 @@ Maintenance tool for the [opencode](https://opencode.ai) 2.x SQLite database
 (`~/.local/share/opencode/opencode.db`): inspect sizes and integrity, and delete
 projects/sessions to reclaim space.
 
-Written in Rust. All commands print JSON to stdout; errors go to stderr.
-Supports Linux, macOS, and Windows.
+Written in Rust. Output is a human-readable table on a terminal and JSON when
+piped (`--format table|json` to force either). Destructive commands preview
+their impact and ask `Proceed? [y/N]` on a terminal; `--dry-run` and `--yes`
+keep them scriptable. Supports Linux, macOS, and Windows.
 
 ## Compatibility
 
@@ -37,7 +39,7 @@ cargo build --release   # -> target/release/opencode-dbtool
 | `project show <id>` | project detail (sessions, breakdown) |
 | `project delete <id>...` | delete project(s) + all related data |
 | `project purge [--older-than <age>] [--path <dir>...] [--empty]` | delete projects matching all filters |
-| `session list [--sort size] [--limit <n>]` | per-session breakdown (full ids) |
+| `session list [--sort size] [--limit <n>] [--search <text>]` | per-session breakdown (full ids) |
 | `session show <id> [--messages [--limit <n>]]` | session detail, optionally with message previews |
 | `session delete <id>...` | delete session(s) + cascade |
 | `session purge [--older-than <age>] [--subagents] [--archived] [--empty] [--path <dir>...] [--path-prefix <dir>...] [--larger-than <size>] [--keep-latest <n>] [--keep-latest-per-project <n>]` | delete sessions matching all filters |
@@ -51,21 +53,32 @@ cargo build --release   # -> target/release/opencode-dbtool
 | `fs clean-blob-orphans` | delete instruction blobs referenced by no state |
 | `fs clean-log [--older-than <age>]` | truncate log/opencode.log, or prune only old lines |
 | `vacuum [--no-backup] [--keep-backups <n>]` | run VACUUM (backup + verify by default) |
+| `cleanup [filters] [--fs-older-than <age>] [--no-backup] [--no-vacuum] [--keep-backups <n>]` | backup → optional purge → orphan/file cleanup → VACUUM, in one run |
+| `completions <shell>` | print a shell completion script (bash, zsh, fish, ...) |
 | `self-update [--dry-run\|--yes]` | check for / install the latest GitHub release binary |
 
-All ids are matched exactly (no prefix/substring resolution), except
-`--path-prefix` (matches a directory and everything below it). In `purge` /
-`strip-reasoning`, `--path <dir>` is an exact match against the session
-`directory`; in `project list`/`project purge` it is an exact match against
-the project `worktree`. It is never a prefix match; a trailing slash is
-ignored on both sides of the comparison.
+All commands accept `--format <table\|json>` (default: table on a terminal,
+JSON when piped) and `--quiet` (suppress progress on stderr). `--dry-run` and
+`--yes` may be passed anywhere on the command line. Every subcommand has its
+own `--help`.
+
+Session and project references resolve in this order: exact id, a unique id
+prefix (for sessions the leading `ses_` may be omitted), then — for projects —
+an exact worktree path. An ambiguous prefix, or a worktree shared by several
+projects, is refused with the candidate list; use the full id to disambiguate.
+`--path` filters stay exact matches: in `purge` / `strip-reasoning` it is an
+exact match against the session `directory`; in `project list`/`project purge`
+it is an exact match against the project `worktree`. It is never a prefix
+match; a trailing slash is ignored on both sides of the comparison.
+`--path-prefix` matches a directory and everything below it.
 
 ### Common fields
 
 Commands that print a single result object (`stats`, `doctor`, `project
 delete`, `project purge`, `session delete`, `session purge`, `session
 strip-reasoning`, `kv delete`, `backup`, `fs clean-snapshots`,
-`fs clean-shell`, `fs clean-blob-orphans`, `fs clean-log`, `vacuum`)
+`fs clean-shell`, `fs clean-blob-orphans`, `fs clean-log`, `vacuum`,
+`cleanup`)
 start with an environment block;
 `project/session list` print a bare array and `project/session show` a bare
 object:
@@ -77,6 +90,29 @@ object:
 If the running process cannot be determined, the block instead carries
 `"opencode_running": null, "pids": null, "pid_error": "<reason>"` (read-only
 commands still proceed; guarded commands fail with exit 3).
+
+### Output formats
+
+The JSON shapes below are the stable contract: they are always printed when
+stdout is not a terminal (scripts, pipes) and with `--format json`. On a
+terminal the same values render as a table — list commands show one row per
+item, single results show aligned `key: value` lines, and byte fields
+(`bytes`, `*_bytes`) are formatted for humans (`8.4 MB`). `--format table`
+forces the table even when piped. The interactive prompt and errors go to
+stderr, so stdout stays machine-readable.
+
+### Interactive confirmation
+
+Destructive commands (`session`/`project delete` and `purge`,
+`strip-reasoning`, `kv delete`, `backup`, `fs clean-*`, `vacuum`, `cleanup`,
+`self-update`) work in three modes:
+
+- `--dry-run`: print the preview and change nothing (safe while opencode
+  runs).
+- `--yes`: execute for real (the running-instance guard applies).
+- neither, on a terminal: print the preview, ask `Proceed? [y/N]`, then
+  execute or abort.
+- neither, not a terminal: exit 2 with a message pointing at both flags.
 
 ### `stats`
 
@@ -164,8 +200,9 @@ integrity/fk/orphan checks fail.
 ### `project list` / `project show`
 
 Browse projects (worktrees opencode tracks) with their session counts and
-data sizes. `project list` prints an array; `project show <id>` prints one
-object plus `session_list`.
+data sizes. `project list` prints an array; `project show <ref>` prints one
+object plus `session_list`. `<ref>` may be the full project id, a unique id
+prefix, or an exact worktree path (when it maps to exactly one project).
 
 `project list --path <dir>` filters the array to projects whose worktree
 matches the directory. `--path` is repeatable (OR) and matches **every**
@@ -188,8 +225,9 @@ them likewise.
 
 ### `project delete`
 
-Delete one or more projects by id, together with every session and all
-related data. Preview the impact with `--dry-run` first.
+Delete one or more projects by reference (id, unique id prefix, or an
+exact worktree path that maps to exactly one project), together with every
+session and all related data. Preview the impact with `--dry-run` first.
 
 ```json
 {
@@ -222,12 +260,17 @@ A filter match of zero projects is normal (exit 0).
 
 Per-session breakdown: event/`session_message`/`inbox`/`pending` counts,
 data size, archived flag, and cost. Use it with `--sort size` and `--limit`
-to find the biggest sessions before purging. `session list` prints an array;
-`session show <id>` prints one object (add `--messages [--limit <n>]` for
-oldest-first message previews with per-message bytes, plus
-`total_messages`). Without `--sort`/`--limit`, `session list` is
-ordered by `time_updated` descending. `size_bytes` sums
+to find the biggest sessions before purging. `--search <text>` keeps only
+sessions whose title or directory contains the text (case-insensitive).
+`session list` prints an array; `session show <ref>` prints one object (add
+`--messages [--limit <n>]` for oldest-first message previews with
+per-message bytes, plus `total_messages`). Without `--sort`/`--limit`,
+`session list` is ordered by `time_updated` descending. `size_bytes` sums
 session_message+inbox+pending+instructions+event bytes.
+
+`<ref>` may be the full id, a unique id prefix, or the id without its `ses_`
+prefix (`session show ses_effb2a71` and `session show effb2a71` both work
+when unambiguous).
 
 ```json
 {
@@ -251,8 +294,9 @@ top-level sessions. It also appears in `project show`'s `session_list`.
 
 ### `session delete`
 
-Delete sessions by id, cascading to child sessions (subagents) and all
-related data. `session purge` and `project delete` behave the same.
+Delete sessions by reference (id, unique id prefix, or id without `ses_`),
+cascading to child sessions (subagents) and all related data. `session
+purge` and `project delete` behave the same.
 
 ```json
 {
@@ -497,6 +541,44 @@ added on a real run (dry-run reports nothing since no backup is touched):
 "backup_cleanup": { "kept": 3, "removed_files": 7, "removed_bytes": 52428800 }
 ```
 
+### `cleanup`
+
+One-shot maintenance: runs the common cleanup steps in a single guarded
+command and reports each step's result. Steps, in order:
+
+1. a verified pre-run backup (skipped with `--no-backup`, and when no
+   session filters are given);
+2. `session purge` with the given filters — **without session filters no
+   sessions are deleted**, so a bare `cleanup` only removes orphans and old
+   files;
+3. `fs clean-blob-orphans`;
+4. `fs clean-snapshots --orphans-only`;
+5. `fs clean-shell --older-than <age>` (default `7d`, change with
+   `--fs-older-than`);
+6. `fs clean-log --older-than <age>` (same cutoff);
+7. `vacuum` (skipped with `--no-vacuum`; no second backup is taken because
+   step 1 already backed up the pre-change database).
+
+All `session purge` filters are accepted directly. `--keep-backups <n>`
+prunes older backups after the pre-run backup. The output embeds each step's
+result (without nested environment blocks) plus `action`, `filters`,
+`fs_older_than`, `cleaned`, and a `note`. `--dry-run` prints the complete
+plan without changing anything.
+
+```sh
+opencode-dbtool cleanup --older-than 30d --subagents --keep-latest-per-project 5
+```
+
+### `completions`
+
+Print a completion script for your shell (bash, elvish, fish, powershell,
+zsh):
+
+```sh
+source <(opencode-dbtool completions bash)
+opencode-dbtool completions zsh > ~/.zfunc/_opencode-dbtool
+```
+
 ### `self-update`
 
 Update the running binary from the [GitHub
@@ -510,15 +592,15 @@ environment when set, avoiding the unauthenticated GitHub API rate limit.
 ```json
 {
   "command": "self-update",
-  "current_version": "0.2.0",
-  "latest_version": "0.2.0",
+  "current_version": "0.3.0",
+  "latest_version": "0.3.0",
   "target": "x86_64-unknown-linux-musl",
   "update_available": true,
   "updated": false,
   "dry_run": true,
   "status": "update-available",
   "path": "/home/user/.cargo/bin/opencode-dbtool",
-  "release_url": "https://github.com/orrisroot/opencode-dbtool/releases/tag/v0.2.0"
+  "release_url": "https://github.com/orrisroot/opencode-dbtool/releases/tag/v0.3.0"
 }
 ```
 
@@ -536,13 +618,38 @@ failures, and download problems surface as exit code 3.
 | flag | meaning |
 | --- | --- |
 | `--dry-run`, `-n` | print actions without changing anything (safe while opencode runs) |
-| `--yes`, `-y` | confirm a destructive command; required for every real (non-dry-run) run of `delete`, `purge`, `strip-reasoning`, `kv delete`, `backup`, `fs clean-*`, `vacuum`, and `self-update` |
-| `--no-backup` | `vacuum` only: skip the timestamped backup (dangerous) |
+| `--yes`, `-y` | confirm a destructive command. On a terminal, omitting `--yes`/`--dry-run` shows the preview and asks `Proceed? [y/N]` instead; off a terminal `--yes` is required for every real run of `delete`, `purge`, `strip-reasoning`, `kv delete`, `backup`, `fs clean-*`, `vacuum`, `cleanup`, and `self-update` |
+| `--format <table\|json>` | output format (default: table on a terminal, JSON when piped) |
+| `--quiet` | suppress progress and confirmation messages on stderr |
+| `--no-backup` | `vacuum`/`cleanup`: skip the timestamped backup (dangerous) |
 
-Destructive commands refuse to run without `--yes` or `--dry-run`
-(exit code 2): share the JSON output shape, and use `--dry-run` to
-preview the impact before confirming with `--yes`. `--dry-run` and
-`--yes` may be passed anywhere on the command line.
+Destructive commands refuse to run without `--yes`, `--dry-run`, or an
+interactive terminal (exit code 2): use `--dry-run` to preview the impact
+before confirming.
+
+## Recipes
+
+```sh
+# Where is the space going?
+opencode-dbtool stats --detail
+
+# Biggest sessions first
+opencode-dbtool session list --sort size --limit 10
+
+# Preview a retention policy, then apply it
+opencode-dbtool session purge --older-than 30d --keep-latest-per-project 5 --dry-run
+opencode-dbtool session purge --older-than 30d --keep-latest-per-project 5
+
+# One-shot cleanup (backup, purge, orphan/file cleanup, VACUUM)
+opencode-dbtool cleanup --older-than 30d --subagents
+
+# Inspect a huge cache key
+opencode-dbtool kv list
+opencode-dbtool kv show models-dev:catalog
+
+# Shell completions
+source <(opencode-dbtool completions bash)
+```
 
 ## Exit codes
 
@@ -601,8 +708,8 @@ matching busy timeout, so concurrent reads never wedge.
   data files.
 - `delete`, `purge`, `strip-reasoning`, `kv delete`, `backup`,
   `fs clean-snapshots`, `fs clean-shell`, `fs clean-blob-orphans`,
-  `fs clean-log`, and `vacuum` are **refused while opencode runs** (exit
-  1); close opencode and retry.
+  `fs clean-log`, `vacuum`, and `cleanup` are **refused while opencode
+  runs** (exit 1); close opencode and retry.
   Deleting a session a running instance is using is not safe: the row is
   not resurrected, later writes fail FK checks, and the TUI keeps showing
   the cached session until refreshed. If detection itself fails, guarded

@@ -123,6 +123,14 @@ fn render_object(map: &serde_json::Map<String, Value>, indent: usize, out: &mut 
             Value::Array(items) if items.is_empty() => {
                 out.push_str(&format!("{p}{k}: -\n"));
             }
+            Value::Array(items) if items.iter().all(|i| !i.is_object() && !i.is_array()) => {
+                let joined = items
+                    .iter()
+                    .map(|i| scalar_text("", i))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                out.push_str(&format!("{p}{k}: {}\n", truncate(&joined)));
+            }
             Value::Array(items) => {
                 out.push_str(&format!("{p}{k}:\n"));
                 if items.iter().all(Value::is_object) {
