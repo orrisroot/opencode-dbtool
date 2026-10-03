@@ -25,6 +25,8 @@ pub fn execute(mut cli: Cli) -> Result<()> {
         return Ok(());
     };
     output::set_format(output::effective_format(cli.format));
+    output::set_fields(cli.fields.clone());
+    output::set_pager(!cli.no_pager && std::io::stdout().is_terminal());
     output::set_relative(!cli.absolute);
     output::set_quiet(cli.quiet);
     let color = std::io::stdout().is_terminal()

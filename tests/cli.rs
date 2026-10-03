@@ -1762,3 +1762,50 @@ fn report_lists_suggestions() {
 
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+#[test]
+fn csv_format_and_fields() {
+    let dir = temp_dir("csv");
+    create_db(&dir.join("opencode.db"));
+
+    let out = run(&["session", "list", "--format", "csv"], &dir);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.starts_with("id,title,directory,updated,session_messages,size_bytes,cost\n"),
+        "stdout: {text}"
+    );
+    assert!(text.contains("ses_1"), "stdout: {text}");
+
+    // --fields selects (and orders) the columns.
+    let out = run(
+        &[
+            "session",
+            "list",
+            "--format",
+            "csv",
+            "--fields",
+            "size_bytes,id",
+        ],
+        &dir,
+    );
+    assert!(out.status.success());
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(text.lines().next().unwrap(), "size_bytes,id");
+    assert!(
+        text.lines().nth(1).unwrap().ends_with(",ses_1"),
+        "stdout: {text}"
+    );
+
+    // CSV of a single object is key/value rows.
+    let out = run(&["stats", "--format", "csv"], &dir);
+    assert!(out.status.success());
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("db,"), "stdout: {text}");
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}

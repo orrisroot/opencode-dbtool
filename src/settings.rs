@@ -77,9 +77,10 @@ impl Settings {
                 cli.format = Some(match format.as_str() {
                     "table" => Format::Table,
                     "json" => Format::Json,
+                    "csv" => Format::Csv,
                     other => {
                         return Err(AppError::usage(format!(
-                            "invalid config format: {other} (expected table or json)"
+                            "invalid config format: {other} (expected table, json, or csv)"
                         )))
                     }
                 });

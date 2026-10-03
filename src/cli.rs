@@ -17,6 +17,7 @@ use std::path::PathBuf;
 pub enum Format {
     Table,
     Json,
+    Csv,
 }
 
 #[derive(Parser)]
@@ -67,6 +68,14 @@ pub struct Cli {
     /// Disable colors in table output (also honors NO_COLOR)
     #[arg(long, global = true)]
     pub no_color: bool,
+
+    /// Table/CSV columns to print, comma-separated (e.g. id,title,size_bytes)
+    #[arg(long, global = true, value_name = "FIELDS", value_delimiter = ',')]
+    pub fields: Vec<String>,
+
+    /// Disable the automatic pager on a terminal
+    #[arg(long, global = true)]
+    pub no_pager: bool,
 }
 
 #[derive(Subcommand)]
@@ -735,6 +744,17 @@ mod tests {
         assert!(
             Cli::try_parse_from(["opencode-dbtool", "stats", "--absolute", "--no-color"]).is_ok()
         );
+        assert!(Cli::try_parse_from([
+            "opencode-dbtool",
+            "session",
+            "list",
+            "--format",
+            "csv",
+            "--fields",
+            "id,size_bytes",
+            "--no-pager"
+        ])
+        .is_ok());
     }
 
     #[test]

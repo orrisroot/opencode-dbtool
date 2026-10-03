@@ -9,11 +9,22 @@ use crate::cli::Format;
 use crate::error::Result;
 use serde_json::Value;
 use std::io::{IsTerminal, Write};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
+use std::sync::OnceLock;
 
-/// Table rendering is off by default so unit tests and piped runs keep
-/// seeing JSON.
-static TABLE_MODE: AtomicBool = AtomicBool::new(false);
+const FORMAT_JSON: u8 = 0;
+const FORMAT_TABLE: u8 = 1;
+const FORMAT_CSV: u8 = 2;
+
+/// Active output format; JSON by default so unit tests and piped runs
+/// keep seeing the stable contract.
+static FORMAT: AtomicU8 = AtomicU8::new(FORMAT_JSON);
+/// `--fields`: explicit columns for table/CSV output.
+static FIELDS: OnceLock<Vec<String>> = OnceLock::new();
+/// Longest string shown in a table cell (adjusted to `COLUMNS`).
+static CELL_LIMIT: AtomicUsize = AtomicUsize::new(80);
+/// Auto-pager on a terminal (`--no-pager` disables).
+static PAGER: AtomicBool = AtomicBool::new(false);
 /// Relative timestamps in tables (`--absolute` disables).
 static RELATIVE_TIME: AtomicBool = AtomicBool::new(true);
 /// ANSI colors in tables (TTY only, `--no-color` / `NO_COLOR` disable).
@@ -37,7 +48,22 @@ pub fn effective_format(explicit: Option<Format>) -> Format {
 }
 
 pub fn set_format(format: Format) {
-    TABLE_MODE.store(format == Format::Table, Ordering::Relaxed);
+    let code = match format {
+        Format::Json => FORMAT_JSON,
+        Format::Table => FORMAT_TABLE,
+        Format::Csv => FORMAT_CSV,
+    };
+    FORMAT.store(code, Ordering::Relaxed);
+}
+
+pub fn set_fields(fields: Vec<String>) {
+    if !fields.is_empty() {
+        let _ = FIELDS.set(fields);
+    }
+}
+
+pub fn set_pager(enabled: bool) {
+    PAGER.store(enabled, Ordering::Relaxed);
 }
 
 pub fn set_relative(enabled: bool) {
@@ -53,7 +79,11 @@ pub fn set_quiet(quiet: bool) {
 }
 
 pub fn table_mode() -> bool {
-    TABLE_MODE.load(Ordering::Relaxed)
+    FORMAT.load(Ordering::Relaxed) == FORMAT_TABLE
+}
+
+fn csv_mode() -> bool {
+    FORMAT.load(Ordering::Relaxed) == FORMAT_CSV
 }
 
 /// Progress output is on when stderr is a terminal and `--quiet` is off.
@@ -92,19 +122,54 @@ pub fn emit_text(text: &str) -> Result<()> {
     write_stdout(text)
 }
 
-/// Print a command result; `columns` selects (and orders) the table
-/// columns in table mode. JSON mode always prints the full value.
+/// Print a command result; `columns` selects (and orders) the table/CSV
+/// columns. JSON mode always prints the full value.
 pub fn emit_cols(v: &Value, columns: &[&str]) -> Result<()> {
+    let effective = effective_columns(columns);
     let text = if table_mode() {
-        render(v, columns)
+        set_cell_limit_for(effective.len());
+        let refs: Vec<&str> = effective.iter().map(String::as_str).collect();
+        render(v, &refs)
+    } else if csv_mode() {
+        render_csv(v, &effective)
     } else {
         serde_json::to_string_pretty(v)?
     };
     write_stdout(&text)
 }
 
-/// Survive closed pipes (`head`, `less`, ...).
+/// `--fields` overrides the command's column selection.
+fn effective_columns(columns: &[&str]) -> Vec<String> {
+    match FIELDS.get() {
+        Some(fields) if !fields.is_empty() => fields.clone(),
+        _ => columns.iter().map(|s| s.to_string()).collect(),
+    }
+}
+
+/// Keep tables within `COLUMNS` by shortening cells.
+fn set_cell_limit_for(ncols: usize) {
+    let width = std::env::var("COLUMNS")
+        .ok()
+        .and_then(|c| c.parse::<usize>().ok())
+        .unwrap_or(0);
+    CELL_LIMIT.store(cell_limit_for(width, ncols), Ordering::Relaxed);
+}
+
+/// Longest cell length that keeps `ncols` columns inside `width`
+/// (columns are separated by two spaces).
+fn cell_limit_for(width: usize, ncols: usize) -> usize {
+    if width < 40 || ncols == 0 {
+        return 80;
+    }
+    let overhead = 2 * ncols.saturating_sub(1);
+    ((width.saturating_sub(overhead)) / ncols).clamp(12, 80)
+}
+
+/// Survive closed pipes (`head`, `less`, ...), optionally through a pager.
 fn write_stdout(text: &str) -> Result<()> {
+    if PAGER.load(Ordering::Relaxed) && (table_mode() || csv_mode()) && try_page(text) {
+        return Ok(());
+    }
     let mut stdout = std::io::stdout().lock();
     if let Err(e) = writeln!(stdout, "{text}") {
         if e.kind() != std::io::ErrorKind::BrokenPipe {
@@ -114,12 +179,35 @@ fn write_stdout(text: &str) -> Result<()> {
     Ok(())
 }
 
+/// Pipe the text through `$PAGER` (or `less -FRX`); `false` when the pager
+/// could not be started, so the caller can write directly.
+fn try_page(text: &str) -> bool {
+    let (program, args): (String, Vec<String>) = match std::env::var("PAGER") {
+        Ok(pager) if !pager.trim().is_empty() => {
+            let mut parts = pager.split_whitespace();
+            let program = parts.next().unwrap_or("less").to_string();
+            (program, parts.map(str::to_string).collect())
+        }
+        _ => ("less".to_string(), vec!["-FRX".to_string()]),
+    };
+    let child = std::process::Command::new(&program)
+        .args(&args)
+        .stdin(std::process::Stdio::piped())
+        .spawn();
+    let Ok(mut child) = child else {
+        return false;
+    };
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(text.as_bytes());
+        let _ = stdin.write_all(b"\n");
+    }
+    let _ = child.wait();
+    true
+}
+
 // ---------------------------------------------------------------------------
 // table rendering
 // ---------------------------------------------------------------------------
-
-/// Longest string shown in a table cell before truncation.
-const CELL_MAX: usize = 80;
 
 fn pad(indent: usize) -> String {
     " ".repeat(indent)
@@ -295,10 +383,11 @@ fn is_byte_key(key: &str) -> bool {
 }
 
 fn truncate(s: &str) -> String {
-    if s.chars().count() <= CELL_MAX {
+    let limit = CELL_LIMIT.load(Ordering::Relaxed);
+    if s.chars().count() <= limit {
         return s.to_string();
     }
-    let head: String = s.chars().take(CELL_MAX - 1).collect();
+    let head: String = s.chars().take(limit.saturating_sub(1)).collect();
     format!("{head}…")
 }
 
@@ -324,6 +413,76 @@ pub fn human_bytes(n: i64) -> String {
         format!("{value:.1}")
     };
     format!("{}{} {}", if negative { "-" } else { "" }, value, unit)
+}
+
+// ---------------------------------------------------------------------------
+// CSV rendering
+// ---------------------------------------------------------------------------
+
+fn render_csv(v: &Value, columns: &[String]) -> String {
+    let mut out = String::new();
+    match v {
+        Value::Array(items) if items.iter().all(Value::is_object) => {
+            let keys = csv_keys(items, columns);
+            out.push_str(&csv_row(&keys));
+            for item in items {
+                let cells: Vec<String> = keys.iter().map(|k| csv_cell(item.get(k))).collect();
+                out.push_str(&csv_row(&cells));
+            }
+        }
+        Value::Object(map) => {
+            for (k, val) in map {
+                out.push_str(&csv_row(&[k.clone(), csv_cell(Some(val))]));
+            }
+        }
+        other => out.push_str(&csv_row(&[csv_cell(Some(other))])),
+    }
+    out.trim_end().to_string()
+}
+
+fn csv_keys(items: &[Value], columns: &[String]) -> Vec<String> {
+    if !columns.is_empty() {
+        return columns.to_vec();
+    }
+    let mut keys: Vec<String> = Vec::new();
+    for item in items {
+        if let Value::Object(map) = item {
+            for k in map.keys() {
+                if !keys.contains(k) {
+                    keys.push(k.clone());
+                }
+            }
+        }
+    }
+    keys
+}
+
+fn csv_cell(v: Option<&Value>) -> String {
+    match v {
+        None | Some(Value::Null) => String::new(),
+        Some(Value::Bool(b)) => b.to_string(),
+        Some(Value::Number(n)) => n.to_string(),
+        Some(Value::String(s)) => s.clone(),
+        Some(compound) => serde_json::to_string(compound).unwrap_or_default(),
+    }
+}
+
+fn csv_row(cells: &[String]) -> String {
+    let mut line = cells
+        .iter()
+        .map(|c| csv_escape(c))
+        .collect::<Vec<_>>()
+        .join(",");
+    line.push('\n');
+    line
+}
+
+fn csv_escape(s: &str) -> String {
+    if s.contains(['"', ',', '\n', '\r']) {
+        format!("\"{}\"", s.replace('"', "\"\""))
+    } else {
+        s.to_string()
+    }
 }
 
 #[cfg(test)]
@@ -390,5 +549,34 @@ mod tests {
             serde_json::to_string_pretty(&v).unwrap(),
             "{\n  \"a\": 1\n}"
         );
+    }
+
+    #[test]
+    fn csv_renders_arrays_with_selected_columns_and_escaping() {
+        let v = json!([
+            {"id": "a", "title": "hello, world", "size_bytes": 2048},
+            {"id": "b", "title": "say \"hi\"", "size_bytes": 0}
+        ]);
+        let text = render_csv(&v, &["id".to_string(), "title".to_string()]);
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines[0], "id,title");
+        assert_eq!(lines[1], "a,\"hello, world\"");
+        assert_eq!(lines[2], "b,\"say \"\"hi\"\"\"");
+    }
+
+    #[test]
+    fn csv_renders_objects_as_key_value_rows() {
+        let v = json!({"db": "/x/opencode.db", "ok": true});
+        let text = render_csv(&v, &[]);
+        assert!(text.contains("db,/x/opencode.db"), "got: {text}");
+        assert!(text.contains("ok,true"), "got: {text}");
+    }
+
+    #[test]
+    fn cell_limit_scales_with_width() {
+        assert_eq!(cell_limit_for(0, 4), 80);
+        assert_eq!(cell_limit_for(30, 4), 80);
+        assert_eq!(cell_limit_for(120, 3), 38);
+        assert_eq!(cell_limit_for(50, 10), 12);
     }
 }
