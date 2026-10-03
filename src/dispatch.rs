@@ -252,6 +252,8 @@ fn execute_confirmed<F>(
 where
     F: FnMut(bool) -> Result<()>,
 {
+    // One real maintenance run at a time, across processes (cron + manual).
+    let _lock = crate::lock::ToolLock::acquire()?;
     if restart {
         let svc = service.ok_or_else(|| {
             AppError::usage(

@@ -305,6 +305,18 @@ pub fn shell_quote(arg: &str) -> String {
     format!("'{}'", arg.replace('\'', "'\\''"))
 }
 
+/// Fail when fewer than `needed` bytes are available for `what`.
+pub fn ensure_free_space(available: u64, needed: u64, what: &str) -> Result<()> {
+    if available < needed {
+        return Err(AppError::db(format!(
+            "not enough free disk space for {what}: need {}, available {}",
+            crate::output::human_bytes(needed as i64),
+            crate::output::human_bytes(available as i64),
+        )));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -390,6 +402,19 @@ mod tests {
     fn parse_count_ok() {
         assert_eq!(parse_count("0").unwrap(), 0);
         assert_eq!(parse_count("10").unwrap(), 10);
+    }
+
+    #[test]
+    fn ensure_free_space_checks_the_shortfall() {
+        assert!(ensure_free_space(200, 100, "the backup").is_ok());
+        assert!(ensure_free_space(100, 100, "the backup").is_ok());
+        let err = ensure_free_space(100, 200, "the backup").unwrap_err();
+        assert_eq!(err.code, 3);
+        assert!(
+            err.message.contains("not enough free disk space"),
+            "got: {err}"
+        );
+        assert!(err.message.contains("200 B"), "got: {err}");
     }
 
     #[test]

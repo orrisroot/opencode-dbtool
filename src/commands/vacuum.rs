@@ -441,6 +441,12 @@ pub fn cmd_restore(db_path: &Path, source: &Path, dry_run: bool) -> Result<()> {
         return output::emit(&serde_json::to_value(&out)?);
     }
 
+    // The copy needs room for the source database; fail before touching
+    // anything.
+    let available =
+        fs2::available_space(db_path.parent().unwrap_or(Path::new("."))).unwrap_or(u64::MAX);
+    crate::util::ensure_free_space(available, file_size(&source_abs), "the restore")?;
+
     // Safety copy of the current database (best effort: a corrupt current
     // database must not block recovery).
     match backup_value(db_path, false, None) {
@@ -547,14 +553,26 @@ struct BackupInfo {
 /// exclusive access), so a running opencode does not block it. Any
 /// failure removes the partial file and aborts.
 fn create_backup(db_path: &Path) -> Result<BackupInfo> {
-    let path = backup_path(db_path, &timestamp_utc(now_ms()?));
-    if path.exists() {
-        return Err(AppError::db(format!(
-            "backup already exists: {}",
-            path.display()
-        )));
+    let stamp = timestamp_utc(now_ms()?);
+    let mut path = backup_path(db_path, &stamp);
+    // Two runs within the same second must not collide (e.g. a backup
+    // followed immediately by a restore's safety copy).
+    let mut suffix = 1;
+    while path.exists() {
+        path = backup_path(db_path, &format!("{stamp}-{suffix}"));
+        suffix += 1;
+        if suffix > 100 {
+            return Err(AppError::db(format!(
+                "backup already exists: {}",
+                path.display()
+            )));
+        }
     }
     let src = crate::db::open_conn(db_path, true)?;
+    let need = file_size(db_path);
+    let available =
+        fs2::available_space(path.parent().unwrap_or(Path::new("."))).unwrap_or(u64::MAX);
+    crate::util::ensure_free_space(available, need, "the backup")?;
     let copied = (|| -> Result<()> {
         let mut dst = Connection::open(&path)
             .map_err(|e| AppError::db(format!("backup failed ({}): {e}", path.display())))?;
@@ -621,6 +639,21 @@ mod tests {
             }
         }
         let _ = std::fs::remove_dir(dir);
+    }
+
+    #[test]
+    fn backups_within_the_same_second_get_unique_names() {
+        let (con, path) = temp_db("collision");
+        testdb::insert_session(&con, "s1", "/a", None);
+        let first = create_backup(&path).unwrap();
+        let second = create_backup(&path).unwrap();
+        assert_ne!(
+            first.path, second.path,
+            "same-second backups must not collide"
+        );
+        assert!(first.path.exists() && second.path.exists());
+        drop(con);
+        cleanup(&path);
     }
 
     #[test]

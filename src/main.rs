@@ -21,6 +21,7 @@ mod confirm;
 mod db;
 mod dispatch;
 mod error;
+mod lock;
 mod models;
 mod output;
 mod repo;
