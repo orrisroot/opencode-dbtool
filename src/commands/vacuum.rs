@@ -339,10 +339,17 @@ pub fn list_backup_files(db_path: &Path, verify: bool) -> Result<Vec<BackupFileO
             continue;
         }
         let integrity = if verify {
-            match crate::db::open_conn(&path, true) {
-                Ok(con) => Some(quick_check(&con)),
-                Err(e) => Some(format!("error: {e}")),
-            }
+            let check = {
+                match crate::db::open_conn(&path, true) {
+                    Ok(con) => quick_check(&con),
+                    Err(e) => format!("error: {e}"),
+                }
+            };
+            // Verification can leave transient sidecars; they are not
+            // part of the backup.
+            let _ = std::fs::remove_file(sidecar_path(&path, "-wal"));
+            let _ = std::fs::remove_file(sidecar_path(&path, "-shm"));
+            Some(check)
         } else {
             None
         };

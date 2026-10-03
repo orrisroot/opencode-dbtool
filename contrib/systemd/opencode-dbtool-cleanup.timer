@@ -1,0 +1,12 @@
+[Unit]
+Description=Weekly opencode database maintenance
+
+[Timer]
+# Every Monday at 04:00, with up to an hour of jitter; catch up if the
+# machine was off.
+OnCalendar=Mon 04:00
+RandomizedDelaySec=1h
+Persistent=true
+
+[Install]
+WantedBy=timers.target

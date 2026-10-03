@@ -1205,6 +1205,12 @@ fn backup_list_and_restore_round_trip() {
         .to_string();
     assert_eq!(arr[0]["file"], expected);
 
+    // --verify reports the integrity of each backup.
+    let out = run(&["backup", "list", "--verify"], &dir);
+    assert!(out.status.success());
+    let arr = stdout_json(&out);
+    assert_eq!(arr[0]["integrity"], "ok");
+
     // Dry-run restore verifies the backup but changes nothing.
     let out = run(&["backup", "restore", &backup, "--dry-run"], &dir);
     assert!(out.status.success());

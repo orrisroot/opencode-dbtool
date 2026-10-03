@@ -1,0 +1,12 @@
+[Unit]
+Description=opencode database maintenance (opencode-dbtool cleanup)
+Documentation=https://github.com/orrisroot/opencode-dbtool
+
+[Service]
+Type=oneshot
+# Adjust the binary path to your installation. `--restart-service` stops
+# and restarts the opencode service around the maintenance window, so a
+# running TUI only sees a short interruption.
+ExecStart=%h/.cargo/bin/opencode-dbtool cleanup \
+    --older-than 30d --subagents --keep-latest-per-project 5 \
+    --restart-service --yes

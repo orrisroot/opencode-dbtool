@@ -33,21 +33,24 @@ cargo build --release   # -> target/release/opencode-dbtool
 
 | command | description |
 | --- | --- |
-| `stats [--detail]` | DB overview: table sizes, totals, storage usage (`--detail` adds analysis) |
+| `stats [--detail]` | DB overview: table sizes, totals, storage usage, reclaimable space (`--detail` adds analysis) |
 | `doctor` | integrity + consistency checks |
-| `project list [--path <dir>]` | project overview (counts, sizes); `--path` filters to a directory (repeatable) |
+| `project list [--path <dir>] [--sort size\|updated\|sessions]` | project overview (counts, sizes); `--path` filters to a directory (repeatable) |
 | `project show <id>` | project detail (sessions, breakdown) |
 | `project delete <id>...` | delete project(s) + all related data |
 | `project purge [--older-than <age>] [--path <dir>...] [--empty]` | delete projects matching all filters |
-| `session list [--sort size] [--limit <n>] [--search <text>]` | per-session breakdown (full ids) |
-| `session show <id> [--messages [--limit <n>]]` | session detail, optionally with message previews |
+| `session list [--sort size\|cost\|updated\|messages] [--limit <n>] [--search <text>] [--min-size <size>]` | per-session breakdown (full ids) |
+| `session show <id> [--messages [--limit <n>] [--full]]` | session detail, optionally with message previews |
 | `session delete <id>...` | delete session(s) + cascade |
-| `session purge [--older-than <age>] [--subagents] [--archived] [--empty] [--path <dir>...] [--path-prefix <dir>...] [--larger-than <size>] [--keep-latest <n>] [--keep-latest-per-project <n>]` | delete sessions matching all filters |
-| `session strip-reasoning [--older-than <age>] [--subagents] [--archived] [--empty] [--path <dir>...] [--path-prefix <dir>...] [--larger-than <size>] [--keep-latest <n>] [--keep-latest-per-project <n>]` | delete only the reasoning content of matching sessions |
+| `session purge [filters]` | delete sessions matching all filters |
+| `session strip-reasoning [filters]` | delete only the reasoning content of matching sessions |
 | `kv list [--older-than <age>]` | list global kv entries with sizes (large caches first) |
-| `kv show <key>` | show a kv value (truncated) |
+| `kv show <key> [--raw]` | show a kv value (truncated; `--raw` prints it verbatim) |
 | `kv delete <key>...` | delete kv entries (caches regenerate on demand) |
 | `backup [--keep-backups <n>]` | online verified backup (safe while opencode runs) |
+| `backup list [--verify]` | list timestamped backups, newest first |
+| `backup restore <file>` | restore a backup over the current database (safety copy first) |
+| `service status` | diagnose the running opencode service (API, DB match) |
 | `fs clean-snapshots [--project <id>...] [--orphans-only]` | delete snapshot storage, optionally scoped |
 | `fs clean-shell [--older-than <age>]` | delete shell output files, optionally only old ones |
 | `fs clean-blob-orphans` | delete instruction blobs referenced by no state |
@@ -59,9 +62,15 @@ cargo build --release   # -> target/release/opencode-dbtool
 | `self-update [--dry-run\|--yes]` | check for / install the latest GitHub release binary |
 
 All commands accept `--format <table\|json>` (default: table on a terminal,
-JSON when piped) and `--quiet` (suppress progress on stderr). `--dry-run` and
-`--yes` may be passed anywhere on the command line. Every subcommand has its
-own `--help`.
+JSON when piped), `--quiet` (suppress progress on stderr), `--absolute`
+(absolute instead of relative timestamps in tables), and `--no-color`.
+`--dry-run` and `--yes` may be passed anywhere on the command line. Every
+subcommand has its own `--help`.
+
+Filters for `session purge` / `session strip-reasoning` are
+`--older-than <age>`, `--subagents`, `--archived`, `--empty`,
+`--path <dir>...`, `--path-prefix <dir>...`, `--larger-than <size>`,
+`--keep-latest <n>`, and `--keep-latest-per-project <n>` (details below).
 
 Session and project references resolve in this order: exact id, a unique id
 prefix (for sessions the leading `ses_` may be omitted), then — for projects —
@@ -172,18 +181,41 @@ has the target database open. On other platforms the delete commands keep
 the normal running-instance guard; use `--restart-service` or stop
 opencode.
 
+### `service status`
+
+One-stop diagnosis of the running service: registration (`registered`,
+`pid`, `url`, `version`), API reachability with credentials (`api_ok`,
+`api_error`), and whether the service has this database open
+(`db_matches`). Works even when the database file is missing. Use it when
+deletes unexpectedly fall back to the guard or when filing a bug report.
+
+```json
+{
+  "opencode_running": true,
+  "registered": true,
+  "pid": 5406,
+  "url": "http://127.0.0.1:49374",
+  "version": "2.0.22",
+  "db_matches": true,
+  "api_ok": true
+}
+```
+
 ### `stats`
 
 Database overview: file and WAL sizes, per-table row counts, total data
-volume, the sizes of opencode's filesystem storage, and the breakdown of
-`session_message` rows by type. Start here to see where space is going.
+volume, reclaimable space, the sizes of opencode's filesystem storage,
+and the breakdown of `session_message` rows by type. Start here to see
+where space is going.
 
 ```json
 {
   "db_bytes": 8388608,
   "wal_bytes": 0,
   "free_pages": 120,
+  "reclaimable_bytes": 491520,
   "tables": { "session_v2": 6, "session_message": 640, "event": 90210, "...": 0 },
+  "table_bytes": { "session_message": 900000, "event": 400000, "...": 0 },
   "total_data_bytes": 12345678,
   "storage": { "snapshot_bytes": 736000, "shell_bytes": 39681, "repos_bytes": 0, "log_bytes": 2441760 },
   "message_types": { "assistant": { "count": 400, "bytes": 900000 }, "user": { "count": 240, "bytes": 10240 } }
@@ -195,7 +227,9 @@ volume, the sizes of opencode's filesystem storage, and the breakdown of
 | `db_bytes` | size of `opencode.db` on disk |
 | `wal_bytes` | size of the WAL file |
 | `free_pages` | SQLite freelist page count (space that `vacuum` can reclaim) |
+| `reclaimable_bytes` | `free_pages` * `page_size`: the bytes a VACUUM would give back |
 | `tables` | row count per table |
+| `table_bytes` | content bytes per table, largest first |
 | `total_data_bytes` | sum of content columns across all tables (`data`, `payload`, `value`, `initial_values`/`current_values`, ...) |
 | `storage` | sizes of the filesystem storage beside the database: `snapshot_bytes` (`snapshot/`), `shell_bytes` (`shell/`), `repos_bytes` (`repos/`), `log_bytes` (`log/`); missing directories count as 0 |
 | `message_types` | `session_message` rows grouped by `type` (largest first) |
@@ -318,13 +352,18 @@ A filter match of zero projects is normal (exit 0).
 
 Per-session breakdown: event/`session_message`/`inbox`/`pending` counts,
 data size, archived flag, and cost. Use it with `--sort size` and `--limit`
-to find the biggest sessions before purging. `--search <text>` keeps only
-sessions whose title or directory contains the text (case-insensitive).
-`session list` prints an array; `session show <ref>` prints one object (add
-`--messages [--limit <n>]` for oldest-first message previews with
-per-message bytes, plus `total_messages`). Without `--sort`/`--limit`,
-`session list` is ordered by `time_updated` descending. `size_bytes` sums
-session_message+inbox+pending+instructions+event bytes.
+to find the biggest sessions before purging. `--sort` accepts `size`,
+`cost`, `updated`, and `messages`; `--min-size <size>` keeps only sessions
+at least that large. `--search <text>` keeps only sessions whose title or
+directory contains the text (case-insensitive). `session list` prints an
+array; `session show <ref>` prints one object (add `--messages
+[--limit <n>]` for oldest-first message previews with per-message bytes,
+plus `total_messages`; `--full` keeps whole messages instead of 300-char
+previews). Without `--sort`/`--limit`, `session list` is ordered by
+`time_updated` descending. `size_bytes` sums
+session_message+inbox+pending+instructions+event bytes. In tables,
+`updated`/`time` columns show relative ages (`15m ago`); `--absolute`
+prints ISO timestamps.
 
 `<ref>` may be the full id, a unique id prefix, or the id without its `ses_`
 prefix (`session show ses_effb2a71` and `session show effb2a71` both work
@@ -556,14 +595,28 @@ optional `--keep-backups <n>` pruning. Safe while opencode runs.
 }
 ```
 
+`backup list [--verify]` lists the timestamped backups (newest first) with
+size and creation time; `--verify` runs an integrity check on each.
+`backup restore <file>` verifies the source, takes a safety backup of the
+current database (best effort, so a corrupt current database can still be
+recovered), removes stale WAL/SHM files, replaces the database, and
+verifies the result. It needs exclusive access (or `--restart-service`)
+and `--dry-run` reports the plan without touching anything.
+
+```sh
+opencode-dbtool backup list
+opencode-dbtool backup restore opencode.db.backup-20260830T120000Z --yes
+```
+
 ### `kv list` / `kv show` / `kv delete`
 
 Inspect the global `kv` table, which can dominate database size (e.g. the
 multi-megabyte `models-dev:catalog` cache). `kv list [--older-than <age>]`
 prints `{key, bytes, updated}` largest first; `kv show <key>` prints the
-value truncated to 2000 chars plus `truncated`; `kv delete <key>...`
-removes keys (caches regenerate on demand) and is guarded while opencode
-runs. Preview with `--dry-run` first.
+value truncated to 2000 chars plus `truncated` (`--raw` prints it verbatim
+with no wrapper or truncation); `kv delete <key>...` removes keys (caches
+regenerate on demand) and is guarded while opencode runs. Preview with
+`--dry-run` first.
 
 ### `vacuum`
 
@@ -653,8 +706,12 @@ command and reports each step's result. Steps, in order:
 All `session purge` filters are accepted directly. `--keep-backups <n>`
 prunes older backups after the pre-run backup. The output embeds each step's
 result (without nested environment blocks) plus `action`, `filters`,
-`fs_older_than`, `cleaned`, and a `note`. `--dry-run` prints the complete
-plan without changing anything.
+`fs_older_than`, `cleaned`, and a `note`. A compact `summary` object
+aggregates the run (sessions/rows, backup path, orphan counts, file bytes,
+log before/after, vacuum status, database size before/after), and on a
+terminal the table output is exactly that summary instead of the nested
+step dump. `--dry-run` prints the plan without changing anything and adds
+a `to apply:` hint with the confirmed command line.
 
 ```sh
 opencode-dbtool cleanup --older-than 30d --subagents --keep-latest-per-project 5
@@ -704,14 +761,43 @@ the static musl build on Linux; an unsupported local platform fails with
 exit code 2, while a release missing this platform's asset, network/API
 failures, and download problems surface as exit code 3.
 
+## Configuration
+
+Optional defaults can live in `config.toml`:
+
+```toml
+# $XDG_CONFIG_HOME/opencode-dbtool/config.toml
+format = "table"          # or "json"
+quiet = false
+restart_service = true    # as if --restart-service were always passed
+no_input = false
+fs_older_than = "14d"     # cleanup's shell/log cutoff
+
+[purge]                   # defaults for session purge / strip-reasoning / cleanup
+older_than = "30d"
+subagents = true
+keep_latest_per_project = 5
+# path = ["/home/user/work/a"]
+# path_prefix = ["/home/user/work"]
+```
+
+Command-line flags always win over config values. Use `--config <file>` or
+`$OPENCODE_DBTOOL_CONFIG` for a different location. A malformed config (or
+a missing file passed explicitly) is a usage error; a missing file at the
+standard location is ignored.
+
 ## Flags
 
 | flag | meaning |
 | --- | --- |
-| `--dry-run`, `-n` | print actions without changing anything (safe while opencode runs) |
-| `--yes`, `-y` | confirm a destructive command. On a terminal, omitting `--yes`/`--dry-run` shows the preview and asks `Proceed? [y/N]` instead; off a terminal `--yes` is required for every real run of `delete`, `purge`, `strip-reasoning`, `kv delete`, `backup`, `fs clean-*`, `vacuum`, `cleanup`, and `self-update` |
+| `--dry-run`, `-n` | print actions without changing anything (safe while opencode runs) and show a `to apply:` hint |
+| `--yes`, `-y` | confirm a destructive command. On a terminal, omitting `--yes`/`--dry-run` shows the preview and asks `Proceed? [y/N]` instead; off a terminal `--yes` is required for every real run of `delete`, `purge`, `strip-reasoning`, `kv delete`, `backup`/`restore`, `fs clean-*`, `vacuum`, `cleanup`, and `self-update` |
+| `--no-input` | never prompt: destructive commands then require `--yes`, even on a terminal (useful for CI with a pseudo-TTY) |
 | `--format <table\|json>` | output format (default: table on a terminal, JSON when piped) |
 | `--quiet` | suppress progress and confirmation messages on stderr |
+| `--absolute` | absolute ISO timestamps in tables instead of relative ages |
+| `--no-color` | disable ANSI colors in tables (also honors `NO_COLOR`) |
+| `--config <file>` | load defaults from this config file |
 | `--no-backup` | `vacuum`/`cleanup`: skip the timestamped backup (dangerous) |
 | `--online` | `vacuum` only: attempt VACUUM while opencode runs (may block the server briefly) |
 | `--restart-service` | stop the registered opencode service for the run and restart it afterwards (for commands that need exclusive access) |
@@ -723,11 +809,14 @@ before confirming.
 ## Recipes
 
 ```sh
-# Where is the space going?
+# Where is the space going, and what can be reclaimed?
 opencode-dbtool stats --detail
 
 # Biggest sessions first
 opencode-dbtool session list --sort size --limit 10
+
+# Is the online machinery healthy?
+opencode-dbtool service status
 
 # Preview a retention policy, then apply it
 opencode-dbtool session purge --older-than 30d --keep-latest-per-project 5 --dry-run
@@ -747,13 +836,24 @@ opencode-dbtool vacuum --online
 # Full cleanup including VACUUM, with an automatic service restart
 opencode-dbtool cleanup --older-than 30d --subagents --restart-service
 
+# Backups
+opencode-dbtool backup list --verify
+opencode-dbtool backup restore opencode.db.backup-20260830T120000Z --yes
+
 # Inspect a huge cache key
 opencode-dbtool kv list
 opencode-dbtool kv show models-dev:catalog
+opencode-dbtool kv show models-dev:catalog --raw | jq .
 
 # Shell completions
 source <(opencode-dbtool completions bash)
 ```
+
+## Scheduling
+
+`contrib/` contains systemd (Linux) and launchd (macOS) templates for
+running `cleanup --restart-service --yes` on a schedule, plus installation
+notes. See [contrib/README.md](contrib/README.md).
 
 ## Exit codes
 
@@ -773,6 +873,9 @@ source <(opencode-dbtool completions bash)
 | `OPENCODE_DISABLE_CHANNEL_DB` | skip the channel-database fallback and always target `opencode.db` |
 | `XDG_DATA_HOME` | data dir defaults to `$XDG_DATA_HOME/opencode` |
 | `XDG_STATE_HOME` | state dir for service discovery defaults to `$XDG_STATE_HOME/opencode` (`~/.local/state/opencode`) |
+| `XDG_CONFIG_HOME` | config file defaults to `$XDG_CONFIG_HOME/opencode-dbtool/config.toml` (`~/.config/...`) |
+| `OPENCODE_DBTOOL_CONFIG` | explicit config file path (same as `--config`) |
+| `NO_COLOR` | disable colors in table output (same as `--no-color`) |
 | `GH_TOKEN` / `GITHUB_TOKEN` | `self-update` only: GitHub API token (raises the release-check rate limit) |
 
 Default data dir: `~/.local/share/opencode`.

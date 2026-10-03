@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.orrisroot.opencode-dbtool-cleanup</string>
+  <!-- Adjust the binary path to your installation. `--restart-service`
+       stops and restarts the opencode service around the run. -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/local/bin/opencode-dbtool</string>
+    <string>cleanup</string>
+    <string>--older-than</string>
+    <string>30d</string>
+    <string>--subagents</string>
+    <string>--keep-latest-per-project</string>
+    <string>5</string>
+    <string>--restart-service</string>
+    <string>--yes</string>
+  </array>
+  <!-- Every Sunday at 04:00. -->
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Weekday</key>
+    <integer>0</integer>
+    <key>Hour</key>
+    <integer>4</integer>
+  </dict>
+  <key>StandardOutPath</key>
+  <string>/tmp/opencode-dbtool-cleanup.log</string>
+  <key>StandardErrorPath</key>
+  <string>/tmp/opencode-dbtool-cleanup.err</string>
+</dict>
+</plist>
