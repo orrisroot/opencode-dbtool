@@ -9,6 +9,7 @@ use crate::error::{AppError, Result};
 use crate::models::{ProjectFilter, PurgeFilter};
 use crate::util::{now_ms, parse_age_ms, parse_count, parse_size_bytes};
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use std::path::PathBuf;
 
 /// Output format; `auto` (the default when the flag is absent) picks a
 /// table on a terminal and JSON when stdout is piped.
@@ -50,6 +51,10 @@ pub struct Cli {
     /// (applies to commands that otherwise require opencode to be closed)
     #[arg(long, global = true)]
     pub restart_service: bool,
+
+    /// Never prompt; destructive commands then require --yes
+    #[arg(long, global = true)]
+    pub no_input: bool,
 }
 
 #[derive(Subcommand)]
@@ -75,6 +80,9 @@ pub enum Command {
     /// Filesystem storage cleanup (snapshots, shell, blobs, log)
     #[command(subcommand)]
     Fs(FsCmd),
+    /// Inspect the running opencode service
+    #[command(subcommand)]
+    Service(ServiceCmd),
     /// Compact the database, reclaiming space freed by deletes
     Vacuum(VacuumArgs),
     /// Update the binary from the latest GitHub release
@@ -332,6 +340,9 @@ pub struct DbCheckpointArgs {
 
 #[derive(Args)]
 pub struct BackupArgs {
+    /// List backups or restore one (default: create a backup)
+    #[command(subcommand)]
+    pub command: Option<BackupCmd>,
     /// Keep only the newest N backup files after a successful run
     #[arg(
         long = "keep-backups",
@@ -339,6 +350,38 @@ pub struct BackupArgs {
         value_parser = keep_backups_value
     )]
     pub keep_backups: Option<i64>,
+}
+
+#[derive(Subcommand)]
+pub enum BackupCmd {
+    /// List timestamped backups, newest first
+    List(BackupListArgs),
+    /// Restore a backup over the current database
+    Restore(BackupRestoreArgs),
+}
+
+#[derive(Args)]
+pub struct BackupListArgs {
+    /// Verify every backup with an integrity check (slower)
+    #[arg(long)]
+    pub verify: bool,
+}
+
+#[derive(Args)]
+pub struct BackupRestoreArgs {
+    /// Backup file to restore (as listed by `backup list`)
+    #[arg(value_name = "FILE")]
+    pub file: PathBuf,
+}
+
+// ---------------------------------------------------------------------------
+// service
+// ---------------------------------------------------------------------------
+
+#[derive(Subcommand)]
+pub enum ServiceCmd {
+    /// Show registration, API reachability, and database match
+    Status,
 }
 
 #[derive(Args)]

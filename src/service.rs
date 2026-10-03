@@ -18,12 +18,15 @@ pub struct ServiceInfo {
     pub pid: i32,
     pub url: String,
     pub password: Option<String>,
+    pub version: Option<String>,
 }
 
 #[derive(Deserialize)]
 struct ServiceFile {
     pid: i32,
     url: String,
+    #[serde(default)]
+    version: Option<String>,
     #[serde(default)]
     password: Option<String>,
 }
@@ -57,6 +60,7 @@ fn discover_in(dir: &Path) -> Option<ServiceInfo> {
             pid: file.pid,
             url: file.url.trim_end_matches('/').to_string(),
             password,
+            version: file.version,
         });
     }
     None
@@ -249,25 +253,27 @@ impl ServiceInfo {
     /// it safe to route deletes through it (otherwise the tool would
     /// modify the server's database instead of the target one).
     ///
-    /// The check is exact on Linux (open file descriptors). Other
-    /// platforms cannot verify process file handles, so API routing is
-    /// disabled there; use `--restart-service` or stop opencode instead.
-    pub fn targets_db(&self, db_path: &Path) -> bool {
+    /// The check is exact on Linux (open file descriptors); `None` on
+    /// other platforms, where API routing is disabled.
+    pub fn db_match(&self, db_path: &Path) -> Option<bool> {
         #[cfg(target_os = "linux")]
         {
-            linux_process_has_open(self.pid, db_path)
+            Some(linux_process_has_open(self.pid, db_path))
         }
         #[cfg(not(target_os = "linux"))]
         {
             let _ = db_path;
-            false
+            None
         }
     }
 
-    /// `DELETE /api/session/{id}`; a 404 `SessionNotFoundError` counts as
-    /// success (the session is already gone).
-    pub fn delete_session(&self, id: &str) -> Result<()> {
-        let agent = ureq::Agent::new_with_config(
+    /// API routing requires an exact database match.
+    pub fn targets_db(&self, db_path: &Path) -> bool {
+        self.db_match(db_path).unwrap_or(false)
+    }
+
+    fn agent() -> ureq::Agent {
+        ureq::Agent::new_with_config(
             ureq::Agent::config_builder()
                 .timeout_global(Some(Duration::from_secs(15)))
                 .http_status_as_error(false)
@@ -275,9 +281,41 @@ impl ServiceInfo {
                 // through an HTTP(S)_PROXY from the environment.
                 .proxy(None)
                 .build(),
-        );
+        )
+    }
+
+    fn get_json(&self, path: &str) -> Result<(u16, String)> {
+        let url = format!("{}{path}", self.url);
+        let mut request = Self::agent().get(&url);
+        if let Some(header) = self.auth_header() {
+            request = request.header("Authorization", header);
+        }
+        let mut response = request
+            .call()
+            .map_err(|e| AppError::db(format!("opencode API request failed: {e}")))?;
+        let status = response.status().as_u16();
+        let body = response.body_mut().read_to_string().unwrap_or_default();
+        Ok((status, body))
+    }
+
+    /// `GET /api/info` (used by `service status`).
+    pub fn api_info(&self) -> Result<serde_json::Value> {
+        let (status, body) = self.get_json("/api/info")?;
+        if status != 200 {
+            return Err(AppError::db(format!(
+                "opencode API info failed (HTTP {status}): {}",
+                body.trim()
+            )));
+        }
+        serde_json::from_str(&body)
+            .map_err(|e| AppError::db(format!("invalid /api/info response: {e}")))
+    }
+
+    /// `DELETE /api/session/{id}`; a 404 `SessionNotFoundError` counts as
+    /// success (the session is already gone).
+    pub fn delete_session(&self, id: &str) -> Result<()> {
         let url = format!("{}/api/session/{id}", self.url);
-        let mut request = agent.delete(&url);
+        let mut request = Self::agent().delete(&url);
         if let Some(header) = self.auth_header() {
             request = request.header("Authorization", header);
         }
@@ -402,6 +440,7 @@ mod tests {
             pid: std::process::id() as i32,
             url: "http://127.0.0.1:1".into(),
             password: None,
+            version: None,
         };
         assert!(!svc.targets_db(&db), "no fd open yet");
         let _held = std::fs::File::open(&db).unwrap();
@@ -451,6 +490,7 @@ mod tests {
             pid: std::process::id() as i32,
             url,
             password: Some("pw".into()),
+            version: None,
         }
     }
 

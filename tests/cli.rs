@@ -1158,3 +1158,198 @@ fn restart_service_is_ignored_by_read_only_commands() {
 
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+#[test]
+fn backup_list_and_restore_round_trip() {
+    let dir = temp_dir("restore");
+    let db = dir.join("opencode.db");
+    create_db(&db);
+
+    // Take a backup, then add a session so the restore has something to undo.
+    let out = run(&["backup", "--yes"], &dir);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let backup = stdout_json(&out)["backup"]["path"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    {
+        let con = Connection::open(&db).unwrap();
+        con.execute(
+            "INSERT INTO session_v2 (id, directory, title, time_updated, cost) \
+             VALUES ('ses_extra', '/work/a', 'extra', 0, 0)",
+            [],
+        )
+        .unwrap();
+    }
+
+    let out = run(&["backup", "list"], &dir);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let arr = stdout_json(&out);
+    let arr = arr.as_array().unwrap();
+    assert_eq!(arr.len(), 1);
+    let expected = Path::new(&backup)
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .to_string();
+    assert_eq!(arr[0]["file"], expected);
+
+    // Dry-run restore verifies the backup but changes nothing.
+    let out = run(&["backup", "restore", &backup, "--dry-run"], &dir);
+    assert!(out.status.success());
+    assert_eq!(stdout_json(&out)["dry_run"], true);
+    {
+        let con = Connection::open(&db).unwrap();
+        let n: i64 = con
+            .query_row(
+                "SELECT COUNT(*) FROM session_v2 WHERE id = 'ses_extra'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 1, "dry-run restore keeps the current data");
+    }
+
+    // Real restore replaces the database (the running-instance guard may
+    // refuse with exit 1 while this test harness runs under opencode).
+    let out = run(&["backup", "restore", &backup, "--yes"], &dir);
+    let code = out.status.code();
+    assert!(
+        code == Some(0) || code == Some(1),
+        "unexpected exit code: {code:?} stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    if code == Some(1) {
+        std::fs::remove_dir_all(&dir).unwrap();
+        return;
+    }
+    let v = stdout_json(&out);
+    assert_eq!(v["integrity"], "ok");
+    assert!(v["safety_backup"]["path"].is_string());
+
+    let con = Connection::open(&db).unwrap();
+    let extra: i64 = con
+        .query_row(
+            "SELECT COUNT(*) FROM session_v2 WHERE id = 'ses_extra'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let original: i64 = con
+        .query_row(
+            "SELECT COUNT(*) FROM session_v2 WHERE id = 'ses_1'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(extra, 0, "restore removed the later session");
+    assert_eq!(original, 1, "restore kept the backed-up session");
+    drop(con);
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn no_input_requires_yes() {
+    let dir = temp_dir("no-input");
+    create_db(&dir.join("opencode.db"));
+
+    let out = run(
+        &["session", "purge", "--older-than", "30d", "--no-input"],
+        &dir,
+    );
+    assert_eq!(out.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("--yes"), "stderr: {stderr}");
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn service_status_without_service() {
+    let dir = temp_dir("service-status");
+    create_db(&dir.join("opencode.db"));
+
+    let out = run(&["service", "status"], &dir);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v = stdout_json(&out);
+    assert_eq!(v["registered"], false);
+    assert!(
+        v["note"]
+            .as_str()
+            .unwrap()
+            .contains("no registered opencode service"),
+        "note: {}",
+        v["note"]
+    );
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn service_status_with_mock_service() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    let dir = temp_dir("service-status-live");
+    let db = dir.join("opencode.db");
+    create_db(&db);
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let db_thread = db.clone();
+    let server = std::thread::spawn(move || {
+        // Hold the DB open so the fd check reports a match.
+        let _held = Connection::open(&db_thread).unwrap();
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut buf = [0u8; 4096];
+        let _ = stream.read(&mut buf).unwrap();
+        let body = r#"{"version":"2.0.22","pid":1,"urls":[]}"#;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        stream.write_all(response.as_bytes()).unwrap();
+    });
+
+    let state = dir.join("state/opencode");
+    std::fs::create_dir_all(&state).unwrap();
+    std::fs::write(
+        state.join("service.json"),
+        serde_json::json!({
+            "pid": std::process::id(),
+            "url": format!("http://{addr}"),
+            "password": "pw",
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let out = run(&["service", "status"], &dir);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    server.join().unwrap();
+    let v = stdout_json(&out);
+    assert_eq!(v["registered"], true);
+    assert_eq!(v["db_matches"], true);
+    assert_eq!(v["api_ok"], true);
+    assert_eq!(v["version"], "2.0.22");
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}

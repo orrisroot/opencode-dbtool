@@ -1,6 +1,8 @@
 //! Command dispatch, confirmation flow, and running-instance guards.
 
-use crate::cli::{Cli, Command, DbCmd, FsCmd, KvCmd, ProjectCmd, SessionCmd, SortKey};
+use crate::cli::{
+    BackupCmd, Cli, Command, DbCmd, FsCmd, KvCmd, ProjectCmd, ServiceCmd, SessionCmd, SortKey,
+};
 use crate::confirm;
 use crate::db;
 use crate::error::{AppError, Result};
@@ -35,6 +37,10 @@ pub fn execute(cli: Cli) -> Result<()> {
         return Err(AppError::usage("cannot determine opencode data dir"));
     };
     let db_path = config::db_path()?;
+    // `service status` diagnoses even when the database is missing.
+    if let Command::Service(ServiceCmd::Status) = command {
+        return commands::service::cmd_service_status(&db_path);
+    }
     require_db(&db_path)?;
     let service = service::discover();
     let restart = cli.restart_service;
@@ -116,8 +122,16 @@ fn mutation_guard<'a>(
             Some(("session strip-reasoning", Some(IDLE_DELETE)))
         }
         Command::Kv(KvCmd::Delete(_)) => Some(("kv delete", Some(IDLE_DELETE))),
-        // Online backup: consistent snapshots of a live WAL database.
-        Command::Backup(_) => Some(("backup", None)),
+        // Listing backups is read-only; creating one uses the online
+        // backup API, and restoring needs exclusive access.
+        Command::Backup(a) => match &a.command {
+            Some(BackupCmd::List(_)) => None,
+            Some(BackupCmd::Restore(_)) => Some((
+                "backup restore",
+                Some("restoring while opencode is running is not allowed"),
+            )),
+            None => Some(("backup", None)),
+        },
         Command::Fs(FsCmd::Snapshots(a)) => Some((
             "fs clean-snapshots",
             if a.orphans_only {
@@ -188,7 +202,8 @@ where
     if cli.yes {
         return execute_confirmed(cli, idle, service, restart, db_path, &mut run);
     }
-    let interactive = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+    let interactive =
+        !cli.no_input && std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
     if !interactive {
         return Err(AppError::usage(format!(
             "{what} modifies data; pass `--dry-run` to preview the impact or `--yes` to confirm"
@@ -350,7 +365,11 @@ fn dispatch(
                 commands::checkpoint::cmd_checkpoint(db_path, a.truncate, dry_run)
             }
         },
-        Command::Backup(a) => commands::vacuum::cmd_backup(db_path, dry_run, a.keep_backups),
+        Command::Backup(a) => match &a.command {
+            Some(BackupCmd::List(l)) => commands::vacuum::cmd_backup_list(db_path, l.verify),
+            Some(BackupCmd::Restore(r)) => commands::vacuum::cmd_restore(db_path, &r.file, dry_run),
+            None => commands::vacuum::cmd_backup(db_path, dry_run, a.keep_backups),
+        },
         Command::Fs(cmd) => match cmd {
             FsCmd::Snapshots(a) => {
                 let con = db::open_conn(db_path, true)?;
@@ -378,7 +397,7 @@ fn dispatch(
         Command::Cleanup(a) => {
             commands::cleanup::cmd_cleanup(dir, db_path, a, dry_run, quiet, service)
         }
-        Command::SelfUpdate | Command::Completions(_) => {
+        Command::SelfUpdate | Command::Completions(_) | Command::Service(_) => {
             unreachable!("handled before database resolution")
         }
     }

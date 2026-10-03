@@ -7,6 +7,7 @@ pub mod fsops;
 pub mod kv;
 pub mod project;
 pub mod selfupdate;
+pub mod service;
 pub mod session;
 pub mod stats;
 pub mod vacuum;

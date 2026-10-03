@@ -4,7 +4,7 @@ use crate::cli::VacuumArgs;
 use crate::db::{file_size, quick_check, EnvStatus};
 use crate::error::{AppError, Result};
 use crate::output;
-use crate::util::{now_ms, timestamp_utc};
+use crate::util::{file_mtime_ms, now_ms, timestamp_utc};
 use rusqlite::Connection;
 use serde::Serialize;
 use std::path::{Path, PathBuf};
@@ -268,6 +268,184 @@ pub fn cmd_backup(db_path: &Path, dry_run: bool, keep: Option<i64>) -> Result<()
     )?)?)
 }
 
+/// Backup-file sidecars (`-wal`, `-shm`, `-journal`) are never backups
+/// themselves.
+fn is_backup_sidecar(name: &str) -> bool {
+    name.ends_with("-wal") || name.ends_with("-shm") || name.ends_with("-journal")
+}
+
+/// Path of a sidecar file next to `path` (`<name>-wal`, ...).
+fn sidecar_path(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = path
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
+    name.push_str(suffix);
+    path.with_file_name(name)
+}
+
+/// One timestamped backup file.
+#[derive(Serialize)]
+pub struct BackupFileOut {
+    pub file: String,
+    pub bytes: u64,
+    pub created: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub integrity: Option<String>,
+}
+
+/// Timestamped backups of this database, newest first.
+pub fn list_backup_files(db_path: &Path, verify: bool) -> Result<Vec<BackupFileOut>> {
+    let dir = db_path.parent().unwrap_or(Path::new("."));
+    let prefix = format!(
+        "{}.backup-",
+        db_path.file_name().unwrap_or_default().to_string_lossy()
+    );
+    let rd = std::fs::read_dir(dir)
+        .map_err(|e| AppError::db(format!("cannot list backups in {}: {e}", dir.display())))?;
+    let mut out = Vec::new();
+    for entry in rd.flatten() {
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().to_string();
+        if !name.starts_with(&prefix)
+            || is_backup_sidecar(&name)
+            || !entry.file_type().is_ok_and(|ft| ft.is_file())
+        {
+            continue;
+        }
+        let integrity = if verify {
+            match crate::db::open_conn(&path, true) {
+                Ok(con) => Some(quick_check(&con)),
+                Err(e) => Some(format!("error: {e}")),
+            }
+        } else {
+            None
+        };
+        out.push(BackupFileOut {
+            file: name,
+            bytes: file_size(&path),
+            created: crate::util::dt(file_mtime_ms(&path).unwrap_or(0)),
+            integrity,
+        });
+    }
+    out.sort_by(|a, b| b.file.cmp(&a.file));
+    Ok(out)
+}
+
+/// List timestamped backups, newest first.
+pub fn cmd_backup_list(db_path: &Path, verify: bool) -> Result<()> {
+    output::emit_cols(
+        &serde_json::to_value(list_backup_files(db_path, verify)?)?,
+        &["file", "bytes", "created", "integrity"],
+    )
+}
+
+/// JSON shape of the `backup restore` output.
+#[derive(Serialize)]
+struct RestoreOut {
+    #[serde(flatten)]
+    env: EnvStatus,
+    dry_run: bool,
+    source: String,
+    db_bytes: u64,
+    integrity: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    safety_backup: Option<BackupOut>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    note: Option<String>,
+}
+
+/// Restore a verified backup over the current database. A safety copy of
+/// the current database is taken first (unless it is unreadable, so a
+/// corrupt database can still be recovered), and stale WAL/SHM files are
+/// removed so old frames cannot be replayed over the restored file.
+pub fn cmd_restore(db_path: &Path, source: &Path, dry_run: bool) -> Result<()> {
+    if source == db_path {
+        return Err(AppError::usage("cannot restore a database over itself"));
+    }
+    if !source.is_file() {
+        return Err(AppError::usage(format!(
+            "backup file not found: {}",
+            source.display()
+        )));
+    }
+    if source
+        .file_name()
+        .map(|n| is_backup_sidecar(&n.to_string_lossy()))
+        .unwrap_or(false)
+    {
+        return Err(AppError::usage(format!(
+            "{} is a WAL/SHM sidecar, not a backup",
+            source.display()
+        )));
+    }
+    // Verify the source before touching anything.
+    let integrity = {
+        let con = crate::db::open_conn(source, true)?;
+        quick_check(&con)
+    };
+    if integrity != "ok" {
+        return Err(AppError::db(format!(
+            "backup integrity check failed ({integrity}) - abort"
+        )));
+    }
+    let mut out = RestoreOut {
+        env: crate::db::env_status(db_path),
+        dry_run,
+        source: source.display().to_string(),
+        db_bytes: file_size(source),
+        integrity,
+        safety_backup: None,
+        note: None,
+    };
+    if dry_run {
+        return output::emit(&serde_json::to_value(&out)?);
+    }
+
+    // Safety copy of the current database (best effort: a corrupt current
+    // database must not block recovery).
+    match backup_value(db_path, false, None) {
+        Ok(safety) => out.safety_backup = Some(safety.backup),
+        Err(e) => out.note = Some(format!("safety backup skipped: {e}")),
+    }
+
+    // Fold the current WAL into the database, then drop the stale WAL/SHM
+    // files so SQLite cannot replay old frames over the restored file.
+    {
+        let con = crate::db::open_conn(db_path, false)?;
+        let _ = con.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
+    }
+    let _ = std::fs::remove_file(db_path.with_extension("db-wal"));
+    let _ = std::fs::remove_file(db_path.with_extension("db-shm"));
+
+    std::fs::copy(source, db_path)
+        .map_err(|e| AppError::db(format!("cannot restore {}: {e}", db_path.display())))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(db_path, std::fs::Permissions::from_mode(0o600));
+    }
+
+    let integrity = {
+        let con = crate::db::open_conn(db_path, true)?;
+        quick_check(&con)
+    };
+    if integrity != "ok" {
+        let safety = out
+            .safety_backup
+            .as_ref()
+            .map(|b| b.path.as_str())
+            .unwrap_or("-");
+        return Err(AppError::db(format!(
+            "integrity check failed after restore ({integrity}); safety backup: {safety}"
+        )));
+    }
+    out.db_bytes = file_size(db_path);
+    out.integrity = integrity;
+    output::emit(&serde_json::to_value(&out)?)
+}
+
 /// Delete all `*.backup-*` files except the newest `keep` (the filename
 /// timestamp is zero-padded UTC, so lexicographic order is chronological).
 /// Best-effort: files that cannot be removed are skipped.
@@ -283,7 +461,10 @@ fn prune_backups(db_path: &Path, keep: i64) -> Result<(usize, u64)> {
     for e in rd.flatten() {
         let p = e.path();
         let name = e.file_name().to_string_lossy().to_string();
-        if name.starts_with(&prefix) && e.file_type().is_ok_and(|ft| ft.is_file()) {
+        if name.starts_with(&prefix)
+            && !is_backup_sidecar(&name)
+            && e.file_type().is_ok_and(|ft| ft.is_file())
+        {
             backups.push(p);
         }
     }
@@ -362,6 +543,10 @@ fn create_backup(db_path: &Path) -> Result<BackupInfo> {
             "backup integrity check failed ({check}) - abort"
         )));
     }
+    // Opening the backup for verification can leave transient WAL/SHM
+    // sidecars; they are not part of the backup.
+    let _ = std::fs::remove_file(sidecar_path(&path, "-wal"));
+    let _ = std::fs::remove_file(sidecar_path(&path, "-shm"));
     let bytes = file_size(&path);
     Ok(BackupInfo {
         path,
