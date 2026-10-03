@@ -140,6 +140,7 @@ pub fn cmd_session_list(con: &Connection, opts: &ListOptions) -> Result<()> {
 /// selected window.
 pub fn session_list_value(con: &Connection, opts: &ListOptions) -> Result<serde_json::Value> {
     let mut meta = load_session_meta(con)?;
+    let mut cached_sizes: Option<HashMap<String, i64>> = None;
     if let Some(search) = opts.search {
         let needle = search.to_lowercase();
         meta.retain(|m| {
@@ -171,11 +172,19 @@ pub fn session_list_value(con: &Connection, opts: &ListOptions) -> Result<serde_
         let ids: Vec<String> = meta.iter().map(|m| m.id.clone()).collect();
         let sizes = session_sizes(con, &ids)?;
         meta.retain(|m| sizes.get(&m.id).copied().unwrap_or(0) >= min);
+        if matches!(opts.sort, Some(SortKey::Size)) {
+            cached_sizes = Some(sizes);
+        }
     }
     match opts.sort {
         Some(SortKey::Size) => {
-            let ids: Vec<String> = meta.iter().map(|m| m.id.clone()).collect();
-            let sizes = session_sizes(con, &ids)?;
+            let sizes = match cached_sizes {
+                Some(sizes) => sizes,
+                None => {
+                    let ids: Vec<String> = meta.iter().map(|m| m.id.clone()).collect();
+                    session_sizes(con, &ids)?
+                }
+            };
             meta.sort_by(|a, b| {
                 sizes
                     .get(&b.id)

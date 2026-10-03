@@ -234,8 +234,14 @@ pub enum SessionCmd {
     /// Delete session(s), cascading to children
     Delete(DeleteIdsArgs),
     /// Delete sessions matching all filters
+    #[command(
+        after_help = "Examples:\n  opencode-dbtool session purge --older-than 30d --subagents --dry-run\n  opencode-dbtool session purge --older-than 90d --keep-latest-per-project 5 --restart-service --yes"
+    )]
     Purge(SessionPurgeArgs),
     /// Delete only the reasoning content of matching sessions
+    #[command(
+        after_help = "Examples:\n  opencode-dbtool session strip-reasoning --older-than 30d --dry-run\n  opencode-dbtool session strip-reasoning --older-than 30d --yes"
+    )]
     StripReasoning(SessionPurgeArgs),
     /// Export a session through the running opencode server
     Export(SessionExportArgs),
@@ -247,7 +253,7 @@ pub enum SessionCmd {
 
 #[derive(Args)]
 #[command(
-    after_help = "Examples:\n  opencode-dbtool session search TODO --limit 5\n  opencode-dbtool session search \"error\" --since 30d --format table"
+    after_help = "Scans message content without an index; expect a full scan on large databases.\n\nExamples:\n  opencode-dbtool session search TODO --limit 5\n  opencode-dbtool session search \"error\" --since 30d --format table"
 )]
 pub struct SessionSearchArgs {
     /// Text to find in message content (case-insensitive)
@@ -342,9 +348,6 @@ pub struct SessionShowArgs {
 }
 
 #[derive(Args)]
-#[command(
-    after_help = "Examples:\n  opencode-dbtool session purge --older-than 30d --subagents --dry-run\n  opencode-dbtool session purge --older-than 90d --keep-latest-per-project 5 --restart-service --yes"
-)]
 pub struct SessionPurgeArgs {
     /// Sessions with `time_updated` older than the age (e.g. 30d, 12h, 2w)
     #[arg(long, value_name = "AGE", value_parser = age_value)]

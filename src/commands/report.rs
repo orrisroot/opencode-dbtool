@@ -237,9 +237,14 @@ pub fn report_value(con: &Connection, db_path: &Path, costs: bool) -> Result<ser
 
 /// Cost aggregates by project and by update day.
 fn costs_out(con: &Connection) -> Result<CostsOut> {
-    let projects = repo::load_projects(con)?;
-    let total = crate::util::round4(projects.iter().map(|p| p.cost).sum());
-    let mut by_project: Vec<ProjectCost> = projects
+    // Total across every session, including ones without a project.
+    let total: f64 = con.query_row(
+        "SELECT COALESCE(SUM(cost),0) FROM \"session_v2\"",
+        [],
+        |r| r.get(0),
+    )?;
+    let total = crate::util::round4(total);
+    let mut by_project: Vec<ProjectCost> = repo::load_projects(con)?
         .into_iter()
         .map(|p| ProjectCost {
             id: p.id,
@@ -409,11 +414,14 @@ mod tests {
             ["x".repeat(2 * 1024 * 1024)],
         )
         .unwrap();
+        // A session without a project still counts toward the total cost.
+        con.execute("UPDATE session_v2 SET cost = 0.75 WHERE id = 'old'", [])
+            .unwrap();
 
         let v = report_value(&con, &db_path, true).unwrap();
         assert_eq!(v["old_sessions"]["count"], 1);
         assert_eq!(v["kv_candidates"][0]["key"], "big");
-        assert!(v["costs"]["total"].is_number());
+        assert_eq!(v["costs"]["total"], 0.75);
         assert!(v["costs"]["by_project"].is_array());
         assert!(v["costs"]["by_day"].is_array());
         assert!(

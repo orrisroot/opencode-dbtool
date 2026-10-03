@@ -63,6 +63,7 @@ pub fn execute(mut cli: Cli) -> Result<()> {
             // Stop the service only when one is actually registered; with
             // none, fall through to the normal running-instance guard.
             let stop_service = restart && service.is_some() && idle.is_some();
+            check_restart_export(stop_service, command)?;
             // When the service is stopped for maintenance, run the direct
             // (offline) path instead of the server API.
             let service_for_run = if stop_service { None } else { service.as_ref() };
@@ -104,6 +105,23 @@ fn require_db(db_path: &Path) -> Result<()> {
 }
 
 const IDLE_DELETE: &str = "deleting while opencode is running is not allowed";
+
+/// `--restart-service` stops the server before the run, but `--export-dir`
+/// needs it for the pre-delete export; reject the combination before the
+/// service is stopped.
+fn check_restart_export(stop_service: bool, command: &Command) -> Result<()> {
+    if !stop_service {
+        return Ok(());
+    }
+    if let Command::Session(SessionCmd::Purge(a)) = command {
+        if a.export_dir.is_some() {
+            return Err(AppError::usage(
+                "--export-dir needs the running opencode server; drop --restart-service",
+            ));
+        }
+    }
+    Ok(())
+}
 
 /// Commands that modify data or storage, with the guard message shown
 /// when opencode is running. `idle` is `None` for operations that are
@@ -556,6 +574,7 @@ fn dispatch(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::Parser;
 
     fn args(list: &[&str]) -> Vec<String> {
         list.iter().map(|s| s.to_string()).collect()
@@ -595,6 +614,27 @@ mod tests {
     #[test]
     fn suggested_command_needs_a_program() {
         assert!(suggested_apply_command(&[]).is_none());
+    }
+
+    #[test]
+    fn restart_service_with_export_dir_is_rejected() {
+        let cli = Cli::try_parse_from([
+            "opencode-dbtool",
+            "session",
+            "purge",
+            "--older-than",
+            "30d",
+            "--export-dir",
+            "/tmp/x",
+            "--restart-service",
+        ])
+        .unwrap();
+        let command = cli.command.unwrap();
+        let err = check_restart_export(true, &command).unwrap_err();
+        assert_eq!(err.code, 2);
+        assert!(err.message.contains("drop --restart-service"), "got: {err}");
+        // Without a service to stop the combination is harmless.
+        assert!(check_restart_export(false, &command).is_ok());
     }
 
     #[test]
