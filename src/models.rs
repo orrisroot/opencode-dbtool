@@ -69,11 +69,13 @@ pub fn session_json(s: &SessionRow) -> SessionOut {
 #[derive(Clone)]
 pub struct SessionMeta {
     pub id: String,
+    pub title: String,
     pub directory: String,
     pub parent_id: Option<String>,
     pub updated: i64,
     pub project_id: Option<String>,
     pub archived: bool,
+    pub cost: f64,
 }
 
 /// Filters for `session purge` / `session strip-reasoning`; set filters
@@ -137,11 +139,13 @@ impl PurgeFilter {
     pub fn matches(&self, s: &SessionRow) -> bool {
         let meta = SessionMeta {
             id: s.id.clone(),
+            title: s.title.clone(),
             directory: s.directory.clone(),
             parent_id: s.parent_id.clone(),
             updated: s.updated,
             project_id: None,
             archived: s.archived,
+            cost: s.cost,
         };
         if !self.matches_meta(&meta) {
             return false;

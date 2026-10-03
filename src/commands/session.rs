@@ -7,9 +7,9 @@ use crate::error::{AppError, Result};
 use crate::models::{session_json, PurgeFilter, PurgeFilterJson, SessionOut};
 use crate::output;
 use crate::repo::{
-    assistant_messages, child_session_ids, load_session, load_session_meta, load_sessions,
-    reasoning_event_counts, reasoning_events_left, reasoning_messages_left, resolve_session_id,
-    resolve_session_ids, rewrite_message, session_sizes, strip_reasoning_events,
+    assistant_messages, child_session_ids, load_session, load_session_meta, reasoning_event_counts,
+    reasoning_events_left, reasoning_messages_left, resolve_session_id, resolve_session_ids,
+    rewrite_message, session_sizes, strip_reasoning_events,
 };
 use crate::service::ServiceInfo;
 use rusqlite::Connection;
@@ -133,19 +133,21 @@ pub fn cmd_session_list(con: &Connection, opts: &ListOptions) -> Result<()> {
 }
 
 /// Build the session list array (exposed for tests).
+///
+/// Aggregates (per-table counts/bytes) are computed only for the rows
+/// that are actually returned: filters and ordering run on the cheap
+/// session metadata first, then the full rows are loaded for the
+/// selected window.
 pub fn session_list_value(con: &Connection, opts: &ListOptions) -> Result<serde_json::Value> {
-    let mut sessions = load_sessions(con)?;
+    let mut meta = load_session_meta(con)?;
     if let Some(search) = opts.search {
         let needle = search.to_lowercase();
-        sessions.retain(|s| {
-            s.title.to_lowercase().contains(&needle) || s.directory.to_lowercase().contains(&needle)
+        meta.retain(|m| {
+            m.title.to_lowercase().contains(&needle) || m.directory.to_lowercase().contains(&needle)
         });
     }
-    if let Some(min) = opts.min_size {
-        sessions.retain(|s| s.size_bytes() >= min);
-    }
     if let Some(cutoff) = opts.updated_before {
-        sessions.retain(|s| s.updated < cutoff);
+        meta.retain(|m| m.updated < cutoff);
     }
     if opts.project.is_some() || opts.parent.is_some() {
         let project_id = match opts.project {
@@ -156,39 +158,57 @@ pub fn session_list_value(con: &Connection, opts: &ListOptions) -> Result<serde_
             Some(reference) => Some(crate::repo::resolve_session_id(con, reference)?),
             None => None,
         };
-        let allowed: HashSet<String> = load_session_meta(con)?
-            .iter()
-            .filter(|m| {
-                project_id
+        meta.retain(|m| {
+            project_id
+                .as_deref()
+                .is_none_or(|p| m.project_id.as_deref() == Some(p))
+                && parent_id
                     .as_deref()
-                    .is_none_or(|p| m.project_id.as_deref() == Some(p))
-                    && parent_id
-                        .as_deref()
-                        .is_none_or(|p| m.parent_id.as_deref() == Some(p))
-            })
-            .map(|m| m.id.clone())
-            .collect();
-        sessions.retain(|s| allowed.contains(&s.id));
+                    .is_none_or(|p| m.parent_id.as_deref() == Some(p))
+        });
+    }
+    if let Some(min) = opts.min_size {
+        let ids: Vec<String> = meta.iter().map(|m| m.id.clone()).collect();
+        let sizes = session_sizes(con, &ids)?;
+        meta.retain(|m| sizes.get(&m.id).copied().unwrap_or(0) >= min);
     }
     match opts.sort {
-        Some(SortKey::Size) => sessions.sort_by(|a, b| {
-            b.size_bytes()
-                .cmp(&a.size_bytes())
-                .then_with(|| a.id.cmp(&b.id))
-        }),
+        Some(SortKey::Size) => {
+            let ids: Vec<String> = meta.iter().map(|m| m.id.clone()).collect();
+            let sizes = session_sizes(con, &ids)?;
+            meta.sort_by(|a, b| {
+                sizes
+                    .get(&b.id)
+                    .copied()
+                    .unwrap_or(0)
+                    .cmp(&sizes.get(&a.id).copied().unwrap_or(0))
+                    .then_with(|| a.id.cmp(&b.id))
+            });
+        }
         Some(SortKey::Cost) => {
-            sessions.sort_by(|a, b| b.cost.total_cmp(&a.cost).then_with(|| a.id.cmp(&b.id)))
+            meta.sort_by(|a, b| b.cost.total_cmp(&a.cost).then_with(|| a.id.cmp(&b.id)))
         }
         Some(SortKey::Messages) => {
-            sessions.sort_by(|a, b| b.sm_msgs.cmp(&a.sm_msgs).then_with(|| a.id.cmp(&b.id)))
+            let ids: Vec<String> = meta.iter().map(|m| m.id.clone()).collect();
+            let counts = crate::repo::message_counts(con, &ids)?;
+            meta.sort_by(|a, b| {
+                counts
+                    .get(&b.id)
+                    .copied()
+                    .unwrap_or(0)
+                    .cmp(&counts.get(&a.id).copied().unwrap_or(0))
+                    .then_with(|| a.id.cmp(&b.id))
+            });
         }
-        // `Updated` is the default order from `load_sessions`.
+        // `Updated` is the default order from `load_session_meta`.
         Some(SortKey::Updated) | None => {}
     }
     if let Some(n) = opts.limit {
-        sessions.truncate(n);
+        meta.truncate(n);
     }
-    let out: Vec<SessionOut> = sessions.iter().map(session_json).collect();
+    let ids: Vec<String> = meta.iter().map(|m| m.id.clone()).collect();
+    let rows = crate::repo::load_sessions_by_ids(con, &ids)?;
+    let out: Vec<SessionOut> = rows.iter().map(session_json).collect();
     Ok(serde_json::to_value(out)?)
 }
 

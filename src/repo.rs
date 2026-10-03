@@ -126,19 +126,21 @@ fn make_session_row(a: SessionAgg) -> SessionRow {
 /// uses.
 pub fn load_session_meta(con: &Connection) -> Result<Vec<SessionMeta>> {
     let sql = format!(
-        "SELECT id, directory, parent_id, time_updated, project_id, \
-         time_archived IS NOT NULL FROM \"{SESSION_TABLE}\" \
+        "SELECT id, COALESCE(title,''), directory, parent_id, time_updated, project_id, \
+         time_archived IS NOT NULL, cost FROM \"{SESSION_TABLE}\" \
          ORDER BY time_updated DESC, id"
     );
     let mut stmt = con.prepare(&sql)?;
     let rows = stmt.query_map([], |r| {
         Ok(SessionMeta {
             id: r.get(0)?,
-            directory: r.get(1)?,
-            parent_id: r.get(2)?,
-            updated: r.get(3)?,
-            project_id: r.get(4)?,
-            archived: r.get(5)?,
+            title: r.get(1)?,
+            directory: r.get(2)?,
+            parent_id: r.get(3)?,
+            updated: r.get(4)?,
+            project_id: r.get(5)?,
+            archived: r.get(6)?,
+            cost: r.get(7)?,
         })
     })?;
     Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
@@ -348,6 +350,54 @@ pub fn load_sessions(con: &Connection) -> Result<Vec<SessionRow>> {
         out.push(make_session_row(r?));
     }
     Ok(out)
+}
+
+/// The given sessions, with the same aggregate columns as
+/// `load_sessions`, returned in the order of `ids` (unknown ids are
+/// skipped).
+pub fn load_sessions_by_ids(con: &Connection, ids: &[String]) -> Result<Vec<SessionRow>> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let cols = session_cols();
+    let mut map: std::collections::HashMap<String, SessionRow> = std::collections::HashMap::new();
+    for chunk in ids.chunks(crate::util::SQL_VAR_CHUNK) {
+        let sql = format!(
+            "SELECT {cols} FROM \"{SESSION_TABLE}\" s WHERE s.id IN ({})",
+            in_clause(chunk)
+        );
+        let mut stmt = con.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(chunk), read_session_row)?;
+        for row in rows {
+            let row = make_session_row(row?);
+            map.insert(row.id.clone(), row);
+        }
+    }
+    Ok(ids.iter().filter_map(|id| map.remove(id)).collect())
+}
+
+/// `session_message` row counts per session for the given ids.
+pub fn message_counts(
+    con: &Connection,
+    ids: &[String],
+) -> Result<std::collections::HashMap<String, i64>> {
+    let mut map: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+    for chunk in ids.chunks(crate::util::SQL_VAR_CHUNK) {
+        let sql = format!(
+            "SELECT session_id, COUNT(*) FROM session_message \
+             WHERE session_id IN ({}) GROUP BY session_id",
+            in_clause(chunk)
+        );
+        let mut stmt = con.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(chunk), |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+        })?;
+        for row in rows {
+            let (id, count) = row?;
+            map.insert(id, count);
+        }
+    }
+    Ok(map)
 }
 
 /// A single session by exact id, with the same aggregate columns as
