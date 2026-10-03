@@ -1,5 +1,5 @@
 //! Read models shared by list/show/delete commands, plus JSON conversion
-//! and in-memory filtering.
+//! and in-memory filtering. V2-only.
 
 use crate::util::{dt, round4};
 use serde::Serialize;
@@ -11,19 +11,26 @@ pub struct SessionRow {
     pub directory: String,
     pub parent_id: Option<String>,
     pub updated: i64,
-    pub msgs: i64,
-    pub msg_bytes: i64,
-    pub parts: i64,
-    pub part_bytes: i64,
+    pub archived: bool,
     pub events: i64,
     pub event_bytes: i64,
-    pub diff_bytes: i64,
+    pub sm_msgs: i64,
+    pub sm_bytes: i64,
+    pub inbox_msgs: i64,
+    pub inbox_bytes: i64,
+    pub pending_msgs: i64,
+    pub pending_bytes: i64,
+    pub instr_bytes: i64,
     pub cost: f64,
 }
 
 impl SessionRow {
     pub fn size_bytes(&self) -> i64 {
-        self.msg_bytes + self.part_bytes + self.event_bytes
+        self.event_bytes
+            + self.sm_bytes
+            + self.inbox_bytes
+            + self.pending_bytes
+            + self.instr_bytes
     }
 }
 
@@ -35,11 +42,12 @@ pub struct SessionOut {
     pub directory: String,
     pub parent_id: Option<String>,
     pub updated: String,
-    pub msgs: i64,
-    pub parts: i64,
+    pub archived: bool,
     pub events: i64,
+    pub session_messages: i64,
+    pub inbox: i64,
+    pub pending: i64,
     pub size_bytes: i64,
-    pub diff_bytes: i64,
     pub cost: f64,
 }
 
@@ -50,11 +58,12 @@ pub fn session_json(s: &SessionRow) -> SessionOut {
         directory: s.directory.clone(),
         parent_id: s.parent_id.clone(),
         updated: dt(s.updated),
-        msgs: s.msgs,
-        parts: s.parts,
+        archived: s.archived,
         events: s.events,
+        session_messages: s.sm_msgs,
+        inbox: s.inbox_msgs,
+        pending: s.pending_msgs,
         size_bytes: s.size_bytes(),
-        diff_bytes: s.diff_bytes,
         cost: round4(s.cost),
     }
 }
@@ -67,6 +76,8 @@ pub struct SessionMeta {
     pub directory: String,
     pub parent_id: Option<String>,
     pub updated: i64,
+    pub project_id: Option<String>,
+    pub archived: bool,
 }
 
 /// Filters for `session purge` / `session strip-reasoning`; set filters
@@ -95,6 +106,19 @@ pub struct PurgeFilter {
     /// Keep the N most recent matching sessions (and, for purge, their
     /// ancestors); `0` keeps nothing.
     pub keep_latest: Option<i64>,
+    /// Raw `--keep-latest-per-project` argument as given (for JSON output).
+    pub keep_latest_per_project_raw: Option<String>,
+    /// Keep the N most recent matching sessions per project (and, for
+    /// purge, their ancestors); `0` keeps nothing. Mutually exclusive
+    /// with `keep_latest`.
+    pub keep_latest_per_project: Option<i64>,
+    /// Only archived sessions (`time_archived` set).
+    pub archived: bool,
+    /// Exact session `directory` prefixes (repeatable, OR): matches the
+    /// directory itself and anything below it.
+    pub path_prefixes: Vec<String>,
+    /// Only sessions with no content rows (zero size).
+    pub empty: bool,
 }
 
 impl PurgeFilter {
@@ -104,6 +128,10 @@ impl PurgeFilter {
             && self.paths.is_empty()
             && self.larger_than_raw.is_none()
             && self.keep_latest_raw.is_none()
+            && self.keep_latest_per_project_raw.is_none()
+            && !self.archived
+            && self.path_prefixes.is_empty()
+            && !self.empty
     }
 
     /// Same as `matches_meta` plus the size check (which needs the
@@ -116,6 +144,8 @@ impl PurgeFilter {
             directory: s.directory.clone(),
             parent_id: s.parent_id.clone(),
             updated: s.updated,
+            project_id: None,
+            archived: s.archived,
         };
         if !self.matches_meta(&meta) {
             return false;
@@ -124,6 +154,9 @@ impl PurgeFilter {
             if s.size_bytes() <= min {
                 return false;
             }
+        }
+        if self.empty && s.size_bytes() != 0 {
+            return false;
         }
         true
     }
@@ -139,9 +172,21 @@ impl PurgeFilter {
         if self.subagents && m.parent_id.is_none() {
             return false;
         }
+        if self.archived && !m.archived {
+            return false;
+        }
         if !self.paths.is_empty() {
             let dir = m.directory.trim_end_matches('/');
             if !self.paths.iter().any(|p| p.trim_end_matches('/') == dir) {
+                return false;
+            }
+        }
+        if !self.path_prefixes.is_empty() {
+            let dir = m.directory.trim_end_matches('/');
+            if !self.path_prefixes.iter().any(|p| {
+                let p = p.trim_end_matches('/');
+                dir == p || dir.starts_with(&format!("{p}/"))
+            }) {
                 return false;
             }
         }
@@ -154,8 +199,12 @@ impl PurgeFilter {
             older_than: self.older_than_raw.clone(),
             subagents: self.subagents,
             paths: self.paths.clone(),
+            path_prefixes: self.path_prefixes.clone(),
+            archived: self.archived,
+            empty: self.empty,
             larger_than: self.larger_than_raw.clone(),
             keep_latest: self.keep_latest_raw.clone(),
+            keep_latest_per_project: self.keep_latest_per_project_raw.clone(),
         }
     }
 }
@@ -166,8 +215,12 @@ pub struct PurgeFilterJson {
     pub older_than: Option<String>,
     pub subagents: bool,
     pub paths: Vec<String>,
+    pub path_prefixes: Vec<String>,
+    pub archived: bool,
+    pub empty: bool,
     pub larger_than: Option<String>,
     pub keep_latest: Option<String>,
+    pub keep_latest_per_project: Option<String>,
 }
 
 #[derive(Clone)]
@@ -176,18 +229,19 @@ pub struct ProjectRow {
     pub worktree: String,
     pub name: String,
     pub sessions: i64,
-    pub msgs: i64,
-    pub msg_bytes: i64,
-    pub parts: i64,
-    pub part_bytes: i64,
+    pub sm_msgs: i64,
+    pub sm_bytes: i64,
     pub events: i64,
     pub event_bytes: i64,
+    pub inbox_bytes: i64,
+    pub pending_bytes: i64,
+    pub instr_bytes: i64,
     pub cost: f64,
     pub updated: i64,
 }
 
 pub fn project_total_bytes(p: &ProjectRow) -> i64 {
-    p.msg_bytes + p.part_bytes + p.event_bytes
+    p.sm_bytes + p.event_bytes + p.inbox_bytes + p.pending_bytes + p.instr_bytes
 }
 
 /// JSON shape of a project in `project list` / `project show`.
@@ -197,9 +251,8 @@ pub struct ProjectOut {
     pub worktree: String,
     pub name: String,
     pub sessions: i64,
-    pub msgs: i64,
-    pub parts: i64,
     pub events: i64,
+    pub session_messages: i64,
     pub size_bytes: i64,
     pub cost: f64,
     pub updated: String,
@@ -211,9 +264,8 @@ pub fn project_json(p: &ProjectRow) -> ProjectOut {
         worktree: p.worktree.clone(),
         name: p.name.clone(),
         sessions: p.sessions,
-        msgs: p.msgs,
-        parts: p.parts,
         events: p.events,
+        session_messages: p.sm_msgs,
         size_bytes: project_total_bytes(p),
         cost: round4(p.cost),
         updated: dt(p.updated),
@@ -243,11 +295,13 @@ pub struct ProjectFilter {
     pub cutoff_ms: Option<i64>,
     /// Exact project `worktree` matches (repeatable, OR).
     pub paths: Vec<String>,
+    /// Only projects with no sessions.
+    pub empty: bool,
 }
 
 impl ProjectFilter {
     pub fn is_empty(&self) -> bool {
-        self.older_than_raw.is_none() && self.paths.is_empty()
+        self.older_than_raw.is_none() && self.paths.is_empty() && !self.empty
     }
 
     pub fn matches(&self, p: &ProjectRow) -> bool {
@@ -262,6 +316,9 @@ impl ProjectFilter {
                 return false;
             }
         }
+        if self.empty && p.sessions != 0 {
+            return false;
+        }
         true
     }
 
@@ -270,6 +327,7 @@ impl ProjectFilter {
         ProjectFilterJson {
             older_than: self.older_than_raw.clone(),
             paths: self.paths.clone(),
+            empty: self.empty,
         }
     }
 }
@@ -279,6 +337,7 @@ impl ProjectFilter {
 pub struct ProjectFilterJson {
     pub older_than: Option<String>,
     pub paths: Vec<String>,
+    pub empty: bool,
 }
 
 #[cfg(test)]
@@ -295,20 +354,24 @@ mod tests {
             directory: "/a".into(),
             parent_id: None,
             updated: 1136214245000,
-            msgs: 1,
-            msg_bytes: 10,
-            parts: 2,
-            part_bytes: 20,
+            archived: true,
             events: 3,
             event_bytes: 30,
-            diff_bytes: 5,
+            sm_msgs: 4,
+            sm_bytes: 40,
+            inbox_msgs: 1,
+            inbox_bytes: 10,
+            pending_msgs: 2,
+            pending_bytes: 20,
+            instr_bytes: 5,
             cost: 0.004594,
         };
         let v = serde_json::to_value(session_json(&s)).unwrap();
         let expected = serde_json::json!({
             "id": "ses_1", "title": "t", "directory": "/a", "parent_id": null,
-            "updated": "2006-01-02T15:04:05Z", "msgs": 1, "parts": 2, "events": 3,
-            "size_bytes": 60, "diff_bytes": 5, "cost": 0.0046
+            "updated": "2006-01-02T15:04:05Z", "archived": true, "events": 3,
+            "session_messages": 4, "inbox": 1, "pending": 2,
+            "size_bytes": 105, "cost": 0.0046
         });
         assert_eq!(v, expected, "session JSON contract changed");
     }
@@ -320,19 +383,20 @@ mod tests {
             worktree: "/w".into(),
             name: "n".into(),
             sessions: 1,
-            msgs: 1,
-            msg_bytes: 10,
-            parts: 2,
-            part_bytes: 20,
+            sm_msgs: 4,
+            sm_bytes: 40,
             events: 3,
             event_bytes: 30,
+            inbox_bytes: 10,
+            pending_bytes: 20,
+            instr_bytes: 5,
             cost: 0.004594,
             updated: 1136214245000,
         };
         let v = serde_json::to_value(project_json(&p)).unwrap();
         let expected = serde_json::json!({
             "id": "p1", "worktree": "/w", "name": "n", "sessions": 1,
-            "msgs": 1, "parts": 2, "events": 3, "size_bytes": 60,
+            "events": 3, "session_messages": 4, "size_bytes": 105,
             "cost": 0.0046, "updated": "2006-01-02T15:04:05Z"
         });
         assert_eq!(v, expected, "project JSON contract changed");
@@ -345,13 +409,16 @@ mod tests {
             directory: dir.to_string(),
             parent_id: None,
             updated: 0,
-            msgs: 0,
-            msg_bytes: 0,
-            parts: 0,
-            part_bytes: 0,
+            archived: false,
             events: 0,
             event_bytes: 0,
-            diff_bytes: 0,
+            sm_msgs: 0,
+            sm_bytes: 0,
+            inbox_msgs: 0,
+            inbox_bytes: 0,
+            pending_msgs: 0,
+            pending_bytes: 0,
+            instr_bytes: 0,
             cost: 0.0,
         }
     }
@@ -491,9 +558,9 @@ mod tests {
             ..Default::default()
         };
         let mut small = row("/a");
-        small.part_bytes = 10;
+        small.sm_bytes = 10;
         let mut big = row("/a");
-        big.part_bytes = 11;
+        big.sm_bytes = 11;
         assert!(!filter(&f, &small));
         assert!(filter(&f, &big));
     }

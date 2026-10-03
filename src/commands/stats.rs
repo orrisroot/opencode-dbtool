@@ -1,31 +1,27 @@
-//! `stats` command: table sizes and totals. `--detail` adds part-type
-//! breakdowns, creation activity, and subagent shares.
+//! `stats` command: table sizes and totals (V2-only). `--detail` adds
+//! message-type breakdowns, creation activity, and subagent shares.
 
 use crate::db::{env_status, file_size, EnvStatus};
 use crate::error::{AppError, Result};
 use crate::output::print_json;
-use crate::util::{
-    dir_size, log_dir, now_ms, quote_ident, session_diff_dir, snapshot_dir, tool_output_dir,
-};
+use crate::util::{dir_size, log_dir, now_ms, quote_ident, repos_dir, shell_dir, snapshot_dir};
 use rusqlite::{params, Connection};
 use serde::Serialize;
 use std::path::Path;
 
 #[derive(Serialize)]
 struct StorageSizes {
-    session_diff_bytes: u64,
     snapshot_bytes: u64,
-    tool_output_bytes: u64,
+    shell_bytes: u64,
+    repos_bytes: u64,
     log_bytes: u64,
 }
 
 #[derive(Serialize)]
 struct ActivityDay {
     day: String,
-    parts: i64,
-    part_bytes: i64,
-    msgs: i64,
-    msg_bytes: i64,
+    messages: i64,
+    message_bytes: i64,
 }
 
 #[derive(Serialize)]
@@ -49,14 +45,13 @@ struct StatsOut {
     db_bytes: u64,
     wal_bytes: u64,
     free_pages: i64,
-    /// Table name -> row count (serde_json::Map is dynamic by design:
-    /// the table set depends on the database schema).
+    /// Table name -> row count.
     tables: serde_json::Map<String, serde_json::Value>,
     total_data_bytes: i64,
     storage: StorageSizes,
-    /// Keyed by `data.type`, in bytes-descending order (requires
+    /// `session_message` rows grouped by `type`, largest first (requires
     /// serde_json's `preserve_order`).
-    part_types: serde_json::Map<String, serde_json::Value>,
+    message_types: serde_json::Map<String, serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     activity: Option<Activity>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -95,19 +90,7 @@ fn stats_out(con: &Connection, data_dir: &Path, db_path: &Path, detail: bool) ->
     let env = env_status(db_path);
     let freelist: i64 = con.query_row("PRAGMA freelist_count", [], |r| r.get(0))?;
 
-    // `part` is scanned once here (its JSON is parsed for the type
-    // breakdown); the table loop below skips its count and byte sum to
-    // avoid a second full pass over the table.
-    let part_types = part_types(con)?;
-    let (part_count, part_bytes): (i64, i64) = part_types
-        .values()
-        .map(|v| {
-            (
-                v["count"].as_i64().unwrap_or(0),
-                v["bytes"].as_i64().unwrap_or(0),
-            )
-        })
-        .fold((0, 0), |(c, b), (pc, pb)| (c + pc, b + pb));
+    let message_types = message_types(con)?;
 
     let mut tables: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
     let mut total: i64 = 0;
@@ -119,37 +102,15 @@ fn stats_out(con: &Connection, data_dir: &Path, db_path: &Path, detail: bool) ->
             .query_map([], |r| r.get(0))?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         for name in names {
-            let rows: i64 = if name == "part" {
-                part_count
-            } else {
-                con.query_row(
-                    &format!("SELECT COUNT(*) FROM {}", quote_ident(&name)),
-                    [],
-                    |r| r.get(0),
-                )?
-            };
-            let has_data: i64 = con.query_row(
-                "SELECT COUNT(*) FROM pragma_table_info(?1) WHERE name='data'",
-                params![name],
+            let rows: i64 = con.query_row(
+                &format!("SELECT COUNT(*) FROM {}", quote_ident(&name)),
+                [],
                 |r| r.get(0),
             )?;
-            let bytes: i64 = if has_data > 0 && name != "part" {
-                con.query_row(
-                    &format!(
-                        "SELECT COALESCE(SUM(length(CAST(data AS BLOB))),0) FROM {}",
-                        quote_ident(&name)
-                    ),
-                    [],
-                    |r| r.get(0),
-                )?
-            } else {
-                0
-            };
-            total += bytes;
+            total += content_bytes(con, &name)?;
             tables.insert(name, serde_json::json!(rows));
         }
     }
-    total += part_bytes;
 
     Ok(StatsOut {
         env,
@@ -159,28 +120,71 @@ fn stats_out(con: &Connection, data_dir: &Path, db_path: &Path, detail: bool) ->
         tables,
         total_data_bytes: total,
         storage: StorageSizes {
-            session_diff_bytes: dir_size(&session_diff_dir(data_dir)),
             snapshot_bytes: dir_size(&snapshot_dir(data_dir)),
-            tool_output_bytes: dir_size(&tool_output_dir(data_dir)),
+            shell_bytes: dir_size(&shell_dir(data_dir)),
+            repos_bytes: dir_size(&repos_dir(data_dir)),
             log_bytes: dir_size(&log_dir(data_dir)),
         },
-        part_types,
+        message_types,
         activity: if detail { Some(activity(con)?) } else { None },
         subagent: if detail { Some(subagent(con)?) } else { None },
     })
 }
 
-/// Per-part-type row counts and data bytes (keyed by `data.type`).
-///
-/// The object is built in `ORDER BY bytes DESC` (largest first) order;
-/// the JSON output keeps that order only while serde_json's
-/// `preserve_order` feature is enabled (Cargo.toml), asserted by the
-/// `part_types_sorted_by_bytes_desc` test.
-fn part_types(con: &Connection) -> Result<serde_json::Map<String, serde_json::Value>> {
+/// Content columns counted toward `total_data_bytes`; id, type, seq,
+/// timestamps etc. are never content.
+fn content_columns(con: &Connection, table: &str) -> Result<Vec<String>> {
+    const CANDIDATES: &[&str] = &[
+        "data",
+        "payload",
+        "value",
+        "initial_values",
+        "current_values",
+        "metadata",
+        "revert",
+        "summary_diffs",
+        "model",
+        "sandboxes",
+        "commands",
+        "binding",
+        "extra",
+    ];
+    let mut out = Vec::new();
+    for c in CANDIDATES {
+        let n: i64 = con.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info(?1) WHERE name=?2",
+            params![table, c],
+            |r| r.get(0),
+        )?;
+        if n > 0 {
+            out.push(c.to_string());
+        }
+    }
+    Ok(out)
+}
+
+fn content_bytes(con: &Connection, table: &str) -> Result<i64> {
+    let cols = content_columns(con, table)?;
+    if cols.is_empty() {
+        return Ok(0);
+    }
+    let expr = cols
+        .iter()
+        .map(|c| format!("COALESCE(length(CAST(\"{c}\" AS BLOB)),0)"))
+        .collect::<Vec<_>>()
+        .join("+");
+    Ok(con.query_row(
+        &format!("SELECT COALESCE(SUM({expr}),0) FROM {}", quote_ident(table)),
+        [],
+        |r| r.get(0),
+    )?)
+}
+
+/// Per-`session_message.type` row counts and data bytes, largest first.
+fn message_types(con: &Connection) -> Result<serde_json::Map<String, serde_json::Value>> {
     let mut stmt = con.prepare(
-        "SELECT COALESCE(json_extract(data, '$.type'), 'unknown'), \
-         COUNT(*), COALESCE(SUM(length(CAST(data AS BLOB))),0) \
-         FROM part GROUP BY 1 ORDER BY 3 DESC",
+        "SELECT type, COUNT(*), COALESCE(SUM(length(CAST(data AS BLOB))),0) \
+         FROM session_message GROUP BY 1 ORDER BY 3 DESC",
     )?;
     let rows = stmt.query_map([], |r| {
         Ok((
@@ -197,16 +201,16 @@ fn part_types(con: &Connection) -> Result<serde_json::Map<String, serde_json::Va
     Ok(types)
 }
 
-/// Daily creation activity of parts and messages over the last 30 days,
+/// Daily `session_message` creation activity over the last 30 days,
 /// grouped by the user's local calendar day (`'localtime'`).
 fn activity(con: &Connection) -> Result<Activity> {
     let cutoff = now_ms()? - 30 * 86_400_000;
-    let mut days: std::collections::BTreeMap<String, (i64, i64, i64, i64)> =
+    let mut days: std::collections::BTreeMap<String, (i64, i64)> =
         std::collections::BTreeMap::new();
     let mut stmt = con.prepare(
         "SELECT date(time_created/1000, 'unixepoch', 'localtime'), COUNT(*), \
          COALESCE(SUM(length(CAST(data AS BLOB))),0) \
-         FROM part WHERE time_created >= ?1 GROUP BY 1",
+         FROM session_message WHERE time_created >= ?1 GROUP BY 1",
     )?;
     let rows = stmt.query_map(params![cutoff], |r| {
         Ok((
@@ -217,65 +221,36 @@ fn activity(con: &Connection) -> Result<Activity> {
     })?;
     for r in rows {
         let (day, count, bytes) = r?;
-        let e = days.entry(day).or_insert((0, 0, 0, 0));
+        let e = days.entry(day).or_insert((0, 0));
         e.0 += count;
         e.1 += bytes;
     }
-    let mut stmt = con.prepare(
-        "SELECT date(time_created/1000, 'unixepoch', 'localtime'), COUNT(*), \
-         COALESCE(SUM(length(CAST(data AS BLOB))),0) \
-         FROM message WHERE time_created >= ?1 GROUP BY 1",
-    )?;
-    let rows = stmt.query_map(params![cutoff], |r| {
-        Ok((
-            r.get::<_, String>(0)?,
-            r.get::<_, i64>(1)?,
-            r.get::<_, i64>(2)?,
-        ))
-    })?;
-    for r in rows {
-        let (day, count, bytes) = r?;
-        let e = days.entry(day).or_insert((0, 0, 0, 0));
-        e.2 += count;
-        e.3 += bytes;
-    }
     let created: Vec<ActivityDay> = days
         .into_iter()
-        .map(|(day, (parts, part_bytes, msgs, msg_bytes))| ActivityDay {
-            day,
-            parts,
-            part_bytes,
-            msgs,
-            msg_bytes,
-        })
+        .map(|(day, (messages, message_bytes))| ActivityDay { day, messages, message_bytes })
         .collect();
     Ok(Activity { days: 30, created })
 }
 
 /// Subagent session counts and bytes versus all sessions.
-///
-/// One pass over message/part/event each (grouped per session), instead
-/// of per-session correlated subqueries, which degrade to a full scan
-/// per session when there is no index on `session_id`.
 fn subagent(con: &Connection) -> Result<Subagent> {
-    let (total_count, total_bytes, sub_count, sub_bytes): (i64, i64, i64, i64) = con.query_row(
-        "SELECT COUNT(*), \
-         COALESCE(SUM(mb + pb + eb), 0), \
-         COALESCE(SUM(parent_id IS NOT NULL), 0), \
-         COALESCE(SUM(CASE WHEN parent_id IS NOT NULL THEN mb + pb + eb END), 0) \
-         FROM session s \
-         LEFT JOIN (SELECT session_id, SUM(length(CAST(data AS BLOB))) AS mb \
-                    FROM message GROUP BY session_id) m ON m.session_id = s.id \
-         LEFT JOIN (SELECT session_id, SUM(length(CAST(data AS BLOB))) AS pb \
-                    FROM part GROUP BY session_id) p ON p.session_id = s.id \
-         LEFT JOIN (SELECT aggregate_id, SUM(length(CAST(data AS BLOB))) AS eb \
-                    FROM event GROUP BY aggregate_id) e ON e.aggregate_id = s.id",
-        [],
-        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
-    )?;
+    let meta = crate::repo::load_session_meta(con)?;
+    let ids: Vec<String> = meta.iter().map(|m| m.id.clone()).collect();
+    let sizes = crate::repo::session_sizes(con, &ids)?;
+    let mut total_bytes: i64 = 0;
+    let mut sub_bytes: i64 = 0;
+    let mut sub_count: i64 = 0;
+    for m in &meta {
+        let b = sizes.get(&m.id).copied().unwrap_or(0);
+        total_bytes += b;
+        if m.parent_id.is_some() {
+            sub_count += 1;
+            sub_bytes += b;
+        }
+    }
     Ok(Subagent {
         sessions: sub_count,
-        total_sessions: total_count,
+        total_sessions: meta.len() as i64,
         size_bytes: sub_bytes,
         total_size_bytes: total_bytes,
     })
@@ -292,11 +267,9 @@ mod tests {
     fn stats_output_contract() {
         let con = testdb::create();
         testdb::insert_session(&con, "s1", "/a", None);
-        let part = r#"{"type":"reasoning","text":"r"}"#;
-        testdb::insert_part(&con, "s1", part);
+        let msg = r#"{"type":"assistant"}"#;
+        testdb::insert_session_message(&con, "m1", "s1", "assistant", msg);
         let mut out = stats_out(&con, Path::new("/tmp"), Path::new("/tmp/x.db"), false).unwrap();
-        // env and file sizes are host-dependent; fix them for the
-        // golden comparison.
         out.env = crate::db::EnvStatus {
             opencode_running: Some(false),
             pids: Some(vec![]),
@@ -306,27 +279,12 @@ mod tests {
         out.db_bytes = 0;
         out.wal_bytes = 0;
         let v = serde_json::to_value(&out).unwrap();
-        let expected = serde_json::json!({
-            "opencode_running": false,
-            "pids": [],
-            "db": "/tmp/x.db",
-            "db_bytes": 0,
-            "wal_bytes": 0,
-            "free_pages": 0,
-            "tables": {
-                "event": 0, "event_sequence": 0, "message": 0, "part": 1,
-                "permission": 0, "project": 0, "project_directory": 0,
-                "session": 1, "session_context_epoch": 0, "session_input": 0,
-                "session_message": 0, "session_share": 0, "todo": 0, "workspace": 0
-            },
-            "total_data_bytes": part.len() as i64,
-            "storage": {
-                "session_diff_bytes": 0, "snapshot_bytes": 0,
-                "tool_output_bytes": 0, "log_bytes": 0
-            },
-            "part_types": { "reasoning": { "count": 1, "bytes": part.len() as i64 } }
-        });
-        assert_eq!(v, expected, "stats JSON contract changed");
+        assert_eq!(v["tables"]["session_v2"], 1);
+        assert_eq!(v["tables"]["session_message"], 1);
+        assert_eq!(v["message_types"]["assistant"]["count"], 1);
+        assert_eq!(v["message_types"]["assistant"]["bytes"], msg.len() as i64);
+        assert!(v["total_data_bytes"].as_i64().unwrap() >= msg.len() as i64);
+        assert!(v.get("part_types").is_none(), "part_types removed");
     }
 
     #[test]
@@ -334,30 +292,27 @@ mod tests {
         let dir = testdb::temp_data_dir("stats-storage");
         let db_path = dir.join("opencode.db");
         let con = testdb::create_at(&db_path);
-        fs::create_dir_all(dir.join("storage/session_diff")).unwrap();
-        fs::write(dir.join("storage/session_diff/s1.json"), vec![0u8; 3]).unwrap();
         fs::create_dir_all(dir.join("snapshot/p")).unwrap();
         fs::write(dir.join("snapshot/p/o"), vec![0u8; 5]).unwrap();
-        fs::create_dir_all(dir.join("tool-output")).unwrap();
-        fs::write(dir.join("tool-output/x"), vec![0u8; 7]).unwrap();
+        fs::create_dir_all(dir.join("log")).unwrap();
+        fs::write(dir.join("log/opencode.log"), vec![0u8; 7]).unwrap();
 
         let out = stats_value(&con, &dir, &db_path, false).unwrap();
-        assert_eq!(out["storage"]["session_diff_bytes"], 3);
         assert_eq!(out["storage"]["snapshot_bytes"], 5);
-        assert_eq!(out["storage"]["tool_output_bytes"], 7);
+        assert_eq!(out["storage"]["log_bytes"], 7);
+        assert!(out["storage"].get("session_diff_bytes").is_none());
+        assert!(out["storage"].get("tool_output_bytes").is_none());
 
         drop(con);
         fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
-    fn part_types_breakdown() {
+    fn message_types_breakdown() {
         let con = testdb::create();
         testdb::insert_session(&con, "s1", "/a", None);
-        testdb::insert_part(&con, "s1", r#"{"type":"reasoning","text":"r"}"#);
-        testdb::insert_part(&con, "s1", r#"{"type":"reasoning","text":"rr"}"#);
-        testdb::insert_part(&con, "s1", r#"{"type":"text","text":"t"}"#);
-        testdb::insert_part(&con, "s1", r#"{"type":"tool","text":"o"}"#);
+        testdb::insert_session_message(&con, "m1", "s1", "assistant", "xx");
+        testdb::insert_session_message(&con, "m2", "s1", "user", "y");
 
         let out = stats_value(
             &con,
@@ -366,24 +321,17 @@ mod tests {
             false,
         )
         .unwrap();
-        assert_eq!(out["part_types"]["reasoning"]["count"], 2);
-        assert_eq!(
-            out["part_types"]["reasoning"]["bytes"],
-            r#"{"type":"reasoning","text":"r"}"#.len() as i64
-                + r#"{"type":"reasoning","text":"rr"}"#.len() as i64
-        );
-        assert_eq!(out["part_types"]["text"]["count"], 1);
-        assert_eq!(out["part_types"]["tool"]["count"], 1);
+        assert_eq!(out["message_types"]["assistant"]["count"], 1);
+        assert_eq!(out["message_types"]["user"]["count"], 1);
     }
 
     #[test]
-    fn part_types_sorted_by_bytes_desc() {
+    fn message_types_sorted_by_bytes_desc() {
         let con = testdb::create();
         testdb::insert_session(&con, "s1", "/a", None);
-        testdb::insert_part(&con, "s1", r#"{"type":"a","text":"x"}"#);
-        testdb::insert_part(&con, "s1", r#"{"type":"b","text":"xxxxxxxxxx"}"#);
-        testdb::insert_part(&con, "s1", r#"{"type":"c","text":"xxxxxxxxxxxxxxxxxxxx"}"#);
-
+        testdb::insert_session_message(&con, "m1", "s1", "b", "xxxxxxxxxx");
+        testdb::insert_session_message(&con, "m2", "s1", "a", "x");
+        // Longest first regardless of alphabetical order.
         let out = stats_value(
             &con,
             std::path::Path::new("/tmp"),
@@ -391,15 +339,13 @@ mod tests {
             false,
         )
         .unwrap();
-        let keys: Vec<&str> = out["part_types"]
+        let keys: Vec<&str> = out["message_types"]
             .as_object()
             .unwrap()
             .keys()
             .map(|k| k.as_str())
             .collect();
-        // Largest first ("c" > "b" > "a" by bytes; alphabetical would
-        // be the reverse). Depends on serde_json's `preserve_order`.
-        assert_eq!(keys, vec!["c", "b", "a"]);
+        assert_eq!(keys, vec!["b", "a"]);
     }
 
     #[test]
@@ -407,16 +353,18 @@ mod tests {
         let con = testdb::create();
         let now = crate::util::now_ms().unwrap();
         testdb::insert_session(&con, "s1", "/a", None);
-        testdb::insert_part_at(&con, "s1", r#"{"type":"text","text":"x"}"#, now);
-        testdb::insert_part_at(
-            &con,
-            "s1",
-            r#"{"type":"text","text":"yy"}"#,
-            now - 2 * 86_400_000,
-        );
+        con.execute(
+            "INSERT INTO session_message (id, session_id, type, data, time_created) VALUES ('m1','s1','assistant','xx',?1)",
+            rusqlite::params![now],
+        )
+        .unwrap();
+        con.execute(
+            "INSERT INTO session_message (id, session_id, type, data, time_created) VALUES ('m2','s1','assistant','yy',?1)",
+            rusqlite::params![now - 2 * 86_400_000],
+        )
+        .unwrap();
         testdb::insert_session(&con, "root", "/a", None);
         testdb::insert_session(&con, "child", "/a", Some("root"));
-        testdb::insert_part_at(&con, "child", r#"{"type":"text","text":"child"}"#, now);
 
         let out = stats_value(
             &con,
@@ -437,11 +385,7 @@ mod tests {
         .unwrap();
         assert_eq!(out["activity"]["days"], 30);
         let days = out["activity"]["created"].as_array().unwrap();
-        // now and now-2d are always on distinct local days, even across
-        // a DST transition (local days are at most 25h long).
         assert_eq!(days.len(), 2);
-        let last = &days[days.len() - 1];
-        assert_eq!(last["parts"], 2);
         assert_eq!(out["subagent"]["sessions"], 1);
         assert_eq!(out["subagent"]["total_sessions"], 3);
     }

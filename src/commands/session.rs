@@ -1,14 +1,14 @@
 //! `session` subcommands: list, show, delete, purge, strip-reasoning.
+//! V2-only.
 
-use crate::db::{env_status, EnvStatus};
+use crate::db::{env_status, EnvStatus, SESSION_TABLE};
 use crate::error::{AppError, Result};
 use crate::models::{session_json, PurgeFilter, PurgeFilterJson, SessionOut};
 use crate::output::print_json;
 use crate::repo::{
     assistant_messages, child_session_ids, load_session, load_session_meta, load_sessions,
-    reasoning_counts, reasoning_event_counts, reasoning_events_left, reasoning_left,
-    reasoning_messages_left, resolve_session_ids, rewrite_message, session_sizes, strip_reasoning,
-    strip_reasoning_events,
+    reasoning_event_counts, reasoning_events_left, reasoning_messages_left,
+    resolve_session_ids, rewrite_message, session_sizes, strip_reasoning_events,
 };
 use rusqlite::Connection;
 use serde::Serialize;
@@ -16,7 +16,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use crate::util::{
-    now_ms, parse_age_ms, parse_count, parse_size_bytes, session_diff_dir, SQL_VAR_CHUNK,
+    now_ms, parse_age_ms, parse_count, parse_size_bytes, SQL_VAR_CHUNK,
 };
 
 /// One session in a delete/purge preview.
@@ -40,10 +40,6 @@ struct DeleteOut {
     sessions: Vec<DeleteSessionRow>,
     deleted: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
-    diff_files_removed: Option<usize>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    diff_bytes_removed: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     note: Option<String>,
 }
 
@@ -64,8 +60,6 @@ impl DeleteOut {
             total_rows,
             sessions,
             deleted: false,
-            diff_files_removed: None,
-            diff_bytes_removed: None,
             note: None,
         }
     }
@@ -75,8 +69,6 @@ impl DeleteOut {
 #[derive(Serialize)]
 struct StripSession {
     id: String,
-    reasoning_parts: i64,
-    reasoning_bytes: i64,
     reasoning_events: i64,
     reasoning_event_bytes: i64,
     messages_rewritten: i64,
@@ -92,8 +84,6 @@ struct StripOut {
     filters: PurgeFilterJson,
     sessions: Vec<StripSession>,
     total_sessions: usize,
-    total_reasoning_parts: i64,
-    total_reasoning_bytes: i64,
     total_reasoning_events: i64,
     total_reasoning_event_bytes: i64,
     total_messages_rewritten: i64,
@@ -103,14 +93,13 @@ struct StripOut {
     note: Option<String>,
 }
 
-pub fn cmd_session_list(con: &Connection, data_dir: &Path, args: &[String]) -> Result<()> {
-    print_json(&session_list_value(con, data_dir, args)?)
+pub fn cmd_session_list(con: &Connection, args: &[String]) -> Result<()> {
+    print_json(&session_list_value(con, args)?)
 }
 
 /// Build the session list array (exposed for tests).
 pub fn session_list_value(
     con: &Connection,
-    data_dir: &Path,
     args: &[String],
 ) -> Result<serde_json::Value> {
     let mut limit: Option<usize> = None;
@@ -143,7 +132,7 @@ pub fn session_list_value(
             other => return Err(AppError::usage(format!("unknown option: {other}"))),
         }
     }
-    let mut sessions = load_sessions(con, Some(&session_diff_dir(data_dir)))?;
+    let mut sessions = load_sessions(con)?;
     if sort_size {
         sessions.sort_by(|a, b| {
             b.size_bytes()
@@ -158,23 +147,71 @@ pub fn session_list_value(
     Ok(serde_json::to_value(out)?)
 }
 
-pub fn cmd_session_show(con: &Connection, data_dir: &Path, args: &[String]) -> Result<()> {
-    if args.len() != 1 {
+pub fn cmd_session_show(con: &Connection, args: &[String]) -> Result<()> {
+    let mut messages = false;
+    let mut limit: usize = 50;
+    let mut limit_given = false;
+    let mut ids: Vec<&str> = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--messages" => {
+                messages = true;
+                i += 1;
+            }
+            "--limit" => {
+                let n = args
+                    .get(i + 1)
+                    .ok_or_else(|| AppError::usage("--limit requires a count"))?;
+                limit = parse_count(n)? as usize;
+                limit_given = true;
+                i += 2;
+            }
+            other if other.starts_with("--") => {
+                return Err(AppError::usage(format!("unknown option: {other}")));
+            }
+            id => {
+                ids.push(id);
+                i += 1;
+            }
+        }
+    }
+    if ids.len() != 1 || (limit_given && !messages) {
         return Err(AppError::usage(
-            "usage: opencode-dbtool session show <session-id>",
+            "usage: opencode-dbtool session show <session-id> [--messages [--limit <n>]]",
         ));
     }
-    let id = args[0].trim();
-    let s = load_session(con, id, Some(&session_diff_dir(data_dir)))?
+    let id = ids[0].trim();
+    let s = load_session(con, id)?
         .ok_or_else(|| AppError::usage(format!("session not found: {id}")))?;
-    print_json(&serde_json::to_value(session_json(&s))?)
+    let mut v = serde_json::to_value(session_json(&s))?;
+    if messages {
+        let (total, rows) = crate::repo::list_messages(con, id, limit)?;
+        let msgs: Vec<serde_json::Value> = rows
+            .iter()
+            .map(|m| {
+                let preview: String = m.data.chars().take(300).collect();
+                serde_json::json!({
+                    "id": m.id,
+                    "type": m.msg_type,
+                    "seq": m.seq,
+                    "time": crate::util::dt(m.created),
+                    "bytes": m.bytes,
+                    "preview": preview,
+                    "truncated": m.data.len() > preview.len(),
+                })
+            })
+            .collect();
+        v["messages"] = serde_json::Value::Array(msgs);
+        v["total_messages"] = serde_json::json!(total);
+    }
+    print_json(&v)
 }
 
 pub fn cmd_session_delete(
     con: &mut Connection,
     args: &[String],
     dry_run: bool,
-    data_dir: &Path,
     db_path: &Path,
 ) -> Result<()> {
     let ids = parse_id_args(args)?;
@@ -193,10 +230,8 @@ pub fn cmd_session_delete(
         return print_json(&serde_json::to_value(&out)?);
     }
 
-    let (diff_files, diff_bytes) = execute_delete(con, &resolved, data_dir)?;
+    execute_delete(con, &resolved)?;
     out.deleted = true;
-    out.diff_files_removed = Some(diff_files);
-    out.diff_bytes_removed = Some(diff_bytes);
     out.note = Some("file size is unchanged until `opencode-dbtool vacuum` is run".into());
     print_json(&serde_json::to_value(&out)?)
 }
@@ -206,13 +241,12 @@ pub fn cmd_session_purge(
     con: &mut Connection,
     args: &[String],
     dry_run: bool,
-    data_dir: &Path,
     db_path: &Path,
 ) -> Result<()> {
     let filters = parse_purge_args(args)?;
     if filters.is_empty() {
         return Err(AppError::usage(
-            "usage: opencode-dbtool session purge [--older-than <age>] [--subagents] [--path <dir>...] [--larger-than <size>] [--keep-latest <n>]",
+            "usage: opencode-dbtool session purge [--older-than <age>] [--subagents] [--archived] [--empty] [--path <dir>...] [--path-prefix <dir>...] [--larger-than <size>] [--keep-latest <n>] [--keep-latest-per-project <n>]",
         ));
     }
     let mut selected = select_ids(con, &filters, true)?;
@@ -231,10 +265,8 @@ pub fn cmd_session_purge(
         return print_json(&serde_json::to_value(&out)?);
     }
 
-    let (diff_files, diff_bytes) = execute_delete(con, &selected, data_dir)?;
+    execute_delete(con, &selected)?;
     out.deleted = true;
-    out.diff_files_removed = Some(diff_files);
-    out.diff_bytes_removed = Some(diff_bytes);
     out.note = Some("file size is unchanged until `opencode-dbtool vacuum` is run".into());
     print_json(&serde_json::to_value(&out)?)
 }
@@ -242,11 +274,11 @@ pub fn cmd_session_purge(
 /// Delete reasoning content of the sessions selected by filters (optional
 /// filters: none = every session). Conversation text is untouched.
 ///
-/// Reasoning lives in three places, all of which are stripped: V1 `part`
-/// rows, durable `event` rows (`session.next.reasoning.started` /
-/// `.ended`; the full text lives in `.ended`), and V2 `session_message`
-/// assistant content. Removing the events also prevents reasoning from
-/// being re-projected from the event log. Token/cost aggregates are kept.
+/// Reasoning lives in durable `event` rows
+/// (`session.next.reasoning.started` / `.ended`; the full text lives in
+/// `.ended`) and in `session_message` assistant `content[]`. Removing the
+/// events also prevents reasoning from being re-projected from the event
+/// log. Token/cost aggregates are kept.
 pub fn cmd_session_strip_reasoning(
     con: &mut Connection,
     args: &[String],
@@ -257,18 +289,13 @@ pub fn cmd_session_strip_reasoning(
     // No child expansion for strip: only matching sessions are stripped.
     let selected = select_ids(con, &filters, false)?;
 
-    // V1 parts and durable reasoning events, per session.
-    let mut part_map: std::collections::HashMap<String, (i64, i64)> =
-        std::collections::HashMap::new();
-    for (id, n, bytes) in reasoning_counts(con, &selected)? {
-        part_map.insert(id, (n, bytes));
-    }
+    // Durable reasoning events, per session.
     let mut event_map: std::collections::HashMap<String, (i64, i64)> =
         std::collections::HashMap::new();
     for (id, n, bytes) in reasoning_event_counts(con, &selected)? {
         event_map.insert(id, (n, bytes));
     }
-    // V2 session_message reasoning (requires parsing the JSON).
+    // session_message reasoning (requires parsing the JSON).
     let mut message_map: std::collections::HashMap<String, (i64, i64)> =
         std::collections::HashMap::new();
     let mut rewrites: Vec<(String, String, String)> = Vec::new(); // (id, session_id, new data)
@@ -283,12 +310,7 @@ pub fn cmd_session_strip_reasoning(
         }
     }
 
-    let mut all_ids: Vec<String> = part_map.keys().cloned().collect();
-    for id in event_map.keys() {
-        if !all_ids.contains(id) {
-            all_ids.push(id.clone());
-        }
-    }
+    let mut all_ids: Vec<String> = event_map.keys().cloned().collect();
     for id in message_map.keys() {
         if !all_ids.contains(id) {
             all_ids.push(id.clone());
@@ -297,26 +319,19 @@ pub fn cmd_session_strip_reasoning(
     all_ids.sort();
 
     let mut sessions_arr: Vec<StripSession> = Vec::new();
-    let mut total_parts: i64 = 0;
-    let mut total_part_bytes: i64 = 0;
     let mut total_events: i64 = 0;
     let mut total_event_bytes: i64 = 0;
     let mut total_messages: i64 = 0;
     let mut total_rewritten_bytes: i64 = 0;
     for id in &all_ids {
-        let (parts, part_bytes) = part_map.get(id).copied().unwrap_or((0, 0));
         let (events, event_bytes) = event_map.get(id).copied().unwrap_or((0, 0));
         let (messages, rewritten_bytes) = message_map.get(id).copied().unwrap_or((0, 0));
-        total_parts += parts;
-        total_part_bytes += part_bytes;
         total_events += events;
         total_event_bytes += event_bytes;
         total_messages += messages;
         total_rewritten_bytes += rewritten_bytes;
         sessions_arr.push(StripSession {
             id: id.clone(),
-            reasoning_parts: parts,
-            reasoning_bytes: part_bytes,
             reasoning_events: events,
             reasoning_event_bytes: event_bytes,
             messages_rewritten: messages,
@@ -330,8 +345,6 @@ pub fn cmd_session_strip_reasoning(
         filters: filters.json(),
         sessions: sessions_arr,
         total_sessions: 0,
-        total_reasoning_parts: total_parts,
-        total_reasoning_bytes: total_part_bytes,
         total_reasoning_events: total_events,
         total_reasoning_event_bytes: total_event_bytes,
         total_messages_rewritten: total_messages,
@@ -346,19 +359,12 @@ pub fn cmd_session_strip_reasoning(
 
     con.execute_batch("PRAGMA foreign_keys = ON;")?;
     let tx = con.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-    strip_reasoning(&tx, &selected)?;
     strip_reasoning_events(&tx, &selected)?;
     for (id, _session_id, new_data) in &rewrites {
         rewrite_message(&tx, id, new_data)?;
     }
     tx.commit()?;
 
-    let left = reasoning_left(con, &selected)?;
-    if left != 0 {
-        return Err(AppError::usage(format!(
-            "reasoning parts still remain after strip: {left}"
-        )));
-    }
     let events_left = reasoning_events_left(con, &selected)?;
     if events_left != 0 {
         return Err(AppError::usage(format!(
@@ -412,7 +418,9 @@ fn parse_id_args(args: &[String]) -> Result<Vec<String>> {
 }
 
 /// Parse purge/strip-reasoning filter flags: `--older-than <age>`,
-/// `--subagents`, `--path <dir>` (repeatable). Positional args are
+/// `--subagents`, `--archived`, `--empty`, `--path <dir>` (repeatable,
+/// exact), `--path-prefix <dir>` (repeatable), `--larger-than`,
+/// `--keep-latest`, `--keep-latest-per-project`. Positional args are
 /// rejected.
 fn parse_purge_args(args: &[String]) -> Result<PurgeFilter> {
     let mut f = PurgeFilter::default();
@@ -432,11 +440,26 @@ fn parse_purge_args(args: &[String]) -> Result<PurgeFilter> {
                 f.subagents = true;
                 i += 1;
             }
+            "--archived" => {
+                f.archived = true;
+                i += 1;
+            }
+            "--empty" => {
+                f.empty = true;
+                i += 1;
+            }
             "--path" => {
                 let p = args
                     .get(i + 1)
                     .ok_or_else(|| AppError::usage("--path requires a directory"))?;
                 f.paths.push(p.clone());
+                i += 2;
+            }
+            "--path-prefix" => {
+                let p = args
+                    .get(i + 1)
+                    .ok_or_else(|| AppError::usage("--path-prefix requires a directory"))?;
+                f.path_prefixes.push(p.clone());
                 i += 2;
             }
             "--larger-than" => {
@@ -457,54 +480,89 @@ fn parse_purge_args(args: &[String]) -> Result<PurgeFilter> {
                 f.keep_latest = Some(c);
                 i += 2;
             }
+            "--keep-latest-per-project" => {
+                let n = args.get(i + 1).ok_or_else(|| {
+                    AppError::usage("--keep-latest-per-project requires a count")
+                })?;
+                let c = parse_count(n)?;
+                f.keep_latest_per_project_raw = Some(n.clone());
+                f.keep_latest_per_project = Some(c);
+                i += 2;
+            }
             other => return Err(AppError::usage(format!("unknown option: {other}"))),
         }
+    }
+    if f.keep_latest.is_some() && f.keep_latest_per_project.is_some() {
+        return Err(AppError::usage(
+            "--keep-latest and --keep-latest-per-project are mutually exclusive",
+        ));
     }
     Ok(f)
 }
 
 /// Sessions matching the filters. `keep_latest` keeps the N most recent
-/// matches (by `time_updated`, id as tiebreaker); for purge it also
-/// protects their ancestors so deleting a parent can never orphan a
-/// kept session. `protect_ancestors` is off for strip-reasoning, which
-/// never deletes sessions.
+/// matches (by `time_updated`, id as tiebreaker); `keep_latest_per_project`
+/// keeps the N most recent matches *per project* instead. For purge both
+/// also protect the ancestors of kept sessions so deleting a parent can
+/// never orphan a kept session. `protect_ancestors` is off for
+/// strip-reasoning, which never deletes sessions.
 fn select_ids(
     con: &Connection,
     filters: &PurgeFilter,
     protect_ancestors: bool,
 ) -> Result<Vec<String>> {
     // Light selection: every session's filter fields, no aggregate
-    // counts. The size aggregate is only computed (batched) when the
-    // `--larger-than` filter actually needs it.
+    // counts. Size aggregates are only computed (batched) when a
+    // size-dependent filter actually needs them.
     let meta = load_session_meta(con)?;
     let mut selected: Vec<&crate::models::SessionMeta> =
         meta.iter().filter(|m| filters.matches_meta(m)).collect();
-    if let Some(min) = filters.larger_than_bytes {
+    if filters.larger_than_bytes.is_some() || filters.empty {
         let ids: Vec<String> = selected.iter().map(|m| m.id.clone()).collect();
         let sizes = session_sizes(con, &ids)?;
-        selected.retain(|m| sizes.get(&m.id).copied().unwrap_or(0) > min);
+        if let Some(min) = filters.larger_than_bytes {
+            selected.retain(|m| sizes.get(&m.id).copied().unwrap_or(0) > min);
+        }
+        if filters.empty {
+            selected.retain(|m| sizes.get(&m.id).copied().unwrap_or(0) == 0);
+        }
     }
+    // Kept sessions are excluded from the result; ancestor protection
+    // applies to both keep flavours on purge.
+    let mut kept: HashSet<&str> = HashSet::new();
     if let Some(n) = filters.keep_latest {
-        let mut kept: HashSet<&str> = HashSet::new();
         for s in selected.iter().take(n as usize) {
             kept.insert(s.id.as_str());
         }
-        if protect_ancestors {
-            // A kept session's ancestors must survive too: deleting a
-            // parent would orphan (or cascade-delete) the kept child.
-            let parents: HashMap<&str, Option<&str>> = meta
-                .iter()
-                .map(|m| (m.id.as_str(), m.parent_id.as_deref()))
-                .collect();
-            let mut stack: Vec<&str> = kept.iter().copied().collect();
-            while let Some(id) = stack.pop() {
-                if let Some(Some(pid)) = parents.get(id) {
-                    if kept.insert(pid) {
-                        stack.push(pid);
-                    }
+    } else if let Some(n) = filters.keep_latest_per_project {
+        // `meta` (and therefore `selected`) is ordered newest-first, so
+        // the first N matches per project are the ones to keep.
+        let mut per_project: HashMap<Option<&str>, usize> = HashMap::new();
+        for s in selected.iter() {
+            let count = per_project.entry(s.project_id.as_deref()).or_insert(0);
+            if (*count as i64) < n {
+                kept.insert(s.id.as_str());
+                *count += 1;
+            }
+        }
+    }
+    if protect_ancestors && !kept.is_empty() {
+        // A kept session's ancestors must survive too: deleting a
+        // parent would orphan (or cascade-delete) the kept child.
+        let parents: HashMap<&str, Option<&str>> = meta
+            .iter()
+            .map(|m| (m.id.as_str(), m.parent_id.as_deref()))
+            .collect();
+        let mut stack: Vec<&str> = kept.iter().copied().collect();
+        while let Some(id) = stack.pop() {
+            if let Some(Some(pid)) = parents.get(id) {
+                if kept.insert(pid) {
+                    stack.push(pid);
                 }
             }
         }
+    }
+    if filters.keep_latest.is_some() || filters.keep_latest_per_project.is_some() {
         selected.retain(|s| !kept.contains(s.id.as_str()));
     }
     Ok(selected.iter().map(|s| s.id.clone()).collect())
@@ -526,18 +584,18 @@ fn expand_children(con: &Connection, ids: &mut Vec<String>) -> Result<()> {
     Ok(())
 }
 
-/// Tables counted in a session delete preview, in the stable output
-/// order.
-const PREVIEW_TABLES: [(&str, &str); 9] = [
-    ("message", "session_id"),
-    ("part", "session_id"),
-    ("todo", "session_id"),
+/// Tables counted in a session delete preview, in stable output order.
+/// `event_sequence` rows reference aggregates (not sessions) and are deleted
+/// explicitly alongside `event` rows, so they are counted separately here to
+/// keep the dry-run total exact.
+const PREVIEW_TABLES: [(&str, &str); 7] = [
+    ("session_message", "session_id"),
+    ("session_inbox", "session_id"),
+    ("session_pending", "session_id"),
+    ("instruction_entry", "session_id"),
+    ("instruction_state", "session_id"),
     ("event", "aggregate_id"),
     ("event_sequence", "aggregate_id"),
-    ("session_share", "session_id"),
-    ("session_input", "session_id"),
-    ("session_message", "session_id"),
-    ("session_context_epoch", "session_id"),
 ];
 
 /// Per-session preview rows (id + per-table counts + total) and the
@@ -546,15 +604,15 @@ const PREVIEW_TABLES: [(&str, &str); 9] = [
 /// instead of per-session queries; every table key is present, zero
 /// counts included.
 fn preview_impact(con: &Connection, ids: &[String]) -> Result<(i64, Vec<DeleteSessionRow>)> {
-    let mut per_session = HashMap::<String, Vec<(&'static str, i64)>>::new();
+    let mut per_session = HashMap::<String, Vec<(&str, i64)>>::new();
     for (table, id_col) in PREVIEW_TABLES {
         for chunk in ids.chunks(SQL_VAR_CHUNK) {
             if chunk.is_empty() {
                 continue;
             }
             let sql = format!(
-                "SELECT {id_col}, COUNT(*) FROM {table} \
-                 WHERE {id_col} IN ({}) GROUP BY {id_col}",
+                "SELECT \"{id_col}\", COUNT(*) FROM \"{table}\" \
+                 WHERE \"{id_col}\" IN ({}) GROUP BY \"{id_col}\"",
                 placeholders(chunk.len())
             );
             let mut stmt = con.prepare(&sql)?;
@@ -594,20 +652,15 @@ fn placeholders(n: usize) -> String {
     vec!["?"; n].join(",")
 }
 
-/// Delete the given sessions in a single immediate transaction, verify
-/// they are gone, and remove their session_diff files (best-effort).
-/// Returns the number of diff files and bytes removed.
-fn execute_delete(
-    con: &mut Connection,
-    resolved: &[String],
-    data_dir: &Path,
-) -> Result<(usize, u64)> {
+/// Delete the given sessions in a single immediate transaction and verify
+/// they are gone. Related rows follow via `ON DELETE CASCADE`; `event` /
+/// `event_sequence` rows (which reference aggregates, not sessions) are
+/// deleted explicitly.
+fn execute_delete(con: &mut Connection, resolved: &[String]) -> Result<()> {
     con.execute_batch("PRAGMA foreign_keys = ON;")?;
     let tx = con.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     for chunk in resolved.chunks(SQL_VAR_CHUNK) {
         let in_sql = placeholders(chunk.len());
-        // event tables have no FK to session, so they must be deleted
-        // explicitly; the rest follows via ON DELETE CASCADE.
         tx.execute(
             &format!("DELETE FROM event WHERE aggregate_id IN ({in_sql})"),
             rusqlite::params_from_iter(chunk),
@@ -617,7 +670,7 @@ fn execute_delete(
             rusqlite::params_from_iter(chunk),
         )?;
         tx.execute(
-            &format!("DELETE FROM session WHERE id IN ({in_sql})"),
+            &format!("DELETE FROM \"{SESSION_TABLE}\" WHERE id IN ({in_sql})"),
             rusqlite::params_from_iter(chunk),
         )?;
     }
@@ -627,7 +680,7 @@ fn execute_delete(
     for chunk in resolved.chunks(SQL_VAR_CHUNK) {
         let in_sql = placeholders(chunk.len());
         let left: i64 = con.query_row(
-            &format!("SELECT COUNT(*) FROM session WHERE id IN ({in_sql})"),
+            &format!("SELECT COUNT(*) FROM \"{SESSION_TABLE}\" WHERE id IN ({in_sql})"),
             rusqlite::params_from_iter(chunk),
             |r| r.get(0),
         )?;
@@ -638,25 +691,7 @@ fn execute_delete(
             "sessions still exist after delete: {remaining}"
         )));
     }
-    Ok(remove_diff_files(data_dir, resolved))
-}
-
-/// Best-effort removal of `storage/session_diff/<id>.json` files;
-/// missing files are ignored. Returns (files removed, bytes removed).
-fn remove_diff_files(data_dir: &Path, ids: &[String]) -> (usize, u64) {
-    let dir = session_diff_dir(data_dir);
-    let mut removed = 0;
-    let mut bytes = 0;
-    for id in ids {
-        let p = dir.join(format!("{id}.json"));
-        if let Ok(meta) = std::fs::metadata(&p) {
-            if std::fs::remove_file(&p).is_ok() {
-                removed += 1;
-                bytes += meta.len();
-            }
-        }
-    }
-    (removed, bytes)
+    Ok(())
 }
 
 #[cfg(test)]
@@ -677,14 +712,13 @@ mod tests {
             &mut con,
             &["parent".to_string()],
             false,
-            Path::new("/tmp"),
             Path::new("/tmp/x.db"),
         )
         .unwrap();
 
         assert_eq!(testdb::session_count(&con), 1);
         let remaining: String = con
-            .query_row("SELECT id FROM session", [], |r| r.get(0))
+            .query_row("SELECT id FROM session_v2", [], |r| r.get(0))
             .unwrap();
         assert_eq!(remaining, "unrelated");
     }
@@ -699,14 +733,13 @@ mod tests {
             &mut con,
             &["child".to_string()],
             false,
-            Path::new("/tmp"),
             Path::new("/tmp/x.db"),
         )
         .unwrap();
 
         assert_eq!(testdb::session_count(&con), 1);
         let remaining: String = con
-            .query_row("SELECT id FROM session", [], |r| r.get(0))
+            .query_row("SELECT id FROM session_v2", [], |r| r.get(0))
             .unwrap();
         assert_eq!(remaining, "parent");
     }
@@ -720,7 +753,6 @@ mod tests {
             &mut con,
             &["--path".to_string(), "/a".to_string()],
             false,
-            Path::new("/tmp"),
             Path::new("/tmp/x.db"),
         )
         .unwrap_err();
@@ -732,17 +764,17 @@ mod tests {
     fn preview_rows_include_zero_tables() {
         let con = testdb::create();
         testdb::insert_session(&con, "s1", "/a", None);
-        testdb::insert_part(&con, "s1", r#"{"type":"text","text":"x"}"#);
+        testdb::insert_session_message(&con, "m1", "s1", "assistant", "{}");
 
         let (total, arr) = preview_impact(&con, &["s1".to_string()]).unwrap();
-        assert_eq!(total, 2); // session row + part row
+        assert_eq!(total, 2); // session row + session_message row
         let row = serde_json::to_value(&arr[0]).unwrap();
         let rows = row["rows"].as_object().unwrap();
-        assert_eq!(rows.len(), 9, "all counted tables present");
-        assert_eq!(rows["part"], 1);
-        assert_eq!(rows["message"], 0);
-        assert_eq!(rows["todo"], 0);
+        assert_eq!(rows.len(), 7, "all counted tables present");
+        assert_eq!(rows["session_message"], 1);
+        assert_eq!(rows["session_inbox"], 0);
         assert_eq!(rows["event"], 0);
+        assert_eq!(rows["event_sequence"], 0);
     }
 
     fn fixed_env(db: &str) -> crate::db::EnvStatus {
@@ -757,8 +789,8 @@ mod tests {
     #[test]
     fn delete_output_contract() {
         let mut rows = serde_json::Map::new();
-        rows.insert("part".into(), serde_json::json!(1));
-        rows.insert("message".into(), serde_json::json!(0));
+        rows.insert("session_message".into(), serde_json::json!(1));
+        rows.insert("session_inbox".into(), serde_json::json!(0));
         let out = DeleteOut {
             env: fixed_env("/tmp/x.db"),
             dry_run: true,
@@ -771,15 +803,13 @@ mod tests {
                 total: 2,
             }],
             deleted: false,
-            diff_files_removed: None,
-            diff_bytes_removed: None,
             note: None,
         };
         let v = serde_json::to_value(&out).unwrap();
         let expected = serde_json::json!({
             "opencode_running": false, "pids": [], "db": "/tmp/x.db",
             "dry_run": true, "action": "delete", "total_rows": 2,
-            "sessions": [ { "id": "ses_1", "rows": { "part": 1, "message": 0 }, "total": 2 } ],
+            "sessions": [ { "id": "ses_1", "rows": { "session_message": 1, "session_inbox": 0 }, "total": 2 } ],
             "deleted": false
         });
         assert_eq!(v, expected, "delete JSON contract changed");
@@ -797,21 +827,21 @@ mod tests {
                 older_than: Some("30d".into()),
                 subagents: true,
                 paths: vec!["/a".into()],
+                path_prefixes: vec![],
+                archived: false,
+                empty: false,
                 larger_than: None,
                 keep_latest: Some("1".into()),
+                keep_latest_per_project: None,
             },
             sessions: vec![StripSession {
                 id: "ses_1".into(),
-                reasoning_parts: 3,
-                reasoning_bytes: 100,
                 reasoning_events: 1,
                 reasoning_event_bytes: 50,
                 messages_rewritten: 2,
                 rewritten_bytes: 5,
             }],
             total_sessions: 1,
-            total_reasoning_parts: 3,
-            total_reasoning_bytes: 100,
             total_reasoning_events: 1,
             total_reasoning_event_bytes: 50,
             total_messages_rewritten: 2,
@@ -824,12 +854,13 @@ mod tests {
             "opencode_running": false, "pids": [], "db": "/tmp/x.db",
             "dry_run": true, "action": "strip-reasoning",
             "filters": { "older_than": "30d", "subagents": true, "paths": ["/a"],
-                         "larger_than": null, "keep_latest": "1" },
-            "sessions": [ { "id": "ses_1", "reasoning_parts": 3, "reasoning_bytes": 100,
+                         "path_prefixes": [], "archived": false, "empty": false,
+                         "larger_than": null, "keep_latest": "1",
+                         "keep_latest_per_project": null },
+            "sessions": [ { "id": "ses_1",
                             "reasoning_events": 1, "reasoning_event_bytes": 50,
                             "messages_rewritten": 2, "rewritten_bytes": 5 } ],
             "total_sessions": 1,
-            "total_reasoning_parts": 3, "total_reasoning_bytes": 100,
             "total_reasoning_events": 1, "total_reasoning_event_bytes": 50,
             "total_messages_rewritten": 2, "total_rewritten_bytes": 5,
             "stripped": false
@@ -852,7 +883,7 @@ mod tests {
         assert_eq!(arr.len(), N);
         assert_eq!(total, N as i64);
 
-        execute_delete(&mut con, &ids, Path::new("/tmp/x.db")).unwrap();
+        execute_delete(&mut con, &ids).unwrap();
         assert_eq!(testdb::session_count(&con), 0);
     }
 
@@ -866,7 +897,6 @@ mod tests {
             &mut con,
             &["--path".to_string(), "/a".to_string()],
             false,
-            Path::new("/tmp"),
             Path::new("/tmp/x.db"),
         )
         .unwrap();
@@ -879,14 +909,7 @@ mod tests {
         let mut con = testdb::create();
         testdb::insert_session(&con, "s1", "/a", None);
 
-        let err = cmd_session_purge(
-            &mut con,
-            &[],
-            false,
-            Path::new("/tmp"),
-            Path::new("/tmp/x.db"),
-        )
-        .unwrap_err();
+        let err = cmd_session_purge(&mut con, &[], false, Path::new("/tmp/x.db")).unwrap_err();
         assert_eq!(err.code, 2);
     }
 
@@ -896,18 +919,12 @@ mod tests {
         testdb::insert_session(&con, "root", "/a", None);
         testdb::insert_session(&con, "child", "/a", Some("root"));
 
-        cmd_session_purge(
-            &mut con,
-            &["--subagents".to_string()],
-            false,
-            Path::new("/tmp"),
-            Path::new("/tmp/x.db"),
-        )
-        .unwrap();
+        cmd_session_purge(&mut con, &["--subagents".to_string()], false, Path::new("/tmp/x.db"))
+            .unwrap();
 
         assert_eq!(testdb::session_count(&con), 1);
         let remaining: String = con
-            .query_row("SELECT id FROM session", [], |r| r.get(0))
+            .query_row("SELECT id FROM session_v2", [], |r| r.get(0))
             .unwrap();
         assert_eq!(remaining, "root");
     }
@@ -923,14 +940,13 @@ mod tests {
             &mut con,
             &["--older-than".to_string(), "30d".to_string()],
             false,
-            Path::new("/tmp"),
             Path::new("/tmp/x.db"),
         )
         .unwrap();
 
         assert_eq!(testdb::session_count(&con), 1);
         let remaining: String = con
-            .query_row("SELECT id FROM session", [], |r| r.get(0))
+            .query_row("SELECT id FROM session_v2", [], |r| r.get(0))
             .unwrap();
         assert_eq!(remaining, "recent");
     }
@@ -949,14 +965,13 @@ mod tests {
             &mut con,
             &["--older-than".to_string(), "30d".to_string()],
             false,
-            Path::new("/tmp"),
             Path::new("/tmp/x.db"),
         )
         .unwrap();
 
         assert_eq!(testdb::session_count(&con), 1);
         let remaining: String = con
-            .query_row("SELECT id FROM session", [], |r| r.get(0))
+            .query_row("SELECT id FROM session_v2", [], |r| r.get(0))
             .unwrap();
         assert_eq!(remaining, "above");
     }
@@ -977,14 +992,13 @@ mod tests {
                 "--subagents".to_string(),
             ],
             false,
-            Path::new("/tmp"),
             Path::new("/tmp/x.db"),
         )
         .unwrap();
 
         assert_eq!(testdb::session_count(&con), 2);
         let remaining: Vec<String> = con
-            .prepare("SELECT id FROM session ORDER BY id")
+            .prepare("SELECT id FROM session_v2 ORDER BY id")
             .unwrap()
             .query_map([], |r| r.get(0))
             .unwrap()
@@ -1002,7 +1016,6 @@ mod tests {
             &mut con,
             &["--path".to_string(), "/a".to_string()],
             true,
-            Path::new("/tmp"),
             Path::new("/tmp/x.db"),
         )
         .unwrap();
@@ -1014,22 +1027,21 @@ mod tests {
     fn purge_larger_than_selects_big_sessions() {
         let mut con = testdb::create();
         testdb::insert_session(&con, "small", "/a", None);
-        testdb::insert_part(&con, "small", "x");
+        testdb::insert_session_message(&con, "m1", "small", "assistant", "x");
         testdb::insert_session(&con, "big", "/a", None);
-        testdb::insert_part(&con, "big", "xxxxxxxx");
+        testdb::insert_session_message(&con, "m2", "big", "assistant", "xxxxxxxx");
 
         cmd_session_purge(
             &mut con,
             &["--larger-than".to_string(), "4".to_string()],
             false,
-            Path::new("/tmp"),
             Path::new("/tmp/x.db"),
         )
         .unwrap();
 
         assert_eq!(testdb::session_count(&con), 1);
         let remaining: String = con
-            .query_row("SELECT id FROM session", [], |r| r.get(0))
+            .query_row("SELECT id FROM session_v2", [], |r| r.get(0))
             .unwrap();
         assert_eq!(remaining, "small");
     }
@@ -1045,14 +1057,13 @@ mod tests {
             &mut con,
             &["--keep-latest".to_string(), "2".to_string()],
             false,
-            Path::new("/tmp"),
             Path::new("/tmp/x.db"),
         )
         .unwrap();
 
         assert_eq!(testdb::session_count(&con), 2);
         let remaining: Vec<String> = con
-            .prepare("SELECT id FROM session ORDER BY id")
+            .prepare("SELECT id FROM session_v2 ORDER BY id")
             .unwrap()
             .query_map([], |r| r.get(0))
             .unwrap()
@@ -1071,7 +1082,6 @@ mod tests {
             &mut con,
             &["--keep-latest".to_string(), "1".to_string()],
             false,
-            Path::new("/tmp"),
             Path::new("/tmp/x.db"),
         )
         .unwrap();
@@ -1090,14 +1100,13 @@ mod tests {
             &mut con,
             &["--keep-latest".to_string(), "1".to_string()],
             false,
-            Path::new("/tmp"),
             Path::new("/tmp/x.db"),
         )
         .unwrap();
 
         assert_eq!(testdb::session_count(&con), 1);
         let remaining: String = con
-            .query_row("SELECT id FROM session", [], |r| r.get(0))
+            .query_row("SELECT id FROM session_v2", [], |r| r.get(0))
             .unwrap();
         assert_eq!(remaining, "parent");
     }
@@ -1112,7 +1121,6 @@ mod tests {
             &mut con,
             &["--keep-latest".to_string(), "0".to_string()],
             false,
-            Path::new("/tmp"),
             Path::new("/tmp/x.db"),
         )
         .unwrap();
@@ -1129,7 +1137,6 @@ mod tests {
             &mut con,
             &["--keep-latest".to_string(), "5".to_string()],
             false,
-            Path::new("/tmp"),
             Path::new("/tmp/x.db"),
         )
         .unwrap();
@@ -1152,14 +1159,13 @@ mod tests {
                 "1".to_string(),
             ],
             false,
-            Path::new("/tmp"),
             Path::new("/tmp/x.db"),
         )
         .unwrap();
 
         assert_eq!(testdb::session_count(&con), 2);
         let remaining: Vec<String> = con
-            .prepare("SELECT id FROM session ORDER BY id")
+            .prepare("SELECT id FROM session_v2 ORDER BY id")
             .unwrap()
             .query_map([], |r| r.get(0))
             .unwrap()
@@ -1173,8 +1179,20 @@ mod tests {
         let mut con = testdb::create();
         testdb::insert_session_at(&con, "old", "/a", None, 0);
         testdb::insert_session_at(&con, "new", "/a", None, 1);
-        testdb::insert_part(&con, "old", r#"{"type":"reasoning","text":"o"}"#);
-        testdb::insert_part(&con, "new", r#"{"type":"reasoning","text":"n"}"#);
+        testdb::insert_session_message(
+            &con,
+            "m-old",
+            "old",
+            "assistant",
+            r#"{"type":"assistant","content":[{"type":"reasoning","text":"o"}]}"#,
+        );
+        testdb::insert_session_message(
+            &con,
+            "m-new",
+            "new",
+            "assistant",
+            r#"{"type":"assistant","content":[{"type":"reasoning","text":"n"}]}"#,
+        );
 
         cmd_session_strip_reasoning(
             &mut con,
@@ -1184,95 +1202,19 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(testdb::reasoning_part_count(&con), 1);
-        let remaining: String = con
-            .query_row("SELECT session_id FROM part", [], |r| r.get(0))
+        let left: i64 = con
+            .query_row(
+                "SELECT COUNT(*) FROM session_message WHERE json_extract(data, '$.content') LIKE '%reasoning%' AND json_valid(data)",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
-        assert_eq!(remaining, "new");
-    }
-
-    #[test]
-    fn strip_reasoning_removes_only_reasoning_parts() {
-        let mut con = testdb::create();
-        testdb::insert_session(&con, "s1", "/a", None);
-        testdb::insert_part(
-            &con,
-            "s1",
-            r#"{"type":"reasoning","text":"chain of thought"}"#,
+        // Only the old session was stripped; the new one keeps reasoning.
+        assert_eq!(
+            crate::repo::reasoning_messages_left(&con, &["old".to_string()]).unwrap(),
+            0
         );
-        testdb::insert_part(&con, "s1", r#"{"type":"reasoning","text":"more thinking"}"#);
-        testdb::insert_part(&con, "s1", r#"{"type":"text","text":"hello"}"#);
-        testdb::insert_part(&con, "s1", r#"{"type":"tool","text":"{}"}"#);
-
-        cmd_session_strip_reasoning(&mut con, &[], false, Path::new("/tmp/x.db")).unwrap();
-
-        assert_eq!(testdb::session_count(&con), 1);
-        assert_eq!(testdb::part_count(&con), 2);
-        assert_eq!(testdb::reasoning_part_count(&con), 0);
-    }
-
-    #[test]
-    fn strip_reasoning_applies_filters() {
-        let mut con = testdb::create();
-        testdb::insert_session(&con, "parent", "/a", None);
-        testdb::insert_session(&con, "child", "/a", Some("parent"));
-        testdb::insert_part(&con, "parent", r#"{"type":"reasoning","text":"p"}"#);
-        testdb::insert_part(&con, "child", r#"{"type":"reasoning","text":"c"}"#);
-
-        cmd_session_strip_reasoning(
-            &mut con,
-            &["--subagents".to_string()],
-            false,
-            Path::new("/tmp/x.db"),
-        )
-        .unwrap();
-
-        assert_eq!(testdb::reasoning_part_count(&con), 1);
-        let remaining: String = con
-            .query_row("SELECT session_id FROM part", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(remaining, "parent");
-    }
-
-    #[test]
-    fn strip_reasoning_dry_run_changes_nothing() {
-        let mut con = testdb::create();
-        testdb::insert_session(&con, "s1", "/a", None);
-        testdb::insert_part(&con, "s1", r#"{"type":"reasoning","text":"x"}"#);
-
-        cmd_session_strip_reasoning(&mut con, &[], true, Path::new("/tmp/x.db")).unwrap();
-
-        assert_eq!(testdb::reasoning_part_count(&con), 1);
-    }
-
-    #[test]
-    fn strip_reasoning_removes_reasoning_events() {
-        let mut con = testdb::create();
-        testdb::insert_session(&con, "s1", "/a", None);
-        testdb::insert_event(
-            &con,
-            "s1",
-            "session.next.reasoning.started",
-            r#"{"reasoningID":"r1"}"#,
-        );
-        testdb::insert_event(
-            &con,
-            "s1",
-            "session.next.reasoning.ended",
-            r#"{"reasoningID":"r1","text":"chain of thought"}"#,
-        );
-        testdb::insert_event(&con, "s1", "session.next.text.ended", r#"{"text":"hello"}"#);
-
-        cmd_session_strip_reasoning(&mut con, &[], false, Path::new("/tmp/x.db")).unwrap();
-
-        let remaining: Vec<String> = con
-            .prepare("SELECT type FROM event ORDER BY type")
-            .unwrap()
-            .query_map([], |r| r.get(0))
-            .unwrap()
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .unwrap();
-        assert_eq!(remaining, vec!["session.next.text.ended"]);
+        assert_eq!(left, 1);
     }
 
     #[test]
@@ -1376,8 +1318,6 @@ mod tests {
     fn verification_detects_reasoning_by_json_semantics() {
         let con = testdb::create();
         testdb::insert_session(&con, "s1", "/a", None);
-        // Whitespace-formatted reasoning item: a raw-text LIKE check
-        // would miss this.
         testdb::insert_session_message(
             &con,
             "m1",
@@ -1385,7 +1325,6 @@ mod tests {
             "assistant",
             r#"{"type":"assistant","content":[{"type": "reasoning", "text": "x"}]}"#,
         );
-        // Literal `"type":"reasoning"` inside a text item is not reasoning.
         testdb::insert_session_message(
             &con,
             "m2",
@@ -1393,8 +1332,6 @@ mod tests {
             "assistant",
             r#"{"type":"assistant","content":[{"type":"text","text":"say {\"type\":\"reasoning\"}"}]}"#,
         );
-        // Not JSON at all: cannot be stripped, so it counts as left when
-        // it still carries a reasoning marker.
         testdb::insert_session_message(
             &con,
             "m3",
@@ -1408,83 +1345,101 @@ mod tests {
     }
 
     #[test]
-    fn delete_removes_session_diff_file() {
-        let dir = testdb::temp_data_dir("del-diff");
-        let db_path = dir.join("opencode.db");
-        let mut con = testdb::create_at(&db_path);
+    fn strip_reasoning_removes_reasoning_events() {
+        let mut con = testdb::create();
         testdb::insert_session(&con, "s1", "/a", None);
-        let diff = dir.join("storage/session_diff");
-        std::fs::create_dir_all(&diff).unwrap();
-        std::fs::write(diff.join("s1.json"), vec![0u8; 4]).unwrap();
-        std::fs::write(diff.join("other.json"), vec![0u8; 8]).unwrap();
-
-        cmd_session_delete(&mut con, &["s1".to_string()], false, &dir, &db_path).unwrap();
-
-        assert!(
-            !diff.join("s1.json").exists(),
-            "diff of deleted session gone"
+        testdb::insert_event(
+            &con,
+            "s1",
+            "session.next.reasoning.started",
+            r#"{"reasoningID":"r1"}"#,
         );
-        assert!(diff.join("other.json").exists(), "unrelated file kept");
-        drop(con);
-        std::fs::remove_dir_all(&dir).unwrap();
+        testdb::insert_event(
+            &con,
+            "s1",
+            "session.next.reasoning.ended",
+            r#"{"reasoningID":"r1","text":"chain of thought"}"#,
+        );
+        testdb::insert_event(&con, "s1", "session.next.text.ended", r#"{"text":"hello"}"#);
+
+        cmd_session_strip_reasoning(&mut con, &[], false, Path::new("/tmp/x.db")).unwrap();
+
+        let remaining: Vec<String> = con
+            .prepare("SELECT type FROM event ORDER BY type")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(remaining, vec!["session.next.text.ended"]);
     }
 
     #[test]
-    fn purge_removes_session_diff_file() {
-        let dir = testdb::temp_data_dir("purge-diff");
-        let db_path = dir.join("opencode.db");
-        let mut con = testdb::create_at(&db_path);
+    fn strip_reasoning_dry_run_changes_nothing() {
+        let mut con = testdb::create();
         testdb::insert_session(&con, "s1", "/a", None);
-        let diff = dir.join("storage/session_diff");
-        std::fs::create_dir_all(&diff).unwrap();
-        std::fs::write(diff.join("s1.json"), vec![0u8; 4]).unwrap();
+        testdb::insert_session_message(
+            &con,
+            "m1",
+            "s1",
+            "assistant",
+            r#"{"type":"assistant","content":[{"type":"reasoning","text":"x"}]}"#,
+        );
 
-        cmd_session_purge(
+        cmd_session_strip_reasoning(&mut con, &[], true, Path::new("/tmp/x.db")).unwrap();
+
+        assert_eq!(reasoning_messages_left(&con, &["s1".to_string()]).unwrap(), 1);
+    }
+
+    #[test]
+    fn strip_reasoning_applies_filters() {
+        let mut con = testdb::create();
+        testdb::insert_session(&con, "parent", "/a", None);
+        testdb::insert_session(&con, "child", "/a", Some("parent"));
+        testdb::insert_session_message(
+            &con,
+            "m-p",
+            "parent",
+            "assistant",
+            r#"{"type":"assistant","content":[{"type":"reasoning","text":"p"}]}"#,
+        );
+        testdb::insert_session_message(
+            &con,
+            "m-c",
+            "child",
+            "assistant",
+            r#"{"type":"assistant","content":[{"type":"reasoning","text":"c"}]}"#,
+        );
+
+        cmd_session_strip_reasoning(
             &mut con,
-            &["--path".to_string(), "/a".to_string()],
+            &["--subagents".to_string()],
             false,
-            &dir,
-            &db_path,
+            Path::new("/tmp/x.db"),
         )
         .unwrap();
 
-        assert!(!diff.join("s1.json").exists());
-        drop(con);
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn load_sessions_reads_diff_bytes() {
-        let dir = testdb::temp_data_dir("diff-bytes");
-        let db_path = dir.join("opencode.db");
-        let con = testdb::create_at(&db_path);
-        testdb::insert_session(&con, "s1", "/a", None);
-        let diff = dir.join("storage/session_diff");
-        std::fs::create_dir_all(&diff).unwrap();
-        std::fs::write(diff.join("s1.json"), vec![0u8; 6]).unwrap();
-
-        let sessions = load_sessions(&con, Some(&session_diff_dir(&dir))).unwrap();
-        assert_eq!(sessions[0].diff_bytes, 6);
-
-        let sessions = load_sessions(&con, None).unwrap();
-        assert_eq!(sessions[0].diff_bytes, 0);
-        drop(con);
-        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(
+            reasoning_messages_left(&con, &["parent".to_string()]).unwrap(),
+            1
+        );
+        assert_eq!(
+            reasoning_messages_left(&con, &["child".to_string()]).unwrap(),
+            0
+        );
     }
 
     #[test]
     fn session_list_sorts_by_size_and_limits() {
-        let dir = testdb::temp_data_dir("list-sort");
-        let db_path = dir.join("opencode.db");
-        let con = testdb::create_at(&db_path);
+        let con = testdb::create();
         testdb::insert_session(&con, "small", "/a", None);
-        testdb::insert_part(&con, "small", "x");
+        testdb::insert_session_message(&con, "m1", "small", "assistant", "x");
         testdb::insert_session(&con, "big", "/a", None);
-        testdb::insert_part(&con, "big", "xxxxxxxxxxxxxxxx");
+        testdb::insert_session_message(&con, "m2", "big", "assistant", "xxxxxxxxxxxxxxxx");
         testdb::insert_session(&con, "medium", "/a", None);
-        testdb::insert_part(&con, "medium", "xxxxxxxx");
+        testdb::insert_session_message(&con, "m3", "medium", "assistant", "xxxxxxxx");
 
-        let all = session_list_value(&con, &db_path, &[]).unwrap();
+        let all = session_list_value(&con, &[]).unwrap();
         let ids: Vec<&str> = all
             .as_array()
             .unwrap()
@@ -1493,8 +1448,8 @@ mod tests {
             .collect();
         assert_eq!(ids.len(), 3);
 
-        let sized = session_list_value(&con, &db_path, &["--sort".to_string(), "size".to_string()])
-            .unwrap();
+        let sized =
+            session_list_value(&con, &["--sort".to_string(), "size".to_string()]).unwrap();
         let ids: Vec<&str> = sized
             .as_array()
             .unwrap()
@@ -1505,7 +1460,6 @@ mod tests {
 
         let limited = session_list_value(
             &con,
-            &db_path,
             &[
                 "--sort".to_string(),
                 "size".to_string(),
@@ -1522,14 +1476,72 @@ mod tests {
             .collect();
         assert_eq!(ids, vec!["big", "medium"]);
 
-        assert!(
-            session_list_value(&con, &db_path, &["--sort".to_string(), "nope".to_string()])
-                .is_err()
-        );
-        assert!(session_list_value(&con, &db_path, &["--limit".to_string()]).is_err());
-        assert!(session_list_value(&con, &db_path, &["--unknown".to_string()]).is_err());
-        drop(con);
-        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(session_list_value(&con, &["--sort".to_string(), "nope".to_string()]).is_err());
+        assert!(session_list_value(&con, &["--limit".to_string()]).is_err());
+        assert!(session_list_value(&con, &["--unknown".to_string()]).is_err());
+    }
+
+    #[test]
+    fn delete_cascades_to_messages_and_inbox() {
+        let mut con = testdb::create();
+        testdb::insert_session(&con, "s1", "/a", None);
+        testdb::insert_session_message(&con, "m1", "s1", "assistant", "{}");
+        testdb::insert_inbox(&con, "i1", "s1", "payload");
+        con.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+
+        cmd_session_delete(
+            &mut con,
+            &["s1".to_string()],
+            false,
+            Path::new("/tmp/x.db"),
+        )
+        .unwrap();
+
+        assert_eq!(testdb::session_count(&con), 0);
+        let sm: i64 = con
+            .query_row("SELECT COUNT(*) FROM session_message", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(sm, 0);
+        let inbox: i64 = con
+            .query_row("SELECT COUNT(*) FROM session_inbox", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(inbox, 0);
+    }
+
+    #[test]
+    fn preview_counts_v2_tables() {
+        let con = testdb::create();
+        testdb::insert_session(&con, "s1", "/a", None);
+        testdb::insert_session_message(&con, "m1", "s1", "assistant", "{}");
+        let (total, arr) = preview_impact(&con, &["s1".to_string()]).unwrap();
+        assert_eq!(total, 2, "session row + session_message row");
+        let rows = &arr[0].rows;
+        assert_eq!(rows["session_message"], 1);
+        assert_eq!(rows["event_sequence"], 0);
+        assert_eq!(rows.len(), 7);
+    }
+
+    #[test]
+    fn larger_than_uses_v2_bytes() {
+        let mut con = testdb::create();
+        testdb::insert_session(&con, "small", "/a", None);
+        testdb::insert_session_message(&con, "m1", "small", "assistant", "x");
+        testdb::insert_session(&con, "big", "/a", None);
+        testdb::insert_session_message(&con, "m2", "big", "assistant", "xxxxxxxx");
+
+        cmd_session_purge(
+            &mut con,
+            &["--larger-than".to_string(), "4".to_string()],
+            false,
+            Path::new("/tmp/x.db"),
+        )
+        .unwrap();
+
+        assert_eq!(testdb::session_count(&con), 1);
+        let remaining: String = con
+            .query_row("SELECT id FROM session_v2", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(remaining, "small");
     }
 
     #[test]
@@ -1538,9 +1550,11 @@ mod tests {
             "--older-than".to_string(),
             "30d".to_string(),
             "--subagents".to_string(),
+            "--archived".to_string(),
+            "--empty".to_string(),
             "--path".to_string(),
             "/a".to_string(),
-            "--path".to_string(),
+            "--path-prefix".to_string(),
             "/b".to_string(),
             "--larger-than".to_string(),
             "50M".to_string(),
@@ -1551,11 +1565,158 @@ mod tests {
         assert_eq!(f.older_than_raw.as_deref(), Some("30d"));
         assert!(f.cutoff_ms.is_some());
         assert!(f.subagents);
-        assert_eq!(f.paths, vec!["/a", "/b"]);
+        assert!(f.archived);
+        assert!(f.empty);
+        assert_eq!(f.paths, vec!["/a"]);
+        assert_eq!(f.path_prefixes, vec!["/b"]);
         assert_eq!(f.larger_than_raw.as_deref(), Some("50M"));
         assert_eq!(f.larger_than_bytes, Some(50 * 1024 * 1024));
         assert_eq!(f.keep_latest_raw.as_deref(), Some("10"));
         assert_eq!(f.keep_latest, Some(10));
+    }
+
+    #[test]
+    fn keep_latest_variants_are_mutually_exclusive() {
+        for args in [
+            vec!["--keep-latest".to_string()],
+            vec!["--keep-latest".to_string(), "0".to_string()],
+            vec!["--keep-latest".to_string(), "-1".to_string()],
+            vec!["--keep-latest-per-project".to_string()],
+            vec![
+                "--keep-latest".to_string(),
+                "1".to_string(),
+                "--keep-latest-per-project".to_string(),
+                "1".to_string(),
+            ],
+        ] {
+            // Bare flags are rejected; the pair is rejected together.
+            if args.len() == 2 && args[0] == "--keep-latest" && args[1] == "0" {
+                // --keep-latest 0 is valid (deletes all).
+                assert!(parse_purge_args(&args).is_ok());
+            } else {
+                assert!(parse_purge_args(&args).is_err(), "should reject: {args:?}");
+            }
+        }
+        assert!(parse_purge_args(&[
+            "--keep-latest-per-project".to_string(),
+            "2".to_string()
+        ])
+        .is_ok());
+    }
+
+    #[test]
+    fn purge_path_prefix_matches_subtree() {
+        let mut con = testdb::create();
+        testdb::insert_session(&con, "root", "/a", None);
+        testdb::insert_session(&con, "child", "/a/b/c", None);
+        testdb::insert_session(&con, "other", "/ab", None);
+
+        cmd_session_purge(
+            &mut con,
+            &["--path-prefix".to_string(), "/a".to_string()],
+            false,
+            Path::new("/tmp/x.db"),
+        )
+        .unwrap();
+
+        assert_eq!(testdb::session_count(&con), 1);
+        let remaining: String = con
+            .query_row("SELECT id FROM session_v2", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(remaining, "other");
+    }
+
+    #[test]
+    fn purge_empty_selects_only_contentless_sessions() {
+        let mut con = testdb::create();
+        testdb::insert_session(&con, "empty", "/a", None);
+        testdb::insert_session(&con, "full", "/a", None);
+        testdb::insert_session_message(&con, "m1", "full", "assistant", "x");
+
+        cmd_session_purge(
+            &mut con,
+            &["--empty".to_string()],
+            false,
+            Path::new("/tmp/x.db"),
+        )
+        .unwrap();
+
+        assert_eq!(testdb::session_count(&con), 1);
+        let remaining: String = con
+            .query_row("SELECT id FROM session_v2", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(remaining, "full");
+    }
+
+    #[test]
+    fn purge_archived_selects_only_archived() {
+        let mut con = testdb::create();
+        testdb::insert_session(&con, "live", "/a", None);
+        testdb::insert_session(&con, "old", "/a", None);
+        con.execute(
+            "UPDATE session_v2 SET time_archived = 1 WHERE id = 'old'",
+            [],
+        )
+        .unwrap();
+
+        cmd_session_purge(
+            &mut con,
+            &["--archived".to_string()],
+            false,
+            Path::new("/tmp/x.db"),
+        )
+        .unwrap();
+
+        assert_eq!(testdb::session_count(&con), 1);
+        let remaining: String = con
+            .query_row("SELECT id FROM session_v2", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(remaining, "live");
+    }
+
+    #[test]
+    fn purge_keep_latest_per_project_keeps_newest_each() {
+        let mut con = testdb::create();
+        testdb::insert_project(&con, "p1", "/a");
+        testdb::insert_project(&con, "p2", "/b");
+        for (i, id) in ["a1", "a2", "a3"].iter().enumerate() {
+            con.execute(
+                "INSERT INTO session_v2 (id, directory, title, project_id, time_updated, cost) \
+                 VALUES (?1, '/a', ?1, 'p1', ?2, 0)",
+                rusqlite::params![id, i as i64],
+            )
+            .unwrap();
+        }
+        for (i, id) in ["b1", "b2"].iter().enumerate() {
+            con.execute(
+                "INSERT INTO session_v2 (id, directory, title, project_id, time_updated, cost) \
+                 VALUES (?1, '/b', ?1, 'p2', ?2, 0)",
+                rusqlite::params![id, i as i64],
+            )
+            .unwrap();
+        }
+
+        cmd_session_purge(
+            &mut con,
+            &[
+                "--keep-latest-per-project".to_string(),
+                "1".to_string(),
+            ],
+            false,
+            Path::new("/tmp/x.db"),
+        )
+        .unwrap();
+
+        // Newest per project survive: a3 and b2.
+        let mut remaining: Vec<String> = con
+            .prepare("SELECT id FROM session_v2 ORDER BY id")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        remaining.sort();
+        assert_eq!(remaining, vec!["a3", "b2"]);
     }
 
     #[test]
@@ -1565,16 +1726,44 @@ mod tests {
             vec!["--older-than".to_string(), "xyz".to_string()],
             vec!["--older-than".to_string(), "0d".to_string()],
             vec!["--path".to_string()],
+            vec!["--path-prefix".to_string()],
             vec!["--larger-than".to_string()],
             vec!["--larger-than".to_string(), "0".to_string()],
             vec!["--larger-than".to_string(), "1.5M".to_string()],
             vec!["--keep-latest".to_string()],
             vec!["--keep-latest".to_string(), "-1".to_string()],
+            vec!["--keep-latest-per-project".to_string()],
             vec!["ses_1".to_string()],
             vec!["--unknown".to_string()],
         ] {
             assert!(parse_purge_args(&args).is_err(), "should reject: {args:?}");
         }
+    }
+
+    #[test]
+    fn show_messages_previews_content() {
+        let con = testdb::create();
+        testdb::insert_session(&con, "s1", "/a", None);
+        testdb::insert_session_message(&con, "m1", "s1", "assistant", &"x".repeat(500));
+        testdb::insert_session_message(&con, "m2", "s1", "user", "hi");
+
+        // Without the flag there is no messages block.
+        let s = crate::repo::load_session(&con, "s1").unwrap().unwrap();
+        let v = serde_json::to_value(crate::models::session_json(&s)).unwrap();
+        assert!(v.get("messages").is_none());
+
+        cmd_session_show(&con, &["s1".to_string(), "--messages".to_string()]).unwrap();
+        cmd_session_show(
+            &con,
+            &[
+                "s1".to_string(),
+                "--messages".to_string(),
+                "--limit".to_string(),
+                "1".to_string(),
+            ],
+        )
+        .unwrap();
+        assert!(cmd_session_show(&con, &["s1".to_string(), "--limit".to_string()]).is_err());
     }
 
     #[test]

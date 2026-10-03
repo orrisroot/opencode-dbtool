@@ -149,6 +149,81 @@ pub fn cmd_vacuum(con: &Connection, db_path: &Path, opts: &VacuumOpts) -> Result
     Ok(result)
 }
 
+/// Parse `backup` flags: `--keep-backups <n>`.
+pub fn parse_backup_args(args: &[String]) -> Result<Option<i64>> {
+    let mut keep: Option<i64> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--keep-backups" => {
+                let n = args
+                    .get(i + 1)
+                    .ok_or_else(|| AppError::usage("--keep-backups requires a count"))?;
+                let c = parse_count(n)?;
+                if c == 0 {
+                    return Err(AppError::usage("--keep-backups must be at least 1"));
+                }
+                keep = Some(c);
+                i += 2;
+                continue;
+            }
+            other => return Err(AppError::usage(format!("unknown option: {other}"))),
+        }
+    }
+    Ok(keep)
+}
+
+/// JSON shape of the `backup` command output.
+#[derive(Serialize)]
+pub struct BackupCmdOut {
+    #[serde(flatten)]
+    pub env: crate::db::EnvStatus,
+    pub dry_run: bool,
+    pub backup: BackupOut,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backup_cleanup: Option<BackupCleanupOut>,
+}
+
+/// Create a verified timestamped backup without touching table data:
+/// checkpoint, integrity check, copy + verify, optional backup pruning.
+/// Use it before `purge`/`delete` runs.
+pub fn cmd_backup(db_path: &Path, dry_run: bool, args: &[String]) -> Result<()> {
+    let keep = parse_backup_args(args)?;
+    let con = crate::db::open_conn(db_path, dry_run)?;
+    checkpoint(&con);
+    if quick_check(&con) != "ok" {
+        return Err(AppError::db("integrity check not ok - abort"));
+    }
+    let mut out = BackupCmdOut {
+        env: crate::db::env_status(db_path),
+        dry_run,
+        backup: BackupOut {
+            path: planned_backup_path(db_path).to_string_lossy().to_string(),
+            bytes: file_size(db_path),
+            integrity: None,
+        },
+        backup_cleanup: None,
+    };
+    if dry_run {
+        return crate::output::print_json(&serde_json::to_value(&out)?);
+    }
+    let info = create_backup(db_path)?;
+    out.backup = BackupOut {
+        path: info.path.to_string_lossy().to_string(),
+        bytes: info.bytes,
+        integrity: Some(info.integrity),
+    };
+    if let Some(n) = keep {
+        let (removed_files, removed_bytes) = prune_backups(db_path, n)?;
+        out.backup_cleanup = Some(BackupCleanupOut {
+            kept: n,
+            removed_files,
+            removed_bytes,
+        });
+    }
+    crate::output::print_json(&serde_json::to_value(&out)?)
+}
+
 /// Delete all `*.backup-*` files except the newest `keep` (the filename
 /// timestamp is zero-padded UTC, so lexicographic order is chronological).
 /// Best-effort: files that cannot be removed are skipped.
@@ -329,7 +404,7 @@ mod tests {
     fn vacuum_creates_verified_backup_and_preserves_data() {
         let (con, path) = temp_db("backup");
         testdb::insert_session(&con, "s1", "/a", None);
-        testdb::insert_part(&con, "s1", r#"{"type":"text","text":"hello"}"#);
+        testdb::insert_session_message(&con, "m1", "s1", "assistant", r#"{"type":"text"}"#);
 
         let out =
             serde_json::to_value(cmd_vacuum(&con, &path, &VacuumOpts::default()).unwrap()).unwrap();
@@ -343,14 +418,14 @@ mod tests {
         // The backup is a complete database containing the session.
         let backup_con = crate::db::open_conn(&backup_path, true).unwrap();
         let n: i64 = backup_con
-            .query_row("SELECT COUNT(*) FROM session", [], |r| r.get(0))
+            .query_row("SELECT COUNT(*) FROM session_v2", [], |r| r.get(0))
             .unwrap();
         assert_eq!(n, 1);
         drop(backup_con);
 
         // The main database still has the data.
         let n: i64 = con
-            .query_row("SELECT COUNT(*) FROM session", [], |r| r.get(0))
+            .query_row("SELECT COUNT(*) FROM session_v2", [], |r| r.get(0))
             .unwrap();
         assert_eq!(n, 1);
         let jm: String = con

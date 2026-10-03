@@ -1,6 +1,6 @@
-//! `doctor` command: integrity and consistency checks.
+//! `doctor` command: integrity and consistency checks (V2-only).
 
-use crate::db::{env_status, file_size, quick_check, EnvStatus};
+use crate::db::{env_status, file_size, quick_check, EnvStatus, SESSION_TABLE};
 use crate::error::{AppError, Result};
 use crate::output::print_json;
 use crate::util::expect_no_args;
@@ -24,17 +24,24 @@ struct MissingParent {
 }
 
 #[derive(Serialize)]
-struct MissingWorkspace {
+struct DanglingRef {
     id: String,
-    workspace_id: String,
+    ref_id: String,
+}
+
+#[derive(Serialize)]
+struct BlobOrphan {
+    hash: String,
+    bytes: i64,
 }
 
 #[derive(Serialize)]
 struct Orphans {
     sessions_missing_parent: Vec<MissingParent>,
-    sessions_missing_workspace: Vec<MissingWorkspace>,
+    sessions_dangling_fork: Vec<DanglingRef>,
+    sessions_missing_workspace: Vec<DanglingRef>,
     orphaned_event_sequences: Vec<String>,
-    mismatched_parts: i64,
+    orphan_instruction_blobs: Vec<BlobOrphan>,
 }
 
 #[derive(Serialize)]
@@ -84,11 +91,12 @@ fn doctor_out(con: &Connection, db_path: &Path) -> Result<DoctorOut> {
 
     // References without FK constraints.
     let sessions_missing_parent: Vec<MissingParent> = {
-        let mut stmt = con.prepare(
-            "SELECT s.id, s.parent_id, s.title FROM session s \
+        let sql = format!(
+            "SELECT s.id, s.parent_id, COALESCE(s.title,'') FROM \"{SESSION_TABLE}\" s \
              WHERE s.parent_id IS NOT NULL AND s.parent_id != '' \
-               AND s.parent_id NOT IN (SELECT id FROM session) ORDER BY s.id",
-        )?;
+               AND s.parent_id NOT IN (SELECT id FROM \"{SESSION_TABLE}\") ORDER BY s.id"
+        );
+        let mut stmt = con.prepare(&sql)?;
         let rows = stmt.query_map([], |r| {
             Ok(MissingParent {
                 id: r.get(0)?,
@@ -98,49 +106,86 @@ fn doctor_out(con: &Connection, db_path: &Path) -> Result<DoctorOut> {
         })?;
         rows.collect::<std::result::Result<Vec<_>, _>>()?
     };
-    let sessions_missing_workspace: Vec<MissingWorkspace> = {
-        let mut stmt = con.prepare(
-            "SELECT s.id, s.workspace_id FROM session s \
-             WHERE s.workspace_id IS NOT NULL AND s.workspace_id != '' \
-               AND s.workspace_id NOT IN (SELECT id FROM workspace) ORDER BY s.id",
-        )?;
+    // fork_session_id carries no FK: a deleted fork source leaves a
+    // dangling reference behind.
+    let sessions_dangling_fork: Vec<DanglingRef> = {
+        let sql = format!(
+            "SELECT s.id, s.fork_session_id FROM \"{SESSION_TABLE}\" s \
+             WHERE s.fork_session_id IS NOT NULL AND s.fork_session_id != '' \
+               AND s.fork_session_id NOT IN (SELECT id FROM \"{SESSION_TABLE}\") ORDER BY s.id"
+        );
+        let mut stmt = con.prepare(&sql)?;
         let rows = stmt.query_map([], |r| {
-            Ok(MissingWorkspace {
+            Ok(DanglingRef {
                 id: r.get(0)?,
-                workspace_id: r.get(1)?,
+                ref_id: r.get(1)?,
             })
         })?;
         rows.collect::<std::result::Result<Vec<_>, _>>()?
     };
+    // workspace_id carries no FK and `workspace` is provider-scoped.
+    let sessions_missing_workspace: Vec<DanglingRef> = {
+        let sql = format!(
+            "SELECT s.id, s.workspace_id FROM \"{SESSION_TABLE}\" s \
+             WHERE s.workspace_id IS NOT NULL AND s.workspace_id != '' \
+               AND s.workspace_id NOT IN (SELECT id FROM workspace) ORDER BY s.id"
+        );
+        let mut stmt = con.prepare(&sql)?;
+        let rows = stmt.query_map([], |r| {
+            Ok(DanglingRef {
+                id: r.get(0)?,
+                ref_id: r.get(1)?,
+            })
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()?
+    };
+    // Event aggregates are sessions or projects; anything else is orphaned.
     let orphaned_event_sequences: Vec<String> = {
-        let mut stmt = con.prepare(
+        let sql = format!(
             "SELECT DISTINCT aggregate_id FROM event_sequence \
-             WHERE aggregate_id NOT IN (SELECT id FROM session) ORDER BY 1",
-        )?;
+             WHERE aggregate_id NOT IN (SELECT id FROM \"{SESSION_TABLE}\") \
+               AND aggregate_id NOT IN (SELECT id FROM project) ORDER BY 1 LIMIT 1000"
+        );
+        let mut stmt = con.prepare(&sql)?;
         let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
         rows.collect::<std::result::Result<Vec<_>, _>>()?
     };
-    let mismatched_parts: i64 = con.query_row(
-        "SELECT COUNT(*) FROM part p \
-         JOIN message m ON p.message_id = m.id \
-         WHERE p.session_id != m.session_id",
-        [],
-        |r| r.get(0),
-    )?;
+    // V2 content rows whose session is gone. FK covers them, but explicit
+    // counts help when FKs were off.
+    let mut v2_orphans: i64 = 0;
+    for (table, id_col) in [
+        ("session_message", "session_id"),
+        ("session_inbox", "session_id"),
+        ("session_pending", "session_id"),
+        ("instruction_entry", "session_id"),
+        ("instruction_state", "session_id"),
+    ] {
+        let sql = format!(
+            "SELECT COUNT(*) FROM \"{table}\" t WHERE t.\"{id_col}\" NOT IN (SELECT id FROM \"{SESSION_TABLE}\")"
+        );
+        let n: i64 = con.query_row(&sql, [], |r| r.get(0))?;
+        v2_orphans += n;
+    }
     let orphans = Orphans {
         sessions_missing_parent,
+        sessions_dangling_fork,
         sessions_missing_workspace,
         orphaned_event_sequences,
-        mismatched_parts,
+        orphan_instruction_blobs: crate::repo::blob_orphans(con)?
+            .into_iter()
+            .map(|(hash, bytes)| BlobOrphan { hash, bytes })
+            .collect(),
     };
 
     let ok = quick == "ok"
         && integrity == "ok"
         && fk_violations.is_empty()
         && orphans.sessions_missing_parent.is_empty()
+        && orphans.sessions_dangling_fork.is_empty()
         && orphans.sessions_missing_workspace.is_empty()
         && orphans.orphaned_event_sequences.is_empty()
-        && mismatched_parts == 0;
+        && orphans.orphan_instruction_blobs.is_empty()
+        && v2_orphans == 0;
 
     Ok(DoctorOut {
         env,
@@ -171,7 +216,6 @@ mod tests {
         let con = testdb::create();
         testdb::insert_session(&con, "s1", "/a", None);
         let mut out = doctor_out(&con, Path::new("/tmp/x.db")).unwrap();
-        // env is host-dependent; fix it for the golden comparison.
         out.env = crate::db::EnvStatus {
             opencode_running: Some(false),
             pids: Some(vec![]),
@@ -190,9 +234,10 @@ mod tests {
             "foreign_key_violations": [],
             "orphans": {
                 "sessions_missing_parent": [],
+                "sessions_dangling_fork": [],
                 "sessions_missing_workspace": [],
                 "orphaned_event_sequences": [],
-                "mismatched_parts": 0
+                "orphan_instruction_blobs": []
             },
             "ok": true
         });
@@ -200,14 +245,38 @@ mod tests {
     }
 
     #[test]
-    fn missing_workspace_is_detected() {
+    fn project_aggregate_is_not_orphaned() {
         let con = testdb::create();
         con.execute(
-            "INSERT INTO session (id, directory, title, parent_id, workspace_id, time_updated, cost) \
-             VALUES ('s1', '/a', 't', NULL, 'ws_missing', 0, 0)",
+            "INSERT INTO project (id, worktree, name) VALUES ('p1','/a','p1')",
             [],
         )
         .unwrap();
+        con.execute(
+            "INSERT INTO event_sequence (aggregate_id, seq) VALUES ('p1', 1)",
+            [],
+        )
+        .unwrap();
+        cmd_doctor(&con, Path::new("/tmp/x.db"), &[]).unwrap();
+    }
+
+    #[test]
+    fn dangling_fork_and_workspace_are_detected() {
+        let con = testdb::create();
+        con.execute(
+            "INSERT INTO session_v2 (id, directory, title, fork_session_id, workspace_id, time_updated, cost) \
+             VALUES ('s1', '/a', 't', 'missing-parent', 'missing-ws', 0, 0)",
+            [],
+        )
+        .unwrap();
+        assert!(cmd_doctor(&con, Path::new("/tmp/x.db"), &[]).is_err());
+    }
+
+    #[test]
+    fn orphan_blobs_fail_doctor_until_cleaned() {
+        let con = testdb::create();
+        con.execute("INSERT INTO instruction_blob (hash, value) VALUES ('zzz', 'orphan')", [])
+            .unwrap();
         assert!(cmd_doctor(&con, Path::new("/tmp/x.db"), &[]).is_err());
     }
 }

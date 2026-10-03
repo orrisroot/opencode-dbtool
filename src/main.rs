@@ -64,16 +64,20 @@ fn usage() {
     );
     println!("  opencode-dbtool project show <id>        project detail (sessions, breakdown)");
     println!("  opencode-dbtool project delete <id>...   delete project(s) + all related data");
-    println!("  opencode-dbtool project purge [--older-than <age>] [--path <dir>...]  delete projects matching all filters");
+    println!("  opencode-dbtool project purge [--older-than <age>] [--path <dir>...] [--empty]  delete projects matching all filters");
     println!("  opencode-dbtool session list [--sort size] [--limit <n>]  per-session breakdown (full ids)");
-    println!("  opencode-dbtool session show <id>        session detail");
+    println!("  opencode-dbtool session show <id> [--messages [--limit <n>]]  session detail");
     println!("  opencode-dbtool session delete <id>...   delete session(s) + cascade");
-    println!("  opencode-dbtool session purge [--older-than <age>] [--subagents] [--path <dir>...] [--larger-than <size>] [--keep-latest <n>]  delete sessions matching all filters");
-    println!("  opencode-dbtool session strip-reasoning [--older-than <age>] [--subagents] [--path <dir>...] [--larger-than <size>] [--keep-latest <n>]  delete only the reasoning parts of matching sessions");
-    println!("  opencode-dbtool fs clean-orphans      delete session_diff files with no matching session");
-    println!("  opencode-dbtool fs clean-snapshots    delete all snapshot (undo/redo) storage");
-    println!("  opencode-dbtool fs clean-tool-output  delete all truncated tool output");
-    println!("  opencode-dbtool fs clean-log          truncate log/opencode.log to zero bytes");
+    println!("  opencode-dbtool session purge [--older-than <age>] [--subagents] [--archived] [--empty] [--path <dir>...] [--path-prefix <dir>...] [--larger-than <size>] [--keep-latest <n>] [--keep-latest-per-project <n>]  delete sessions matching all filters");
+    println!("  opencode-dbtool session strip-reasoning [--older-than <age>] [--subagents] [--archived] [--empty] [--path <dir>...] [--path-prefix <dir>...] [--larger-than <size>] [--keep-latest <n>] [--keep-latest-per-project <n>]  delete only the reasoning content of matching sessions");
+    println!("  opencode-dbtool kv list [--older-than <age>]  list global kv entries (key sizes)");
+    println!("  opencode-dbtool kv show <key>                 show a kv value (truncated)");
+    println!("  opencode-dbtool kv delete <key>...            delete kv entries");
+    println!("  opencode-dbtool backup [--keep-backups <n>]   verified timestamped backup of the database");
+    println!("  opencode-dbtool fs clean-snapshots [--project <id>...] [--orphans-only]  delete snapshot storage");
+    println!("  opencode-dbtool fs clean-shell [--older-than <age>]  delete shell output files");
+    println!("  opencode-dbtool fs clean-blob-orphans  delete unreferenced instruction blobs");
+    println!("  opencode-dbtool fs clean-log [--older-than <age>]  truncate or prune log/opencode.log");
     println!("  opencode-dbtool vacuum [--no-backup] [--keep-backups <n>]  run VACUUM (backup + verify by default)");
     println!("  opencode-dbtool self-update [--dry-run|--yes]  check/apply the latest GitHub release binary");
     println!("  opencode-dbtool [--help]                 show this message");
@@ -220,6 +224,43 @@ fn run() -> Result<()> {
             let con = db::open_conn(&db_path, true)?;
             commands::doctor::cmd_doctor(&con, &db_path, rest)
         }),
+        "kv" => match rest.first().map(|s| s.as_str()).unwrap_or("") {
+            "list" => require_db(&db_path).and_then(|_| {
+                let con = db::open_conn(&db_path, true)?;
+                commands::kv::cmd_kv_list(&con, &rest[1..])
+            }),
+            "show" => require_db(&db_path).and_then(|_| {
+                let con = db::open_conn(&db_path, true)?;
+                commands::kv::cmd_kv_show(&con, &rest[1..])
+            }),
+            "delete" => require_db(&db_path)
+                .and_then(|_| {
+                    require_mutation_guard(
+                        dry_run,
+                        yes,
+                        "kv delete",
+                        "deleting while opencode is running is not allowed",
+                    )
+                })
+                .and_then(|_| {
+                    let mut con = db::open_conn(&db_path, dry_run)?;
+                    commands::kv::cmd_kv_delete(&mut con, &rest[1..], dry_run, &db_path)
+                }),
+            _ => {
+                usage();
+                Err(AppError::silent(error::EXIT_NOT_FOUND))
+            }
+        },
+        "backup" => require_db(&db_path)
+            .and_then(|_| {
+                require_mutation_guard(
+                    dry_run,
+                    yes,
+                    "backup",
+                    "backup needs exclusive access",
+                )
+            })
+            .and_then(|_| commands::vacuum::cmd_backup(&db_path, dry_run, rest)),
         "project" => match rest.first().map(|s| s.as_str()).unwrap_or("") {
             "list" => require_db(&db_path).and_then(|_| {
                 let con = db::open_conn(&db_path, true)?;
@@ -245,7 +286,6 @@ fn run() -> Result<()> {
                             &mut con,
                             &rest[1..],
                             dry_run,
-                            &dir,
                             &db_path,
                         )
                     } else {
@@ -253,7 +293,6 @@ fn run() -> Result<()> {
                             &mut con,
                             &rest[1..],
                             dry_run,
-                            &dir,
                             &db_path,
                         )
                     }
@@ -266,11 +305,11 @@ fn run() -> Result<()> {
         "session" => match rest.first().map(|s| s.as_str()).unwrap_or("") {
             "list" => require_db(&db_path).and_then(|_| {
                 let con = db::open_conn(&db_path, true)?;
-                commands::session::cmd_session_list(&con, &dir, &rest[1..])
+                commands::session::cmd_session_list(&con, &rest[1..])
             }),
             "show" => require_db(&db_path).and_then(|_| {
                 let con = db::open_conn(&db_path, true)?;
-                commands::session::cmd_session_show(&con, &dir, &rest[1..])
+                commands::session::cmd_session_show(&con, &rest[1..])
             }),
             "delete" => require_db(&db_path)
                 .and_then(|_| {
@@ -287,7 +326,6 @@ fn run() -> Result<()> {
                         &mut con,
                         &rest[1..],
                         dry_run,
-                        &dir,
                         &db_path,
                     )
                 }),
@@ -307,7 +345,6 @@ fn run() -> Result<()> {
                             &mut con,
                             &rest[1..],
                             dry_run,
-                            &dir,
                             &db_path,
                         )
                     } else {
@@ -325,14 +362,6 @@ fn run() -> Result<()> {
             }
         },
         "fs" => match rest.first().map(|s| s.as_str()).unwrap_or("") {
-            "clean-orphans" => require_db(&db_path)
-                .and_then(|_| require_confirmation(dry_run, yes, "fs clean-orphans"))
-                .and_then(|_| {
-                    // Unguarded: orphan diff files are never referenced
-                    // by a live opencode session.
-                    let con = db::open_conn(&db_path, true)?;
-                    commands::fsops::cmd_fs_clean_orphans(&con, &rest[1..], dry_run, &dir, &db_path)
-                }),
             "clean-snapshots" => require_db(&db_path)
                 .and_then(|_| {
                     require_mutation_guard(
@@ -343,13 +372,33 @@ fn run() -> Result<()> {
                     )
                 })
                 .and_then(|_| {
-                    commands::fsops::cmd_fs_clean_snapshots(&rest[1..], dry_run, &dir, &db_path)
+                    let con = db::open_conn(&db_path, true)?;
+                    commands::fsops::cmd_fs_clean_snapshots(&con, &rest[1..], dry_run, &dir, &db_path)
                 }),
-            "clean-tool-output" => require_confirmation(dry_run, yes, "fs clean-tool-output")
+            "clean-shell" => require_db(&db_path)
                 .and_then(|_| {
-                    // Unguarded: the same retention-based cleanup opencode
-                    // performs itself while running.
-                    commands::fsops::cmd_fs_clean_tool_output(&rest[1..], dry_run, &dir, &db_path)
+                    require_mutation_guard(
+                        dry_run,
+                        yes,
+                        "fs clean-shell",
+                        "shell outputs are in use while opencode runs",
+                    )
+                })
+                .and_then(|_| {
+                    commands::fsops::cmd_fs_clean_shell(&rest[1..], dry_run, &dir, &db_path)
+                }),
+            "clean-blob-orphans" => require_db(&db_path)
+                .and_then(|_| {
+                    require_mutation_guard(
+                        dry_run,
+                        yes,
+                        "fs clean-blob-orphans",
+                        "blob cleanup needs exclusive access",
+                    )
+                })
+                .and_then(|_| {
+                    let mut con = db::open_conn(&db_path, dry_run)?;
+                    commands::fsops::cmd_fs_clean_blob_orphans(&mut con, &rest[1..], dry_run, &db_path)
                 }),
             "clean-log" => require_db(&db_path)
                 .and_then(|_| {

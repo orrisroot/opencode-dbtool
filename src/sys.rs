@@ -4,9 +4,11 @@ use crate::error::{AppError, Result};
 use std::path::Path;
 use sysinfo::{ProcessesToUpdate, System};
 
-/// Executable names of opencode processes: the 1.x/2.x CLI and server
-/// (`opencode`, `opencode-server`, the service is spawned from the same
-/// binary) and the 2.x beta npm executable (`opencode2`).
+/// Executable names of opencode processes: the CLI and server
+/// (`opencode`, `opencode-server`; the service is spawned from the same
+/// binary) plus the 2.x beta npm executable (`opencode2`). The beta name
+/// is kept deliberately: if a stale beta binary ever runs against the same
+/// data dir, destructive commands must still be refused.
 const TARGET_COMMS: [&str; 3] = ["opencode", "opencode-server", "opencode2"];
 
 /// File stem of a process name / path ("opencode.exe" -> "opencode").

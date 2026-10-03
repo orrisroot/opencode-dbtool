@@ -102,20 +102,9 @@ pub fn dir_size(path: &std::path::Path) -> u64 {
     total
 }
 
-/// `storage/session_diff` dir under the opencode data dir (one
-/// `<id>.json` per session).
-pub fn session_diff_dir(data_dir: &Path) -> PathBuf {
-    data_dir.join("storage").join("session_diff")
-}
-
 /// `snapshot` dir under the data dir (git object packs per project).
 pub fn snapshot_dir(data_dir: &Path) -> PathBuf {
     data_dir.join("snapshot")
-}
-
-/// `tool-output` dir under the data dir.
-pub fn tool_output_dir(data_dir: &Path) -> PathBuf {
-    data_dir.join("tool-output")
 }
 
 /// `log` dir under the data dir.
@@ -126,6 +115,92 @@ pub fn log_dir(data_dir: &Path) -> PathBuf {
 /// `log/opencode.log` file under the data dir.
 pub fn log_file(data_dir: &Path) -> PathBuf {
     log_dir(data_dir).join("opencode.log")
+}
+
+/// `shell` dir under the data dir (per-project shell command outputs,
+/// `<project-id>/sh_*.out`).
+pub fn shell_dir(data_dir: &Path) -> PathBuf {
+    data_dir.join("shell")
+}
+
+/// `repos` dir under the data dir (cached git repositories).
+pub fn repos_dir(data_dir: &Path) -> PathBuf {
+    data_dir.join("repos")
+}
+
+/// File modification time in epoch milliseconds; `None` when unavailable.
+pub fn file_mtime_ms(path: &Path) -> Option<i64> {
+    let meta = std::fs::metadata(path).ok()?;
+    let modified = meta.modified().ok()?;
+    let duration = modified.duration_since(UNIX_EPOCH).ok()?;
+    Some(duration.as_millis() as i64)
+}
+
+/// Parse an opencode log line's `timestamp=` prefix
+/// (`timestamp=2026-09-16T13:51:28.659Z ...`) into epoch milliseconds.
+/// Returns `None` when the line carries no parseable timestamp; callers
+/// keep such lines (never delete what cannot be dated).
+pub fn parse_log_ts(line: &str) -> Option<i64> {
+    let rest = line.strip_prefix("timestamp=")?;
+    // Fixed shape: `YYYY-MM-DDTHH:MM:SS.mmmZ` (millis optional).
+    let (date, time) = rest.split_once('T')?;
+    let (y, m, d) = (
+        date.get(0..4)?.parse::<i64>().ok()?,
+        date.get(5..7)?.parse::<i64>().ok()?,
+        date.get(8..10)?.parse::<i64>().ok()?,
+    );
+    let (hh, mm, ss_millis) = (
+        time.get(0..2)?.parse::<i64>().ok()?,
+        time.get(3..5)?.parse::<i64>().ok()?,
+        time.get(6..)?,
+    );
+    // Seconds, then optional `.mmm`, then a zone (`Z` or end).
+    let sec_end = ss_millis.find(|c: char| !c.is_ascii_digit()).unwrap_or(ss_millis.len());
+    let ss: i64 = ss_millis.get(..sec_end)?.parse().ok()?;
+    let mut millis: i64 = 0;
+    let mut tail = ss_millis.get(sec_end..).unwrap_or("");
+    if let Some(frac) = tail.strip_prefix('.') {
+        let digits: String = frac.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if digits.is_empty() {
+            return None;
+        }
+        let scale = 10i64.pow(3u32.saturating_sub(digits.len() as u32));
+        millis = digits.parse::<i64>().ok()?.saturating_mul(scale).min(999);
+        tail = &frac[digits.len()..];
+    }
+    if !tail.is_empty() && !tail.starts_with('Z') {
+        return None;
+    }
+    let days = days_from_civil(y, m, d)?;
+    Some((days * 86_400 + hh * 3600 + mm * 60 + ss) * 1000 + millis)
+}
+
+/// Days since the Unix epoch for a civil date (Howard Hinnant's
+/// algorithm); `None` on out-of-range input.
+fn days_from_civil(y: i64, m: i64, d: i64) -> Option<i64> {
+    if !(1..=12).contains(&m) || d < 1 {
+        return None;
+    }
+    // Reject impossible dates (e.g. Feb 30) instead of rolling over:
+    // callers treat `None` as "keep the line".
+    let leap = y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
+    let dim = match m {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if leap => 29,
+        2 => 28,
+        _ => return None,
+    };
+    if d > dim {
+        return None;
+    }
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let mp = (m + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    Some(era * 146097 + doe - 719468)
 }
 
 /// Decompose a unix-millis timestamp into UTC calendar fields.
@@ -253,6 +328,30 @@ mod tests {
         for bad in ["", "-1", "abc", "1.5"] {
             assert!(parse_count(bad).is_err(), "should reject: {bad:?}");
         }
+    }
+
+    #[test]
+    fn parse_log_ts_reads_opencode_lines() {
+        // 2026-09-16T13:51:28.659Z -> epoch millis.
+        assert_eq!(
+            super::parse_log_ts("timestamp=2026-09-16T13:51:28.659Z level=INFO foo"),
+            Some(1789566688659)
+        );
+        // No fractional seconds.
+        assert_eq!(
+            super::parse_log_ts("timestamp=2026-09-16T13:51:28Z x"),
+            Some(1789566688000)
+        );
+        // Garbage and dateless lines are kept by callers (None).
+        assert_eq!(super::parse_log_ts("no timestamp here"), None);
+        assert_eq!(super::parse_log_ts("timestamp=bogus"), None);
+        assert_eq!(super::parse_log_ts("timestamp=2026-13-99T99:99:99Z"), None);
+        // Impossible calendar dates are rejected, not rolled over.
+        assert_eq!(super::parse_log_ts("timestamp=2026-02-30T00:00:00Z"), None);
+        assert_eq!(
+            super::parse_log_ts("timestamp=2024-02-29T00:00:00Z"),
+            super::parse_log_ts("timestamp=2024-02-29T00:00:00.000Z")
+        );
     }
 
     #[test]

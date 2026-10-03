@@ -1,6 +1,4 @@
-//! Shared in-memory SQLite fixture for command tests.
-//!
-//! Mirrors the opencode schema subset the tool reads and writes.
+//! Shared in-memory SQLite fixture for command tests (V2-only).
 
 use rusqlite::Connection;
 use std::path::{Path, PathBuf};
@@ -33,19 +31,19 @@ pub fn create_at(path: &Path) -> Connection {
 fn schema(con: &Connection) {
     con.execute_batch(
         "CREATE TABLE project (id TEXT PRIMARY KEY, worktree TEXT, name TEXT);
-         CREATE TABLE session (id TEXT PRIMARY KEY, directory TEXT, title TEXT, parent_id TEXT, project_id TEXT REFERENCES project(id) ON DELETE CASCADE, workspace_id TEXT, time_updated INTEGER, cost REAL);
-         CREATE TABLE message (id TEXT, session_id TEXT, data BLOB, time_created INTEGER NOT NULL DEFAULT 0);
-         CREATE TABLE part (session_id TEXT, message_id TEXT, data TEXT, time_created INTEGER NOT NULL DEFAULT 0);
-         CREATE TABLE todo (session_id TEXT);
+         CREATE TABLE session_v2 (id TEXT PRIMARY KEY, directory TEXT, title TEXT, parent_id TEXT, project_id TEXT REFERENCES project(id) ON DELETE CASCADE, workspace_id TEXT, fork_session_id TEXT, fork_boundary TEXT, time_updated INTEGER, cost REAL, time_archived INTEGER, version TEXT NOT NULL DEFAULT '2.0.0');
+         CREATE TABLE session_message (id TEXT PRIMARY KEY, session_id TEXT REFERENCES session_v2(id) ON DELETE CASCADE, type TEXT, seq INTEGER NOT NULL DEFAULT 0, data TEXT, time_created INTEGER NOT NULL DEFAULT 0, time_updated INTEGER NOT NULL DEFAULT 0);
+         CREATE TABLE session_inbox (id TEXT PRIMARY KEY, session_id TEXT REFERENCES session_v2(id) ON DELETE CASCADE, type TEXT, payload TEXT NOT NULL, delivery TEXT NOT NULL, enqueued_seq INTEGER NOT NULL DEFAULT 0, time_created INTEGER NOT NULL DEFAULT 0);
+         CREATE TABLE session_pending (id TEXT PRIMARY KEY, session_id TEXT REFERENCES session_v2(id) ON DELETE CASCADE, type TEXT, data TEXT NOT NULL, delivery TEXT, admitted_seq INTEGER NOT NULL DEFAULT 0, time_created INTEGER NOT NULL DEFAULT 0);
+         CREATE TABLE instruction_entry (session_id TEXT REFERENCES session_v2(id) ON DELETE CASCADE, key TEXT NOT NULL, value TEXT, PRIMARY KEY (session_id, key));
+         CREATE TABLE instruction_state (session_id TEXT PRIMARY KEY REFERENCES session_v2(id) ON DELETE CASCADE, epoch_start INTEGER NOT NULL DEFAULT 0, through_seq INTEGER NOT NULL DEFAULT 0, initial_values TEXT NOT NULL DEFAULT '{}', current_values TEXT NOT NULL DEFAULT '{}');
+         CREATE TABLE instruction_blob (hash TEXT PRIMARY KEY, value TEXT);
          CREATE TABLE event (aggregate_id TEXT, type TEXT, data BLOB);
-         CREATE TABLE event_sequence (aggregate_id TEXT);
-         CREATE TABLE session_share (session_id TEXT);
-         CREATE TABLE session_input (session_id TEXT);
-         CREATE TABLE session_message (id TEXT PRIMARY KEY, session_id TEXT, type TEXT, seq INTEGER NOT NULL DEFAULT 0, data TEXT);
-         CREATE TABLE session_context_epoch (session_id TEXT);
+         CREATE TABLE event_sequence (aggregate_id TEXT PRIMARY KEY, seq INTEGER NOT NULL DEFAULT 0, owner_id TEXT);
          CREATE TABLE permission (project_id TEXT);
-         CREATE TABLE project_directory (project_id TEXT);
-         CREATE TABLE workspace (id TEXT PRIMARY KEY, project_id TEXT);",
+         CREATE TABLE worktree (project_id TEXT, directory TEXT);
+         CREATE TABLE kv (key TEXT PRIMARY KEY, value TEXT NOT NULL, time_created INTEGER NOT NULL DEFAULT 0, time_updated INTEGER NOT NULL DEFAULT 0);
+         CREATE TABLE workspace (id TEXT PRIMARY KEY, provider TEXT NOT NULL, binding TEXT, created_at INTEGER NOT NULL DEFAULT 0, last_used_at INTEGER NOT NULL DEFAULT 0);",
     )
     .unwrap();
 }
@@ -62,22 +60,8 @@ pub fn insert_session_at(
     updated: i64,
 ) {
     con.execute(
-        "INSERT INTO session (id, directory, title, parent_id, time_updated, cost) VALUES (?1, ?2, ?3, ?4, ?5, 0)",
+        "INSERT INTO session_v2 (id, directory, title, parent_id, time_updated, cost) VALUES (?1, ?2, ?3, ?4, ?5, 0)",
         rusqlite::params![id, dir, id, parent, updated],
-    )
-    .unwrap();
-}
-
-/// Insert a part with a raw JSON `data` payload (e.g. `{"type":"reasoning"}`).
-pub fn insert_part(con: &Connection, session_id: &str, data: &str) {
-    insert_part_at(con, session_id, data, 0);
-}
-
-/// Insert a part with an explicit creation timestamp.
-pub fn insert_part_at(con: &Connection, session_id: &str, data: &str, time_created: i64) {
-    con.execute(
-        "INSERT INTO part (session_id, data, time_created) VALUES (?1, ?2, ?3)",
-        rusqlite::params![session_id, data, time_created],
     )
     .unwrap();
 }
@@ -106,18 +90,12 @@ pub fn insert_session_message(
     .unwrap();
 }
 
-pub fn part_count(con: &Connection) -> i64 {
-    con.query_row("SELECT COUNT(*) FROM part", [], |r| r.get(0))
-        .unwrap()
-}
-
-pub fn reasoning_part_count(con: &Connection) -> i64 {
-    con.query_row(
-        "SELECT COUNT(*) FROM part WHERE json_extract(data, '$.type') = 'reasoning'",
-        [],
-        |r| r.get(0),
+pub fn insert_inbox(con: &Connection, id: &str, session_id: &str, payload: &str) {
+    con.execute(
+        "INSERT INTO session_inbox (id, session_id, type, payload, delivery, enqueued_seq) VALUES (?1, ?2, 'prompt', ?3, 'steer', 0)",
+        rusqlite::params![id, session_id, payload],
     )
-    .unwrap()
+    .unwrap();
 }
 
 pub fn insert_project(con: &Connection, id: &str, worktree: &str) {
@@ -138,14 +116,14 @@ pub fn insert_project_session(
     updated: i64,
 ) {
     con.execute(
-        "INSERT INTO session (id, directory, title, parent_id, project_id, time_updated, cost) VALUES (?1, ?2, ?3, NULL, ?4, ?5, 0)",
+        "INSERT INTO session_v2 (id, directory, title, parent_id, project_id, time_updated, cost) VALUES (?1, ?2, ?3, NULL, ?4, ?5, 0)",
         rusqlite::params![id, dir, id, project_id, updated],
     )
     .unwrap();
 }
 
 pub fn session_count(con: &Connection) -> i64 {
-    con.query_row("SELECT COUNT(*) FROM session", [], |r| r.get(0))
+    con.query_row("SELECT COUNT(*) FROM session_v2", [], |r| r.get(0))
         .unwrap()
 }
 

@@ -41,28 +41,28 @@ pub fn env_status(db_path: &Path) -> EnvStatus {
     }
 }
 
-/// Tables the tool depends on (opencode >= 1.18.0 schema).
-fn required_tables() -> &'static [&'static str] {
-    &[
-        "session",
+/// Session table. V2-only: `session_v2`.
+pub const SESSION_TABLE: &str = "session_v2";
+
+/// Verify the database carries the opencode 2.x schema. V1 databases
+/// (`session`/`message`/`part`/...) are not supported. Older or corrupt
+/// databases fail with a descriptive error (exit 3).
+pub fn ensure_schema(con: &Connection) -> Result<()> {
+    // Core tables every command needs. Global tables (`kv`, `account`,
+    // `workspace`, ...) are intentionally not required.
+    for t in [
         "project",
-        "part",
+        "session_v2",
+        "session_message",
+        "session_inbox",
+        "session_pending",
+        "instruction_entry",
+        "instruction_state",
         "event",
         "event_sequence",
-        "session_message",
-        "session_input",
-        "session_context_epoch",
-        "workspace",
+        "worktree",
         "permission",
-        "project_directory",
-    ]
-}
-
-/// Verify the database carries the opencode schema the tool expects.
-/// Older databases (pre 1.18.0) fail with a descriptive error (exit 3).
-pub fn ensure_schema(con: &Connection) -> Result<()> {
-    let mut missing: Vec<&str> = Vec::new();
-    for t in required_tables() {
+    ] {
         let n: i64 = con
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
@@ -71,15 +71,11 @@ pub fn ensure_schema(con: &Connection) -> Result<()> {
             )
             .map_err(|e| AppError::db(e.to_string()))?;
         if n == 0 {
-            missing.push(t);
+            return Err(AppError::db(format!(
+                "database schema is not supported (missing table: {t}) - \
+                 open the database once with opencode 2.x so its migrations run, then retry"
+            )));
         }
-    }
-    if !missing.is_empty() {
-        return Err(AppError::db(format!(
-            "database schema is not supported (missing table(s): {}) - \
-             open the database once with opencode >= 1.18.0 so its migrations run, then retry",
-            missing.join(", ")
-        )));
     }
     Ok(())
 }
@@ -113,6 +109,26 @@ pub fn file_size(path: &Path) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_table_is_v2() {
+        assert_eq!(SESSION_TABLE, "session_v2");
+        let con = crate::testdb::create();
+        ensure_schema(&con).unwrap();
+    }
+
+    #[test]
+    fn ensure_schema_rejects_v1_db() {
+        // V1 layout (legacy `session` table) is no longer supported.
+        let con = rusqlite::Connection::open_in_memory().unwrap();
+        con.execute_batch(
+            "CREATE TABLE session (id TEXT PRIMARY KEY); CREATE TABLE project (id TEXT PRIMARY KEY);",
+        )
+        .unwrap();
+        let err = ensure_schema(&con).unwrap_err();
+        assert_eq!(err.code, 3);
+        assert!(err.message.contains("session_v2"));
+    }
 
     #[test]
     fn env_status_serializes_running_shape() {

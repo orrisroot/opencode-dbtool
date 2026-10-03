@@ -19,9 +19,9 @@ struct SessionDetailOut {
     title: String,
     parent_id: Option<String>,
     updated: String,
-    msgs: i64,
-    parts: i64,
+    archived: bool,
     events: i64,
+    session_messages: i64,
     cost: f64,
 }
 
@@ -45,10 +45,6 @@ struct ProjectDeleteOut {
     projects: Vec<ProjectBriefOut>,
     rows: serde_json::Map<String, serde_json::Value>,
     deleted: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    diff_files_removed: Option<usize>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    diff_bytes_removed: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     note: Option<String>,
 }
@@ -89,25 +85,27 @@ pub fn cmd_project_show(con: &Connection, args: &[String]) -> Result<()> {
 
 /// Project object plus per-session breakdown.
 fn project_detail(con: &Connection, full: ProjectRow) -> Result<serde_json::Value> {
+    use crate::db::SESSION_TABLE;
     let mut out = serde_json::to_value(project_json(&full))?;
+    let sql = format!(
+        "SELECT id, COALESCE(title,''), parent_id, time_updated, \
+         time_archived IS NOT NULL, \
+         (SELECT COUNT(*) FROM event e WHERE e.aggregate_id = s.id), \
+         (SELECT COUNT(*) FROM session_message sm WHERE sm.session_id = s.id), \
+         s.cost \
+         FROM \"{SESSION_TABLE}\" s WHERE s.project_id = ?1 ORDER BY s.time_updated DESC"
+    );
     let sessions: Vec<SessionDetailOut> = {
-        let mut stmt = con.prepare(
-            "SELECT id, title, parent_id, time_updated, \
-             (SELECT COUNT(*) FROM message m WHERE m.session_id = s.id), \
-             (SELECT COUNT(*) FROM part p WHERE p.session_id = s.id), \
-             (SELECT COUNT(*) FROM event e WHERE e.aggregate_id = s.id), \
-             s.cost \
-             FROM session s WHERE s.project_id = ?1 ORDER BY s.time_updated DESC",
-        )?;
+        let mut stmt = con.prepare(&sql)?;
         let rows = stmt.query_map(params![full.id], |r| {
             Ok(SessionDetailOut {
                 id: r.get(0)?,
                 title: r.get(1)?,
                 parent_id: r.get(2)?,
                 updated: crate::util::dt(r.get::<_, i64>(3)?),
-                msgs: r.get(4)?,
-                parts: r.get(5)?,
-                events: r.get(6)?,
+                archived: r.get(4)?,
+                events: r.get(5)?,
+                session_messages: r.get(6)?,
                 cost: crate::util::round4(r.get::<_, f64>(7)?),
             })
         })?;
@@ -121,7 +119,6 @@ pub fn cmd_project_delete(
     con: &mut Connection,
     args: &[String],
     dry_run: bool,
-    data_dir: &Path,
     db_path: &Path,
 ) -> Result<()> {
     let ids = parse_id_args(args)?;
@@ -138,7 +135,7 @@ pub fn cmd_project_delete(
             None => return Err(AppError::usage(format!("project not found: {id}"))),
         }
     }
-    delete_output(con, &projects, dry_run, data_dir, db_path, None)
+    delete_output(con, &projects, dry_run, db_path, None)
 }
 
 /// Delete the projects selected by filters. At least one filter is
@@ -147,20 +144,19 @@ pub fn cmd_project_purge(
     con: &mut Connection,
     args: &[String],
     dry_run: bool,
-    data_dir: &Path,
     db_path: &Path,
 ) -> Result<()> {
     let filters = parse_purge_args(args)?;
     if filters.is_empty() {
         return Err(AppError::usage(
-            "usage: opencode-dbtool project purge [--older-than <age>] [--path <dir>...]",
+            "usage: opencode-dbtool project purge [--older-than <age>] [--path <dir>...] [--empty]",
         ));
     }
     let projects: Vec<ProjectRow> = load_projects(con)?
         .into_iter()
         .filter(|p| filters.matches(p))
         .collect();
-    delete_output(con, &projects, dry_run, data_dir, db_path, Some(&filters))
+    delete_output(con, &projects, dry_run, db_path, Some(&filters))
 }
 
 /// Parse `project delete` args: ids only; flags are rejected.
@@ -185,12 +181,13 @@ fn parse_id_args(args: &[String]) -> Result<Vec<String>> {
 }
 
 /// Parse purge filter flags: `--older-than <age>`, `--path <dir>`
-/// (repeatable). Positional args and `--subagents` are rejected.
+/// (repeatable), `--empty`. Positional args and `--subagents` are rejected.
 fn parse_purge_args(args: &[String]) -> Result<ProjectFilter> {
     let mut f = ProjectFilter {
         older_than_raw: None,
         cutoff_ms: None,
         paths: Vec::new(),
+        empty: false,
     };
     let mut i = 0;
     while i < args.len() {
@@ -211,6 +208,10 @@ fn parse_purge_args(args: &[String]) -> Result<ProjectFilter> {
                 f.paths.push(p.clone());
                 i += 2;
             }
+            "--empty" => {
+                f.empty = true;
+                i += 1;
+            }
             "--subagents" | "--larger-than" | "--keep-latest" => {
                 return Err(AppError::usage(format!(
                     "{} does not apply to projects",
@@ -229,10 +230,10 @@ fn delete_output(
     con: &mut Connection,
     projects: &[ProjectRow],
     dry_run: bool,
-    data_dir: &Path,
     db_path: &Path,
     filters: Option<&ProjectFilter>,
 ) -> Result<()> {
+    use crate::db::SESSION_TABLE;
     let projects_json: Vec<ProjectBriefOut> = projects
         .iter()
         .map(|p| ProjectBriefOut {
@@ -258,8 +259,6 @@ fn delete_output(
         projects: projects_json,
         rows: rows_map,
         deleted: false,
-        diff_files_removed: None,
-        diff_bytes_removed: None,
         note: None,
     };
     if dry_run {
@@ -271,25 +270,17 @@ fn delete_output(
         .collect::<Vec<_>>()
         .join(", ");
     let project_ids: Vec<&str> = projects.iter().map(|p| p.id.as_str()).collect();
-    let session_ids: Vec<String> = {
-        let mut stmt = con.prepare(&format!(
-            "SELECT id FROM session WHERE project_id IN ({plist})"
-        ))?;
-        let rows = stmt.query_map(rusqlite::params_from_iter(&project_ids), |r| {
-            r.get::<_, String>(0)
-        })?;
-        rows.collect::<std::result::Result<Vec<_>, _>>()?
-    };
     con.execute_batch("PRAGMA foreign_keys = ON;")?;
     let tx = con.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-    // event tables have no FK to session/project, so they must be deleted
-    // explicitly; sessions and their rows follow via ON DELETE CASCADE.
+    // event tables reference aggregates, not projects, so they must be
+    // deleted explicitly; sessions and their rows follow via ON DELETE
+    // CASCADE on the project row.
     tx.execute(
-        &format!("DELETE FROM event WHERE aggregate_id IN (SELECT id FROM session WHERE project_id IN ({plist}))"),
+        &format!("DELETE FROM event WHERE aggregate_id IN (SELECT id FROM \"{SESSION_TABLE}\" WHERE project_id IN ({plist}))"),
         rusqlite::params_from_iter(&project_ids),
     )?;
     tx.execute(
-        &format!("DELETE FROM event_sequence WHERE aggregate_id IN (SELECT id FROM session WHERE project_id IN ({plist}))"),
+        &format!("DELETE FROM event_sequence WHERE aggregate_id IN (SELECT id FROM \"{SESSION_TABLE}\" WHERE project_id IN ({plist}))"),
         rusqlite::params_from_iter(&project_ids),
     )?;
     tx.execute(
@@ -306,44 +297,18 @@ fn delete_output(
         |r| r.get(0),
     )?;
     let remaining_sessions: i64 = con.query_row(
-        &format!("SELECT COUNT(*) FROM session WHERE project_id IN ({plist})"),
+        &format!("SELECT COUNT(*) FROM \"{SESSION_TABLE}\" WHERE project_id IN ({plist})"),
         rusqlite::params_from_iter(&project_ids),
         |r| r.get(0),
     )?;
-    let remaining_workspaces: i64 = con.query_row(
-        &format!("SELECT COUNT(*) FROM workspace WHERE project_id IN ({plist})"),
-        rusqlite::params_from_iter(&project_ids),
-        |r| r.get(0),
-    )?;
-    if remaining_projects > 0 || remaining_sessions > 0 || remaining_workspaces > 0 {
+    if remaining_projects > 0 || remaining_sessions > 0 {
         return Err(AppError::usage(
             "some project data still exists after delete",
         ));
     }
-    let (diff_files, diff_bytes) = remove_diff_files(data_dir, &session_ids);
     out.deleted = true;
-    out.diff_files_removed = Some(diff_files);
-    out.diff_bytes_removed = Some(diff_bytes);
     out.note = Some("file size is unchanged until `opencode-dbtool vacuum` is run".into());
     print_json(&serde_json::to_value(&out)?)
-}
-
-/// Best-effort removal of `storage/session_diff/<id>.json` files;
-/// missing files are ignored. Returns (files removed, bytes removed).
-fn remove_diff_files(data_dir: &Path, ids: &[String]) -> (usize, u64) {
-    let dir = crate::util::session_diff_dir(data_dir);
-    let mut removed = 0;
-    let mut bytes = 0;
-    for id in ids {
-        let p = dir.join(format!("{id}.json"));
-        if let Ok(meta) = std::fs::metadata(&p) {
-            if std::fs::remove_file(&p).is_ok() {
-                removed += 1;
-                bytes += meta.len();
-            }
-        }
-    }
-    (removed, bytes)
 }
 
 #[cfg(test)]
@@ -362,7 +327,6 @@ mod tests {
             &mut con,
             &["p1".to_string()],
             false,
-            Path::new("/tmp"),
             Path::new("/tmp/x.db"),
         )
         .unwrap();
@@ -380,7 +344,6 @@ mod tests {
             &mut con,
             &["--path".to_string(), "/a".to_string()],
             false,
-            Path::new("/tmp"),
             Path::new("/tmp/x.db"),
         )
         .unwrap_err();
@@ -399,7 +362,6 @@ mod tests {
             &mut con,
             &["--path".to_string(), "/a".to_string()],
             false,
-            Path::new("/tmp"),
             Path::new("/tmp/x.db"),
         )
         .unwrap();
@@ -416,14 +378,7 @@ mod tests {
         let mut con = testdb::create();
         testdb::insert_project(&con, "p1", "/a");
 
-        let err = cmd_project_purge(
-            &mut con,
-            &[],
-            false,
-            Path::new("/tmp"),
-            Path::new("/tmp/x.db"),
-        )
-        .unwrap_err();
+        let err = cmd_project_purge(&mut con, &[], false, Path::new("/tmp/x.db")).unwrap_err();
         assert_eq!(err.code, 2);
     }
 
@@ -441,7 +396,6 @@ mod tests {
             &mut con,
             &["--older-than".to_string(), "30d".to_string()],
             false,
-            Path::new("/tmp"),
             Path::new("/tmp/x.db"),
         )
         .unwrap();
@@ -463,7 +417,6 @@ mod tests {
             &mut con,
             &["--path".to_string(), "/a".to_string()],
             true,
-            Path::new("/tmp"),
             Path::new("/tmp/x.db"),
         )
         .unwrap();
@@ -500,26 +453,25 @@ mod tests {
     }
 
     #[test]
-    fn delete_removes_session_diff_files() {
-        let dir = testdb::temp_data_dir("proj-diff");
-        let db_path = dir.join("opencode.db");
-        let mut con = testdb::create_at(&db_path);
-        testdb::insert_project(&con, "p1", "/a");
-        testdb::insert_project_session(&con, "s1", "/a", "p1", 0);
-        testdb::insert_project_session(&con, "s2", "/a", "p1", 0);
-        let diff = dir.join("storage/session_diff");
-        std::fs::create_dir_all(&diff).unwrap();
-        std::fs::write(diff.join("s1.json"), vec![0u8; 4]).unwrap();
-        std::fs::write(diff.join("s2.json"), vec![0u8; 6]).unwrap();
-        std::fs::write(diff.join("other.json"), vec![0u8; 8]).unwrap();
+    fn purge_empty_selects_projects_without_sessions() {
+        let mut con = testdb::create();
+        testdb::insert_project(&con, "empty", "/a");
+        testdb::insert_project(&con, "full", "/b");
+        testdb::insert_project_session(&con, "s1", "/b", "full", 0);
 
-        cmd_project_delete(&mut con, &["p1".to_string()], false, &dir, &db_path).unwrap();
+        cmd_project_purge(
+            &mut con,
+            &["--empty".to_string()],
+            false,
+            Path::new("/tmp/x.db"),
+        )
+        .unwrap();
 
-        assert!(!diff.join("s1.json").exists());
-        assert!(!diff.join("s2.json").exists());
-        assert!(diff.join("other.json").exists(), "unrelated file kept");
-        drop(con);
-        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(testdb::project_count(&con), 1);
+        let remaining: String = con
+            .query_row("SELECT id FROM project", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(remaining, "full");
     }
 
     #[test]
