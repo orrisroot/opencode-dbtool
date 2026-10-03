@@ -449,7 +449,7 @@ pub enum KvCmd {
     Delete(KvDeleteArgs),
     /// Delete all kv entries matching age/size filters in one pass
     #[command(
-        after_help = "Examples:\n  opencode-dbtool kv purge --older-than 30d --dry-run\n  opencode-dbtool kv purge --larger-than 1MB --yes"
+        after_help = "Examples:\n  opencode-dbtool kv purge --older-than 30d --dry-run\n  opencode-dbtool kv purge --larger-than 1M --yes"
     )]
     Purge(KvPurgeArgs),
 }
@@ -483,7 +483,7 @@ pub struct KvPurgeArgs {
     /// Only entries not updated since the cutoff
     #[arg(long, value_name = "AGE", value_parser = age_value)]
     pub older_than: Option<String>,
-    /// Only entries larger than this (e.g. 1MB)
+    /// Only entries larger than this (e.g. 1M)
     #[arg(long = "larger-than", value_name = "SIZE", value_parser = size_value)]
     pub larger_than: Option<String>,
 }

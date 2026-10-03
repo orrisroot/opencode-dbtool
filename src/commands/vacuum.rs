@@ -129,7 +129,9 @@ struct VacuumIntoOut {
 /// database, so it is safe while opencode runs; swap the copy in with
 /// `backup restore` while opencode is stopped.
 pub fn cmd_vacuum_into(db_path: &Path, target: &Path, dry_run: bool) -> Result<()> {
-    if target.exists() {
+    // SQLite accepts a missing target or an empty file; a failed run can
+    // leave a 0-byte file behind, so only non-empty files block a retry.
+    if crate::db::file_size(target) > 0 {
         return Err(AppError::usage(format!(
             "target already exists: {}",
             target.display()

@@ -2183,7 +2183,11 @@ fn fs_clean_repos_dry_run_lists_entries() {
     );
     let v = stdout_json(&out);
     assert_eq!(v["total_entries"], 1);
-    assert_eq!(v["entries"][0]["path"], "github.com/o/r@main");
+    // Compare as `Path` so Windows separators are treated as equivalent.
+    assert_eq!(
+        std::path::Path::new(v["entries"][0]["path"].as_str().unwrap()),
+        std::path::Path::new("github.com/o/r@main")
+    );
 
     // Real runs are guarded while this harness runs under opencode.
     let out = run(&["fs", "clean-repos", "--yes"], &dir);
@@ -2237,6 +2241,20 @@ fn vacuum_into_writes_a_compacted_copy() {
         &dir,
     );
     assert_eq!(out.status.code(), Some(2));
+
+    // A 0-byte leftover (e.g. from a failed run) is accepted, like SQLite.
+    let empty = dir.join("empty.db");
+    std::fs::write(&empty, b"").unwrap();
+    let out = run(
+        &["vacuum", "--into", empty.to_str().unwrap(), "--yes"],
+        &dir,
+    );
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(stdout_json(&out)["integrity"], "ok");
 
     std::fs::remove_dir_all(&dir).unwrap();
 }

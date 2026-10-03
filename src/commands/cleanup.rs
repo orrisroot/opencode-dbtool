@@ -194,14 +194,16 @@ pub fn cmd_cleanup(
     };
 
     let note = if dry_run {
-        if vacuum_skipped {
-            Some(
-                "preview only; VACUUM will be skipped while opencode is running (use `vacuum --online`)"
-                    .to_string(),
-            )
+        let mut note = if vacuum_skipped {
+            "preview only; VACUUM will be skipped while opencode is running (use `vacuum --online`)"
+                .to_string()
         } else {
-            Some("preview only; re-run with --yes to apply".to_string())
+            "preview only; re-run with --yes to apply".to_string()
+        };
+        if args.verify {
+            note.push_str("; `--verify` runs after the real cleanup");
         }
+        Some(note)
     } else if vacuum_skipped {
         Some(
             "VACUUM skipped while opencode is running; run `opencode-dbtool vacuum --online` or stop the service"

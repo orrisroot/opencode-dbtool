@@ -799,7 +799,11 @@ mod tests {
 
         let v = repos_cleanup_value(None, true, &dir, &db_path).unwrap();
         assert_eq!(v["total_entries"], 1);
-        assert_eq!(v["entries"][0]["path"], "github.com/owner/repo@main");
+        // Compare as `Path` so Windows separators are treated as equivalent.
+        assert_eq!(
+            std::path::Path::new(v["entries"][0]["path"].as_str().unwrap()),
+            std::path::Path::new("github.com/owner/repo@main")
+        );
         assert!(repo.exists(), "dry-run changes nothing");
 
         repos_cleanup_value(None, false, &dir, &db_path).unwrap();
