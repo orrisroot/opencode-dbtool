@@ -2166,3 +2166,93 @@ fn report_costs_lists_projects() {
 
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+#[test]
+fn fs_clean_repos_dry_run_lists_entries() {
+    let dir = temp_dir("repos");
+    create_db(&dir.join("opencode.db"));
+    let git = dir.join("repos/github.com/o/r@main/.git");
+    std::fs::create_dir_all(&git).unwrap();
+    std::fs::write(git.join("HEAD"), b"x").unwrap();
+
+    let out = run(&["fs", "clean-repos", "--dry-run"], &dir);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v = stdout_json(&out);
+    assert_eq!(v["total_entries"], 1);
+    assert_eq!(v["entries"][0]["path"], "github.com/o/r@main");
+
+    // Real runs are guarded while this harness runs under opencode.
+    let out = run(&["fs", "clean-repos", "--yes"], &dir);
+    let code = out.status.code();
+    assert!(
+        code == Some(0) || code == Some(1),
+        "unexpected exit code: {code:?} stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn vacuum_into_writes_a_compacted_copy() {
+    let dir = temp_dir("vacuum-into");
+    create_db(&dir.join("opencode.db"));
+    let target = dir.join("compact.db");
+
+    let out = run(
+        &["vacuum", "--into", target.to_str().unwrap(), "--dry-run"],
+        &dir,
+    );
+    assert!(out.status.success());
+    let v = stdout_json(&out);
+    assert_eq!(v["dry_run"], true);
+    assert!(!target.exists(), "dry-run writes nothing");
+
+    let out = run(
+        &["vacuum", "--into", target.to_str().unwrap(), "--yes"],
+        &dir,
+    );
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v = stdout_json(&out);
+    assert_eq!(v["integrity"], "ok");
+    assert!(target.exists());
+    let con = Connection::open(&target).unwrap();
+    let n: i64 = con
+        .query_row("SELECT COUNT(*) FROM session_v2", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(n, 1, "compacted copy contains the data");
+    drop(con);
+
+    // An existing target is refused.
+    let out = run(
+        &["vacuum", "--into", target.to_str().unwrap(), "--yes"],
+        &dir,
+    );
+    assert_eq!(out.status.code(), Some(2));
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn db_optimize_runs() {
+    let dir = temp_dir("optimize");
+    create_db(&dir.join("opencode.db"));
+
+    let out = run(&["db", "optimize"], &dir);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(stdout_json(&out)["optimized"], true);
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}

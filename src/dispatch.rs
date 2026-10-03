@@ -193,9 +193,13 @@ fn mutation_guard<'a>(
             "fs clean-log",
             Some("truncating the log while opencode runs is not allowed"),
         )),
+        Command::Fs(FsCmd::Repos(_)) => Some((
+            "fs clean-repos",
+            Some("repository caches are in use while opencode runs"),
+        )),
         Command::Vacuum(a) => Some((
             "VACUUM",
-            if a.online {
+            if a.online || a.into.is_some() {
                 None
             } else {
                 Some("VACUUM needs exclusive access")
@@ -510,6 +514,10 @@ fn dispatch(
                 let con = db::open_conn(db_path, true)?;
                 commands::dbinfo::cmd_db_path(&con, db_path)
             }
+            DbCmd::Optimize => {
+                let con = db::open_conn(db_path, false)?;
+                commands::dbinfo::cmd_db_optimize(&con, db_path)
+            }
         },
         Command::Backup(a) => {
             if a.keep_backups.is_some() && a.command.is_some() {
@@ -558,8 +566,14 @@ fn dispatch(
             FsCmd::Log(a) => {
                 commands::fsops::cmd_fs_clean_log(a.older_than.as_deref(), dry_run, dir, db_path)
             }
+            FsCmd::Repos(a) => {
+                commands::fsops::cmd_fs_clean_repos(a.older_than.as_deref(), dry_run, dir, db_path)
+            }
         },
-        Command::Vacuum(a) => commands::vacuum::cmd_vacuum_cli(db_path, a, dry_run),
+        Command::Vacuum(a) => match &a.into {
+            Some(target) => commands::vacuum::cmd_vacuum_into(db_path, target, dry_run),
+            None => commands::vacuum::cmd_vacuum_cli(db_path, a, dry_run),
+        },
         Command::Report(a) => {
             let con = db::open_conn(db_path, true)?;
             commands::report::cmd_report(&con, db_path, a.costs)

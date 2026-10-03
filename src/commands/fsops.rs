@@ -8,7 +8,7 @@ use crate::db::{env_status, EnvStatus};
 use crate::error::Result;
 use crate::output;
 use crate::util::{
-    dir_size, file_mtime_ms, log_file, now_ms, parse_age_ms, shell_dir, snapshot_dir,
+    dir_size, file_mtime_ms, log_file, now_ms, parse_age_ms, repos_dir, shell_dir, snapshot_dir,
 };
 use rusqlite::Connection;
 use serde::Serialize;
@@ -89,6 +89,133 @@ struct LogOut {
     #[serde(skip_serializing_if = "Option::is_none")]
     older_than: Option<String>,
     deleted: bool,
+}
+
+/// Delete cached git repositories (`repos/<host>/<path>[@branch]`).
+/// Entries are detected by their `.git` directory; with `--older-than`
+/// only entries whose newest file is older than the cutoff are removed.
+pub fn cmd_fs_clean_repos(
+    older_than: Option<&str>,
+    dry_run: bool,
+    data_dir: &Path,
+    db_path: &Path,
+) -> Result<()> {
+    output::emit(&repos_cleanup_value(
+        older_than, dry_run, data_dir, db_path,
+    )?)
+}
+
+/// One cached repository entry.
+#[derive(Serialize)]
+struct RepoEntry {
+    path: String,
+    bytes: u64,
+}
+
+#[derive(Serialize)]
+struct ReposOut {
+    #[serde(flatten)]
+    env: EnvStatus,
+    dry_run: bool,
+    dir: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    older_than: Option<String>,
+    entries: Vec<RepoEntry>,
+    total_entries: usize,
+    total_bytes: u64,
+    deleted: bool,
+}
+
+/// Delete cached git repositories and return the output value.
+pub fn repos_cleanup_value(
+    older_than: Option<&str>,
+    dry_run: bool,
+    data_dir: &Path,
+    db_path: &Path,
+) -> Result<serde_json::Value> {
+    let cutoff = match older_than {
+        Some(age) => Some(now_ms()? - parse_age_ms(age)?),
+        None => None,
+    };
+    let dir = repos_dir(data_dir);
+    let mut entries = Vec::new();
+    let mut total_bytes = 0;
+    collect_repo_entries(&dir, &dir, cutoff, &mut entries, &mut total_bytes);
+    entries.sort_by(|a, b| a.path.cmp(&b.path));
+    let mut out = ReposOut {
+        env: env_status(db_path),
+        dry_run,
+        dir: dir.to_string_lossy().to_string(),
+        older_than: older_than.map(str::to_string),
+        total_entries: entries.len(),
+        total_bytes,
+        entries,
+        deleted: false,
+    };
+    if dry_run {
+        return Ok(serde_json::to_value(&out)?);
+    }
+    for e in &out.entries {
+        std::fs::remove_dir_all(dir.join(&e.path)).map_err(|err| {
+            crate::error::AppError::db(format!("cannot remove repository cache {}: {err}", e.path))
+        })?;
+    }
+    remove_empty_dirs(&dir);
+    out.deleted = true;
+    Ok(serde_json::to_value(&out)?)
+}
+
+fn collect_repo_entries(
+    base: &Path,
+    dir: &Path,
+    cutoff: Option<i64>,
+    entries: &mut Vec<RepoEntry>,
+    total_bytes: &mut u64,
+) {
+    // A directory containing `.git` is a cache entry; do not descend.
+    if dir.join(".git").is_dir() {
+        if let Some(cutoff) = cutoff {
+            if newest_mtime(dir).unwrap_or(0) >= cutoff {
+                return; // recently used, keep
+            }
+        }
+        let bytes = dir_size(dir);
+        let rel = dir
+            .strip_prefix(base)
+            .map(|r| r.to_string_lossy().to_string())
+            .unwrap_or_default();
+        *total_bytes += bytes;
+        entries.push(RepoEntry { path: rel, bytes });
+        return;
+    }
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for e in rd.flatten() {
+        if e.file_type().is_ok_and(|ft| ft.is_dir()) {
+            collect_repo_entries(base, &e.path(), cutoff, entries, total_bytes);
+        }
+    }
+}
+
+/// Newest file mtime under `dir` (cache freshness heuristic); directory
+/// mtimes are ignored so touching a file (git fetch) is what counts.
+fn newest_mtime(dir: &Path) -> Option<i64> {
+    let mut newest: Option<i64> = None;
+    if let Ok(rd) = std::fs::read_dir(dir) {
+        for e in rd.flatten() {
+            let p = e.path();
+            let m = if e.file_type().is_ok_and(|ft| ft.is_dir()) {
+                newest_mtime(&p)
+            } else {
+                file_mtime_ms(&p)
+            };
+            if let Some(m) = m {
+                newest = Some(newest.map_or(m, |n| n.max(m)));
+            }
+        }
+    }
+    newest.or_else(|| file_mtime_ms(dir))
 }
 
 /// Truncate `log/opencode.log` to zero bytes, or with `--older-than
@@ -657,6 +784,57 @@ mod tests {
         let db_path = dir.join("opencode.db");
 
         cmd_fs_clean_log(None, false, &dir, &db_path).unwrap();
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn clean_repos_removes_cache_entries() {
+        let dir = temp_data_dir("repos");
+        let db_path = dir.join("opencode.db");
+        let con = testdb::create_at(&db_path);
+        let repo = dir.join("repos/github.com/owner/repo@main");
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        fs::write(repo.join(".git/HEAD"), b"ref: x").unwrap();
+        fs::write(repo.join("file"), b"x").unwrap();
+
+        let v = repos_cleanup_value(None, true, &dir, &db_path).unwrap();
+        assert_eq!(v["total_entries"], 1);
+        assert_eq!(v["entries"][0]["path"], "github.com/owner/repo@main");
+        assert!(repo.exists(), "dry-run changes nothing");
+
+        repos_cleanup_value(None, false, &dir, &db_path).unwrap();
+        assert!(!repo.exists());
+        drop(con);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn clean_repos_older_than_keeps_recent_entries() {
+        use std::fs::File;
+        use std::time::{Duration, SystemTime};
+
+        let dir = temp_data_dir("repos-old");
+        let db_path = dir.join("opencode.db");
+        let con = testdb::create_at(&db_path);
+        let old = dir.join("repos/github.com/a/old");
+        let recent = dir.join("repos/github.com/a/recent");
+        fs::create_dir_all(old.join(".git")).unwrap();
+        fs::write(old.join(".git/HEAD"), b"x").unwrap();
+        fs::create_dir_all(recent.join(".git")).unwrap();
+        fs::write(recent.join(".git/HEAD"), b"x").unwrap();
+        // Backdate the old entry's newest file by two days.
+        let past = SystemTime::now() - Duration::from_secs(2 * 86_400);
+        File::options()
+            .write(true)
+            .open(old.join(".git/HEAD"))
+            .unwrap()
+            .set_modified(past)
+            .unwrap();
+
+        repos_cleanup_value(Some("1d"), false, &dir, &db_path).unwrap();
+        assert!(!old.exists(), "stale cache removed");
+        assert!(recent.exists(), "recent cache kept");
+        drop(con);
         fs::remove_dir_all(&dir).unwrap();
     }
 }

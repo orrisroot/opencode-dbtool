@@ -108,6 +108,75 @@ struct VacuumCmdOut {
     backup_cleanup: Option<BackupCleanupOut>,
 }
 
+/// JSON shape of `vacuum --into`.
+#[derive(Serialize)]
+struct VacuumIntoOut {
+    #[serde(flatten)]
+    env: EnvStatus,
+    dry_run: bool,
+    source: String,
+    target: String,
+    source_bytes: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    integrity: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    note: Option<String>,
+}
+
+/// Write a compacted copy with `VACUUM INTO`. It only reads the source
+/// database, so it is safe while opencode runs; swap the copy in with
+/// `backup restore` while opencode is stopped.
+pub fn cmd_vacuum_into(db_path: &Path, target: &Path, dry_run: bool) -> Result<()> {
+    if target.exists() {
+        return Err(AppError::usage(format!(
+            "target already exists: {}",
+            target.display()
+        )));
+    }
+    let con = crate::db::open_conn(db_path, true)?;
+    if quick_check(&con) != "ok" {
+        return Err(AppError::db("integrity check not ok - abort"));
+    }
+    let mut out = VacuumIntoOut {
+        env: crate::db::env_status(db_path),
+        dry_run,
+        source: db_path.to_string_lossy().to_string(),
+        target: target.to_string_lossy().to_string(),
+        source_bytes: file_size(db_path),
+        target_bytes: None,
+        integrity: None,
+        note: None,
+    };
+    if dry_run {
+        out.note = Some("dry-run: no compacted copy was written".to_string());
+        return output::emit(&serde_json::to_value(&out)?);
+    }
+    con.execute(
+        "VACUUM INTO ?1",
+        rusqlite::params![target.to_string_lossy()],
+    )
+    .map_err(|e| AppError::db(format!("VACUUM INTO failed: {e}")))?;
+    let check = {
+        let target_con = crate::db::open_conn(target, true)?;
+        quick_check(&target_con)
+    };
+    if check != "ok" {
+        let _ = std::fs::remove_file(target);
+        return Err(AppError::db(format!(
+            "compacted copy failed integrity check ({check}) - removed"
+        )));
+    }
+    out.target_bytes = Some(file_size(target));
+    out.integrity = Some(check);
+    out.note = Some(
+        "swap it in with `opencode-dbtool backup restore <file>` while opencode is stopped"
+            .to_string(),
+    );
+    output::emit(&serde_json::to_value(&out)?)
+}
+
 /// Run `vacuum` from the CLI args (dry-run reports the plan and stops).
 pub fn cmd_vacuum_cli(db_path: &Path, args: &VacuumArgs, dry_run: bool) -> Result<()> {
     let opts = VacuumOpts {

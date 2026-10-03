@@ -38,6 +38,25 @@ pub fn cmd_db_path(con: &Connection, db_path: &Path) -> Result<()> {
     })?)
 }
 
+#[derive(Serialize)]
+struct DbOptimizeOut {
+    #[serde(flatten)]
+    env: EnvStatus,
+    db: String,
+    optimized: bool,
+}
+
+/// `PRAGMA optimize`: refresh query-planner statistics. Safe online.
+pub fn cmd_db_optimize(con: &Connection, db_path: &Path) -> Result<()> {
+    con.execute_batch("PRAGMA optimize;")
+        .map_err(|e| crate::error::AppError::db(format!("PRAGMA optimize failed: {e}")))?;
+    output::emit(&serde_json::to_value(DbOptimizeOut {
+        env: env_status(db_path),
+        db: db_path.to_string_lossy().to_string(),
+        optimized: true,
+    })?)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

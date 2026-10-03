@@ -471,6 +471,8 @@ pub enum DbCmd {
     Checkpoint(DbCheckpointArgs),
     /// Show the resolved database path and key pragmas
     Path,
+    /// Run `PRAGMA optimize` (query-planner statistics, safe online)
+    Optimize,
 }
 
 #[derive(Args)]
@@ -554,6 +556,14 @@ pub struct VacuumArgs {
     /// Attempt VACUUM while opencode runs (may block the server briefly)
     #[arg(long)]
     pub online: bool,
+    /// Write a compacted copy to this file instead of vacuuming in place
+    /// (safe while opencode runs)
+    #[arg(
+        long,
+        value_name = "FILE",
+        conflicts_with_all = ["no_backup", "keep_backups", "online"]
+    )]
+    pub into: Option<PathBuf>,
 }
 
 // ---------------------------------------------------------------------------
@@ -574,6 +584,16 @@ pub enum FsCmd {
     /// Truncate or prune log/opencode.log
     #[command(name = "clean-log")]
     Log(FsLogArgs),
+    /// Delete cached git repositories (repos/)
+    #[command(name = "clean-repos")]
+    Repos(FsReposArgs),
+}
+
+#[derive(Args)]
+pub struct FsReposArgs {
+    /// Only cache entries not modified since the cutoff
+    #[arg(long, value_name = "AGE", value_parser = age_value)]
+    pub older_than: Option<String>,
 }
 
 #[derive(Args)]
