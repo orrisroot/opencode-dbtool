@@ -41,6 +41,9 @@ struct CleanupSummary {
     db_bytes_before: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     db_bytes_after: Option<u64>,
+    /// Post-run doctor result (only with `--verify` on a real run).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    verify_ok: Option<bool>,
 }
 
 #[derive(Serialize)]
@@ -63,6 +66,8 @@ struct CleanupOut {
     log: serde_json::Value,
     /// Final VACUUM result (omitted with `--no-vacuum`).
     vacuum: Option<serde_json::Value>,
+    /// Post-run health check (only with `--verify` on a real run).
+    verify: Option<serde_json::Value>,
     cleaned: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     note: Option<String>,
@@ -180,6 +185,14 @@ pub fn cmd_cleanup(
         )?))
     };
 
+    // 7. Optional post-run health check.
+    let verify_result = if args.verify && !dry_run {
+        progress(quiet, dry_run, "verifying database health");
+        Some(without_env(commands::doctor::doctor_value(&con, db_path)?))
+    } else {
+        None
+    };
+
     let note = if dry_run {
         if vacuum_skipped {
             Some(
@@ -250,6 +263,10 @@ pub fn cmd_cleanup(
             .as_ref()
             .and_then(|v| v.get("db_bytes_after"))
             .and_then(|v| v.as_u64()),
+        verify_ok: verify_result
+            .as_ref()
+            .and_then(|v| v.get("ok"))
+            .and_then(|v| v.as_bool()),
     };
     let out = CleanupOut {
         env: env_status(db_path),
@@ -265,6 +282,7 @@ pub fn cmd_cleanup(
         shell,
         log,
         vacuum,
+        verify: verify_result,
         cleaned: !dry_run,
         note,
     };
@@ -338,6 +356,9 @@ fn summary_table(out: &CleanupOut) -> String {
         (status, _, _) => status.to_string(),
     };
     lines.push(("vacuum", vacuum));
+    if let Some(ok) = s.verify_ok {
+        lines.push(("verify", if ok { "ok" } else { "FAILED" }.to_string()));
+    }
     if let Some(note) = &out.note {
         lines.push(("note", note.clone()));
     }

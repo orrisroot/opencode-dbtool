@@ -2401,3 +2401,49 @@ fn session_markdown_show_and_export_work_locally() {
 
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+#[test]
+fn cleanup_verify_reports_health() {
+    let dir = temp_dir("cleanup-verify");
+    create_db(&dir.join("opencode.db"));
+
+    // Dry-runs never run the check.
+    let out = run(&["cleanup", "--verify", "--dry-run"], &dir);
+    assert!(out.status.success());
+    assert!(stdout_json(&out)["verify"].is_null());
+
+    let out = run(&["cleanup", "--verify", "--yes"], &dir);
+    let code = out.status.code();
+    assert!(
+        code == Some(0) || code == Some(1),
+        "unexpected exit code: {code:?} stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    if code == Some(0) {
+        let v = stdout_json(&out);
+        assert_eq!(v["verify"]["ok"], true);
+        assert_eq!(v["summary"]["verify_ok"], true);
+    }
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn wait_lock_flag_is_validated() {
+    let dir = temp_dir("wait-lock");
+    create_db(&dir.join("opencode.db"));
+
+    // Invalid age values are rejected by the parser.
+    let out = run(&["stats", "--wait-lock", "0s"], &dir);
+    assert_eq!(out.status.code(), Some(2));
+
+    // A valid wait passes through to normal execution.
+    let out = run(&["stats", "--wait-lock", "1m"], &dir);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}

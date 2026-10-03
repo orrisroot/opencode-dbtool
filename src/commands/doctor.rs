@@ -118,6 +118,11 @@ fn apply_fixes(con: &mut Connection) -> Result<FixReport> {
 }
 
 /// Build the doctor result (exposed for tests).
+/// Doctor output as JSON (used by `cleanup --verify`).
+pub fn doctor_value(con: &Connection, db_path: &Path) -> Result<serde_json::Value> {
+    Ok(serde_json::to_value(doctor_out(con, db_path)?)?)
+}
+
 fn doctor_out(con: &Connection, db_path: &Path) -> Result<DoctorOut> {
     let env = env_status(db_path);
     let quick = quick_check(con);

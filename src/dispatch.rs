@@ -282,7 +282,13 @@ where
     F: FnMut(bool) -> Result<()>,
 {
     // One real maintenance run at a time, across processes (cron + manual).
-    let _lock = crate::lock::ToolLock::acquire()?;
+    let wait_lock = cli
+        .wait_lock
+        .as_deref()
+        .map(crate::util::parse_age_ms)
+        .transpose()?
+        .map(|ms| std::time::Duration::from_millis(ms.unsigned_abs()));
+    let _lock = crate::lock::ToolLock::acquire(wait_lock)?;
     if restart {
         let svc = service.ok_or_else(|| {
             AppError::usage(

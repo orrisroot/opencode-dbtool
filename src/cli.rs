@@ -57,6 +57,11 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub no_input: bool,
 
+    /// Wait up to this long for the maintenance lock instead of failing
+    /// immediately (e.g. 30s, 5m, 1h)
+    #[arg(long, value_name = "AGE", value_parser = age_value, global = true)]
+    pub wait_lock: Option<String>,
+
     /// Load defaults from this config file instead of the standard location
     #[arg(long, global = true, value_name = "FILE")]
     pub config: Option<PathBuf>,
@@ -684,6 +689,10 @@ pub struct CleanupArgs {
     /// Attempt the final VACUUM even while opencode runs
     #[arg(long)]
     pub vacuum_online: bool,
+    /// Run database health checks after the run and include the result
+    /// in the summary
+    #[arg(long)]
+    pub verify: bool,
 }
 
 // ---------------------------------------------------------------------------

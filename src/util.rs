@@ -27,6 +27,8 @@ pub fn quote_ident(name: &str) -> String {
 pub fn parse_age_ms(s: &str) -> Result<i64> {
     let s = s.trim();
     let (num, mult) = match s.as_bytes().last() {
+        Some(b's') => (&s[..s.len() - 1], 1_000i64),
+        Some(b'm') => (&s[..s.len() - 1], 60_000i64),
         Some(b'h') => (&s[..s.len() - 1], 3_600_000i64),
         Some(b'd') => (&s[..s.len() - 1], 86_400_000i64),
         Some(b'w') => (&s[..s.len() - 1], 604_800_000i64),
@@ -387,6 +389,8 @@ mod tests {
 
     #[test]
     fn parse_age_units() {
+        assert_eq!(parse_age_ms("30s").unwrap(), 30_000);
+        assert_eq!(parse_age_ms("5m").unwrap(), 300_000);
         assert_eq!(parse_age_ms("1h").unwrap(), 3_600_000);
         assert_eq!(parse_age_ms("30d").unwrap(), 30 * 86_400_000);
         assert_eq!(parse_age_ms("2w").unwrap(), 14 * 86_400_000);
@@ -395,7 +399,7 @@ mod tests {
 
     #[test]
     fn parse_age_rejects_invalid() {
-        for bad in ["", "0", "0d", "-1d", "abc", "1m", "1.5d", "30D", "d"] {
+        for bad in ["", "0", "0d", "-1d", "abc", "1.5d", "30D", "d"] {
             assert!(parse_age_ms(bad).is_err(), "should reject: {bad:?}");
         }
     }
