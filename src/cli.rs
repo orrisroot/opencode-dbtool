@@ -20,6 +20,13 @@ pub enum Format {
     Csv,
 }
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+pub enum ColorWhen {
+    Auto,
+    Always,
+    Never,
+}
+
 #[derive(Parser)]
 #[command(
     name = "opencode-dbtool",
@@ -73,6 +80,16 @@ pub struct Cli {
     /// Disable colors in table output (also honors NO_COLOR)
     #[arg(long, global = true)]
     pub no_color: bool,
+
+    /// Color table output (default: auto; `always` also works when piping)
+    #[arg(
+        long,
+        value_enum,
+        value_name = "WHEN",
+        global = true,
+        conflicts_with = "no_color"
+    )]
+    pub color: Option<ColorWhen>,
 
     /// Table/CSV columns to print, comma-separated (e.g. id,title,size_bytes)
     #[arg(long, global = true, value_name = "FIELDS", value_delimiter = ',')]
@@ -506,6 +523,9 @@ pub struct KvListArgs {
     /// Only entries not updated since the cutoff
     #[arg(long, value_name = "AGE", value_parser = age_value)]
     pub older_than: Option<String>,
+    /// Only keys containing this text (case-insensitive, ASCII)
+    #[arg(long, value_name = "TEXT")]
+    pub search: Option<String>,
 }
 
 #[derive(Args)]

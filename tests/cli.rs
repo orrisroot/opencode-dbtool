@@ -488,6 +488,12 @@ fn kv_commands_round_trip() {
     assert_eq!(arr[0]["key"], "cache:a");
     assert_eq!(arr[0]["bytes"], 5);
 
+    // `--search` matches key text case-insensitively.
+    let out = run(&["kv", "list", "--search", "CACHE"], &dir);
+    assert_eq!(stdout_json(&out).as_array().unwrap().len(), 1);
+    let out = run(&["kv", "list", "--search", "missing"], &dir);
+    assert_eq!(stdout_json(&out).as_array().unwrap().len(), 0);
+
     let out = run(&["kv", "show", "cache:a"], &dir);
     assert!(out.status.success());
     assert_eq!(stdout_json(&out)["value"], "12345");
@@ -2690,6 +2696,31 @@ fn session_batch_export_writes_markdown_files() {
     assert!(v["total_bytes"].as_u64().unwrap() > 0);
     let file = v["sessions"][0]["file"].as_str().unwrap();
     assert!(out_dir.join(file).exists(), "missing export file");
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn color_flag_forces_or_disables_ansi_codes() {
+    let dir = temp_dir("color");
+    create_db(&dir.join("opencode.db"));
+
+    let out = run(
+        &["session", "list", "--format", "table", "--color", "always"],
+        &dir,
+    );
+    assert!(out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("\u{1b}["),
+        "expected ANSI codes"
+    );
+
+    let out = run(
+        &["session", "list", "--format", "table", "--color", "never"],
+        &dir,
+    );
+    assert!(out.status.success());
+    assert!(!String::from_utf8_lossy(&out.stdout).contains("\u{1b}["));
 
     std::fs::remove_dir_all(&dir).unwrap();
 }

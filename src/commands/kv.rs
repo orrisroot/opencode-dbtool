@@ -49,26 +49,20 @@ struct KvKeyRow {
     bytes: i64,
 }
 
-pub fn cmd_kv_list(con: &Connection, older_than: Option<&str>) -> Result<()> {
+pub fn cmd_kv_list(con: &Connection, older_than: Option<&str>, search: Option<&str>) -> Result<()> {
     // Optional `--older-than <age>` limits the listing to keys not updated
-    // since the cutoff (stale caches first).
+    // since the cutoff (stale caches first); `--search` matches key text.
     let cutoff = match older_than {
         Some(age) => Some(now_ms()? - parse_age_ms(age)?),
         None => None,
     };
-    let mut sql = "SELECT key, COALESCE(length(CAST(value AS BLOB)),0), time_updated \
-                   FROM kv"
-        .to_string();
-    if cutoff.is_some() {
-        sql.push_str(" WHERE time_updated < ?1");
-    }
-    sql.push_str(" ORDER BY 2 DESC, key");
-    let mut stmt = con.prepare(&sql)?;
-    let rows = if let Some(c) = cutoff {
-        stmt.query_map(params![c], read_entry)?
-    } else {
-        stmt.query_map([], read_entry)?
-    };
+    let mut stmt = con.prepare(
+        "SELECT key, COALESCE(length(CAST(value AS BLOB)),0), time_updated FROM kv \
+         WHERE (?1 IS NULL OR time_updated < ?1) \
+           AND (?2 IS NULL OR instr(lower(key), lower(?2)) > 0) \
+         ORDER BY 2 DESC, key",
+    )?;
+    let rows = stmt.query_map(params![cutoff, search], read_entry)?;
     let mut out = Vec::new();
     for r in rows {
         out.push(r?);
@@ -329,6 +323,14 @@ mod tests {
             Path::new("/tmp/x.db")
         )
         .is_err());
+    }
+
+    #[test]
+    fn list_search_filters_keys() {
+        let con = kv_db();
+        cmd_kv_list(&con, None, Some("BI")).unwrap();
+        cmd_kv_list(&con, None, Some("nope")).unwrap();
+        cmd_kv_list(&con, Some("1d"), Some("a")).unwrap();
     }
 
     #[test]

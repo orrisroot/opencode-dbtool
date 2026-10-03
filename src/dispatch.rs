@@ -1,7 +1,7 @@
 //! Command dispatch, confirmation flow, and running-instance guards.
 
 use crate::cli::{
-    BackupCmd, Cli, Command, DbCmd, FsCmd, KvCmd, ProjectCmd, ServiceCmd, SessionCmd,
+    BackupCmd, Cli, ColorWhen, Command, DbCmd, FsCmd, KvCmd, ProjectCmd, ServiceCmd, SessionCmd,
 };
 use crate::confirm;
 use crate::db;
@@ -29,10 +29,16 @@ pub fn execute(mut cli: Cli) -> Result<()> {
     output::set_pager(!cli.no_pager && std::io::stdout().is_terminal());
     output::set_relative(!cli.absolute);
     output::set_quiet(cli.quiet);
-    let color = std::io::stdout().is_terminal()
-        && output::table_mode()
-        && !cli.no_color
-        && std::env::var_os("NO_COLOR").is_none();
+    let color = match cli.color {
+        Some(ColorWhen::Always) => true,
+        Some(ColorWhen::Never) => false,
+        _ => {
+            std::io::stdout().is_terminal()
+                && output::table_mode()
+                && !cli.no_color
+                && std::env::var_os("NO_COLOR").is_none()
+        }
+    };
     output::set_color(color);
 
     if let Command::Completions(a) = command {
@@ -520,7 +526,7 @@ fn dispatch(
         Command::Kv(cmd) => match cmd {
             KvCmd::List(a) => {
                 let con = db::open_conn(db_path, true)?;
-                commands::kv::cmd_kv_list(&con, a.older_than.as_deref())
+                commands::kv::cmd_kv_list(&con, a.older_than.as_deref(), a.search.as_deref())
             }
             KvCmd::Show(a) => {
                 let con = db::open_conn(db_path, true)?;
