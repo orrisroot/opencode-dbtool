@@ -41,6 +41,17 @@ struct DeleteOut {
     deleted: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     note: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    exports: Option<ExportSummary>,
+}
+
+/// Sessions exported before a purge (`--export-dir`).
+#[derive(Serialize)]
+struct ExportSummary {
+    dir: String,
+    sessions: usize,
+    bytes: u64,
+    dry_run: bool,
 }
 
 impl DeleteOut {
@@ -61,6 +72,7 @@ impl DeleteOut {
             sessions,
             deleted: false,
             note: None,
+            exports: None,
         }
     }
 }
@@ -102,6 +114,7 @@ pub struct ListOptions<'a> {
     pub min_size: Option<i64>,
     pub project: Option<&'a str>,
     pub parent: Option<&'a str>,
+    pub updated_before: Option<i64>,
 }
 
 pub fn cmd_session_list(con: &Connection, opts: &ListOptions) -> Result<()> {
@@ -130,6 +143,9 @@ pub fn session_list_value(con: &Connection, opts: &ListOptions) -> Result<serde_
     }
     if let Some(min) = opts.min_size {
         sessions.retain(|s| s.size_bytes() >= min);
+    }
+    if let Some(cutoff) = opts.updated_before {
+        sessions.retain(|s| s.updated < cutoff);
     }
     if opts.project.is_some() || opts.parent.is_some() {
         let project_id = match opts.project {
@@ -504,9 +520,10 @@ pub fn cmd_session_purge(
     dry_run: bool,
     db_path: &Path,
     service: Option<&ServiceInfo>,
+    export_dir: Option<&Path>,
 ) -> Result<()> {
     output::emit(&session_purge_value(
-        con, filters, dry_run, db_path, service,
+        con, filters, dry_run, db_path, service, export_dir,
     )?)
 }
 
@@ -518,6 +535,7 @@ pub fn session_purge_value(
     dry_run: bool,
     db_path: &Path,
     service: Option<&ServiceInfo>,
+    export_dir: Option<&Path>,
 ) -> Result<serde_json::Value> {
     if filters.is_empty() {
         return Err(AppError::usage(
@@ -536,6 +554,38 @@ pub fn session_purge_value(
         total_rows,
         sessions_arr,
     );
+
+    // Optional pre-delete export (requires the running server; the
+    // export happens before any deletion, so a failure aborts cleanly).
+    out.exports = match export_dir {
+        Some(dir) if dry_run => Some(ExportSummary {
+            dir: dir.display().to_string(),
+            sessions: selected.len(),
+            bytes: 0,
+            dry_run: true,
+        }),
+        Some(dir) => {
+            let svc = require_service(service, db_path)?;
+            std::fs::create_dir_all(dir)
+                .map_err(|e| AppError::db(format!("cannot create {}: {e}", dir.display())))?;
+            let mut bytes = 0u64;
+            for id in &selected {
+                let body = svc.export_session(id)?;
+                let path = dir.join(format!("{id}.json"));
+                std::fs::write(&path, &body)
+                    .map_err(|e| AppError::db(format!("cannot write {}: {e}", path.display())))?;
+                bytes += body.len() as u64;
+            }
+            Some(ExportSummary {
+                dir: dir.display().to_string(),
+                sessions: selected.len(),
+                bytes,
+                dry_run: false,
+            })
+        }
+        None => None,
+    };
+
     if dry_run {
         return Ok(serde_json::to_value(&out)?);
     }
@@ -1158,6 +1208,7 @@ mod tests {
             }],
             deleted: false,
             note: None,
+            exports: None,
         };
         let v = serde_json::to_value(&out).unwrap();
         let expected = serde_json::json!({
@@ -1253,6 +1304,7 @@ mod tests {
             false,
             Path::new("/tmp/x.db"),
             None,
+            None,
         )
         .unwrap();
 
@@ -1264,8 +1316,15 @@ mod tests {
         let mut con = testdb::create();
         testdb::insert_session(&con, "s1", "/a", None);
 
-        let err = cmd_session_purge(&mut con, &filter(&[]), false, Path::new("/tmp/x.db"), None)
-            .unwrap_err();
+        let err = cmd_session_purge(
+            &mut con,
+            &filter(&[]),
+            false,
+            Path::new("/tmp/x.db"),
+            None,
+            None,
+        )
+        .unwrap_err();
         assert_eq!(err.code, 2);
     }
 
@@ -1280,6 +1339,7 @@ mod tests {
             &filter(&["--subagents".to_string()]),
             false,
             Path::new("/tmp/x.db"),
+            None,
             None,
         )
         .unwrap();
@@ -1303,6 +1363,7 @@ mod tests {
             &filter(&["--older-than".to_string(), "30d".to_string()]),
             false,
             Path::new("/tmp/x.db"),
+            None,
             None,
         )
         .unwrap();
@@ -1329,6 +1390,7 @@ mod tests {
             &filter(&["--older-than".to_string(), "30d".to_string()]),
             false,
             Path::new("/tmp/x.db"),
+            None,
             None,
         )
         .unwrap();
@@ -1358,6 +1420,7 @@ mod tests {
             false,
             Path::new("/tmp/x.db"),
             None,
+            None,
         )
         .unwrap();
 
@@ -1383,6 +1446,7 @@ mod tests {
             true,
             Path::new("/tmp/x.db"),
             None,
+            None,
         )
         .unwrap();
 
@@ -1402,6 +1466,7 @@ mod tests {
             &filter(&["--larger-than".to_string(), "4".to_string()]),
             false,
             Path::new("/tmp/x.db"),
+            None,
             None,
         )
         .unwrap();
@@ -1425,6 +1490,7 @@ mod tests {
             &filter(&["--keep-latest".to_string(), "2".to_string()]),
             false,
             Path::new("/tmp/x.db"),
+            None,
             None,
         )
         .unwrap();
@@ -1452,6 +1518,7 @@ mod tests {
             false,
             Path::new("/tmp/x.db"),
             None,
+            None,
         )
         .unwrap();
 
@@ -1470,6 +1537,7 @@ mod tests {
             &filter(&["--keep-latest".to_string(), "1".to_string()]),
             false,
             Path::new("/tmp/x.db"),
+            None,
             None,
         )
         .unwrap();
@@ -1493,6 +1561,7 @@ mod tests {
             false,
             Path::new("/tmp/x.db"),
             None,
+            None,
         )
         .unwrap();
 
@@ -1509,6 +1578,7 @@ mod tests {
             &filter(&["--keep-latest".to_string(), "5".to_string()]),
             false,
             Path::new("/tmp/x.db"),
+            None,
             None,
         )
         .unwrap();
@@ -1532,6 +1602,7 @@ mod tests {
             ]),
             false,
             Path::new("/tmp/x.db"),
+            None,
             None,
         )
         .unwrap();
@@ -1945,6 +2016,7 @@ mod tests {
             false,
             Path::new("/tmp/x.db"),
             None,
+            None,
         )
         .unwrap();
 
@@ -2026,6 +2098,7 @@ mod tests {
             false,
             Path::new("/tmp/x.db"),
             None,
+            None,
         )
         .unwrap();
 
@@ -2048,6 +2121,7 @@ mod tests {
             &filter(&["--empty".to_string()]),
             false,
             Path::new("/tmp/x.db"),
+            None,
             None,
         )
         .unwrap();
@@ -2075,6 +2149,7 @@ mod tests {
             &filter(&["--archived".to_string()]),
             false,
             Path::new("/tmp/x.db"),
+            None,
             None,
         )
         .unwrap();
@@ -2113,6 +2188,7 @@ mod tests {
             &filter(&["--keep-latest-per-project".to_string(), "1".to_string()]),
             false,
             Path::new("/tmp/x.db"),
+            None,
             None,
         )
         .unwrap();

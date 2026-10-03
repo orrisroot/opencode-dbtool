@@ -1999,3 +1999,144 @@ fn session_show_last_and_conversation_view() {
 
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+#[test]
+fn session_list_older_than_filters() {
+    let dir = temp_dir("list-older");
+    let db = dir.join("opencode.db");
+    create_db(&db);
+    {
+        let con = Connection::open(&db).unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        con.execute(
+            "INSERT INTO session_v2 (id, directory, title, time_updated, cost) \
+             VALUES ('ses_new', '/work/a', 'new', ?1, 0)",
+            [now],
+        )
+        .unwrap();
+    }
+
+    let out = run(&["session", "list", "--older-than", "1d"], &dir);
+    assert!(out.status.success());
+    let v = stdout_json(&out);
+    assert_eq!(v.as_array().unwrap().len(), 1);
+    assert_eq!(v[0]["id"], "ses_1", "only the epoch-old session matches");
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn backup_restore_latest_dry_run_picks_the_newest() {
+    let dir = temp_dir("restore-latest");
+    create_db(&dir.join("opencode.db"));
+
+    let out = run(&["backup", "--yes"], &dir);
+    assert!(out.status.success());
+    let first = stdout_json(&out)["backup"]["path"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let out = run(&["backup", "--yes"], &dir);
+    assert!(out.status.success());
+    let second = stdout_json(&out)["backup"]["path"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_ne!(first, second);
+
+    let out = run(&["backup", "restore", "--latest", "--dry-run"], &dir);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(stdout_json(&out)["source"], second);
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn cleanup_vacuum_online_is_accepted() {
+    let dir = temp_dir("cleanup-online");
+    create_db(&dir.join("opencode.db"));
+
+    let out = run(&["cleanup", "--vacuum-online", "--dry-run"], &dir);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v = stdout_json(&out);
+    assert_eq!(v["vacuum"]["dry_run"], true);
+    assert_eq!(v["summary"]["vacuum"], "planned");
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn purge_export_dir_plans_and_requires_the_service() {
+    let dir = temp_dir("purge-export");
+    create_db(&dir.join("opencode.db"));
+    let export = dir.join("exports");
+
+    // Dry-run plans the export without needing the service.
+    let out = run(
+        &[
+            "session",
+            "purge",
+            "--older-than",
+            "30d",
+            "--export-dir",
+            export.to_str().unwrap(),
+            "--dry-run",
+        ],
+        &dir,
+    );
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v = stdout_json(&out);
+    assert_eq!(v["exports"]["dry_run"], true);
+    assert_eq!(v["exports"]["sessions"], 1);
+
+    // Real run without a service fails before deleting (or is refused by
+    // the running-instance guard in this test harness).
+    let out = run(
+        &[
+            "session",
+            "purge",
+            "--older-than",
+            "30d",
+            "--export-dir",
+            export.to_str().unwrap(),
+            "--yes",
+        ],
+        &dir,
+    );
+    let code = out.status.code();
+    assert!(
+        code == Some(1) || code == Some(2),
+        "unexpected exit code: {code:?} stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // The flag is purge-only.
+    let out = run(
+        &[
+            "session",
+            "strip-reasoning",
+            "--export-dir",
+            "x",
+            "--dry-run",
+        ],
+        &dir,
+    );
+    assert_eq!(out.status.code(), Some(2));
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}

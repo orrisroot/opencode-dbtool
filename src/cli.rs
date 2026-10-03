@@ -284,6 +284,9 @@ pub struct SessionListArgs {
     /// Only sessions at least this large (e.g. 50M)
     #[arg(long = "min-size", value_name = "SIZE", value_parser = size_value)]
     pub min_size: Option<String>,
+    /// Only sessions updated before this age (e.g. 30d)
+    #[arg(long = "older-than", value_name = "AGE", value_parser = age_value)]
+    pub older_than: Option<String>,
     /// Only sessions of this project (id, prefix, or worktree)
     #[arg(long, value_name = "REF")]
     pub project: Option<String>,
@@ -354,6 +357,10 @@ pub struct SessionPurgeArgs {
         value_parser = count_value
     )]
     pub keep_latest_per_project: Option<i64>,
+    /// Export matching sessions to this directory before deleting them
+    /// (requires the running opencode server)
+    #[arg(long = "export-dir", value_name = "DIR")]
+    pub export_dir: Option<PathBuf>,
 }
 
 impl TryFrom<&SessionPurgeArgs> for PurgeFilter {
@@ -480,9 +487,12 @@ pub struct BackupListArgs {
 
 #[derive(Args)]
 pub struct BackupRestoreArgs {
-    /// Backup file to restore (as listed by `backup list`)
-    #[arg(value_name = "FILE")]
-    pub file: PathBuf,
+    /// Backup file to restore (or use --latest)
+    #[arg(value_name = "FILE", required_unless_present = "latest")]
+    pub file: Option<PathBuf>,
+    /// Restore the newest backup
+    #[arg(long, conflicts_with = "file")]
+    pub latest: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -592,6 +602,9 @@ pub struct CleanupArgs {
         conflicts_with = "no_backup"
     )]
     pub keep_backups: Option<i64>,
+    /// Attempt the final VACUUM even while opencode runs
+    #[arg(long)]
+    pub vacuum_online: bool,
 }
 
 // ---------------------------------------------------------------------------

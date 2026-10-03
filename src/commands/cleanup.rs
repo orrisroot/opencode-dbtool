@@ -118,7 +118,7 @@ pub fn cmd_cleanup(
     } else {
         progress(quiet, dry_run, "purging matching sessions");
         Some(without_env(commands::session::session_purge_value(
-            &mut con, &filters, dry_run, db_path, service,
+            &mut con, &filters, dry_run, db_path, service, None,
         )?))
     };
 
@@ -156,19 +156,27 @@ pub fn cmd_cleanup(
     )?);
 
     // 6. Final VACUUM (no second backup; the pre-run one is kept).
-    //    Skipped while opencode runs: VACUUM needs the write lock, so it
-    //    is left to the explicit `vacuum --online` command.
-    let vacuum_skipped = service_running && !args.no_vacuum;
-    let vacuum = if args.no_vacuum || service_running {
+    //    While opencode runs the VACUUM is skipped unless
+    //    `--vacuum-online` explicitly allows it.
+    let vacuum_skipped = service_running && !args.vacuum_online && !args.no_vacuum;
+    let vacuum = if args.no_vacuum || (service_running && !args.vacuum_online) {
         None
     } else {
         progress(quiet, dry_run, "vacuuming the database");
+        if service_running {
+            con.busy_timeout(std::time::Duration::from_secs(60))
+                .map_err(|e| crate::error::AppError::db(format!("busy_timeout: {e}")))?;
+        }
         let opts = commands::vacuum::VacuumOpts {
             backup: false,
             keep_backups: None,
         };
         Some(without_env(commands::vacuum::vacuum_value(
-            &con, db_path, &opts, dry_run, false,
+            &con,
+            db_path,
+            &opts,
+            dry_run,
+            service_running && args.vacuum_online,
         )?))
     };
 
@@ -196,7 +204,7 @@ pub fn cmd_cleanup(
     };
     let vacuum_status = if args.no_vacuum {
         "disabled"
-    } else if service_running {
+    } else if vacuum_skipped {
         "skipped"
     } else if dry_run {
         "planned"

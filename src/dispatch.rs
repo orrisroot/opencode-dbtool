@@ -409,6 +409,10 @@ fn dispatch(
                     .as_deref()
                     .map(crate::util::parse_size_bytes)
                     .transpose()?;
+                let updated_before = match &a.older_than {
+                    Some(age) => Some(crate::util::now_ms()? - crate::util::parse_age_ms(age)?),
+                    None => None,
+                };
                 let con = db::open_conn(db_path, true)?;
                 let opts = commands::session::ListOptions {
                     sort: a.sort,
@@ -417,6 +421,7 @@ fn dispatch(
                     min_size,
                     project: a.project.as_deref(),
                     parent: a.parent.as_deref(),
+                    updated_before,
                 };
                 commands::session::cmd_session_list(&con, &opts)
             }
@@ -433,9 +438,21 @@ fn dispatch(
             SessionCmd::Purge(a) => {
                 let filters = PurgeFilter::try_from(a)?;
                 let mut con = db::open_conn(db_path, dry_run)?;
-                commands::session::cmd_session_purge(&mut con, &filters, dry_run, db_path, service)
+                commands::session::cmd_session_purge(
+                    &mut con,
+                    &filters,
+                    dry_run,
+                    db_path,
+                    service,
+                    a.export_dir.as_deref(),
+                )
             }
             SessionCmd::StripReasoning(a) => {
+                if a.export_dir.is_some() {
+                    return Err(AppError::usage(
+                        "--export-dir only applies to `session purge`",
+                    ));
+                }
                 let filters = PurgeFilter::try_from(a)?;
                 let mut con = db::open_conn(db_path, dry_run)?;
                 commands::session::cmd_session_strip_reasoning(&mut con, &filters, dry_run, db_path)
@@ -483,7 +500,18 @@ fn dispatch(
             match &a.command {
                 Some(BackupCmd::List(l)) => commands::vacuum::cmd_backup_list(db_path, l.verify),
                 Some(BackupCmd::Restore(r)) => {
-                    commands::vacuum::cmd_restore(db_path, &r.file, dry_run)
+                    let path = if r.latest {
+                        let files = commands::vacuum::list_backup_files(db_path, false)?;
+                        let newest = files
+                            .first()
+                            .ok_or_else(|| AppError::usage("no backups found to restore"))?;
+                        db_path.with_file_name(&newest.file)
+                    } else {
+                        r.file.clone().ok_or_else(|| {
+                            AppError::usage("a backup file or --latest is required")
+                        })?
+                    };
+                    commands::vacuum::cmd_restore(db_path, &path, dry_run)
                 }
                 None => commands::vacuum::cmd_backup(db_path, dry_run, a.keep_backups),
             }
