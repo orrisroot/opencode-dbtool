@@ -2256,3 +2256,85 @@ fn db_optimize_runs() {
 
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+#[test]
+fn kv_purge_previews_and_requires_a_filter() {
+    let dir = temp_dir("kv-purge");
+    let db = dir.join("opencode.db");
+    create_db(&db);
+    {
+        let con = Connection::open(&db).unwrap();
+        con.execute(
+            "INSERT INTO kv (key, value, time_created, time_updated) VALUES ('small', '12345', 0, 1700000000000)",
+            [],
+        )
+        .unwrap();
+        con.execute(
+            "INSERT INTO kv (key, value, time_created, time_updated) VALUES ('big', 'xxxxxxxxxxxxxxxx', 0, 0)",
+            [],
+        )
+        .unwrap();
+    }
+
+    // A bare purge is refused so it can never wipe the table.
+    let out = run(&["kv", "purge", "--dry-run"], &dir);
+    assert_eq!(out.status.code(), Some(2));
+
+    let out = run(&["kv", "purge", "--larger-than", "10", "--dry-run"], &dir);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v = stdout_json(&out);
+    assert_eq!(v["total_keys"], 1);
+    assert_eq!(v["keys"][0]["key"], "big");
+    assert_eq!(v["deleted"], false);
+
+    // Real runs are guarded while this harness runs under opencode.
+    let out = run(&["kv", "purge", "--larger-than", "10", "--yes"], &dir);
+    let code = out.status.code();
+    assert!(
+        code == Some(0) || code == Some(1),
+        "unexpected exit code: {code:?} stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn list_table_output_ends_with_a_summary_footer() {
+    let dir = temp_dir("footer");
+    let db = dir.join("opencode.db");
+    create_db(&db);
+    {
+        let con = Connection::open(&db).unwrap();
+        con.execute(
+            "INSERT INTO kv (key, value, time_created, time_updated) VALUES ('k', '12345', 0, 0)",
+            [],
+        )
+        .unwrap();
+    }
+
+    let out = run(&["kv", "list", "--format", "table"], &dir);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("1 key, 5 B total"), "output: {text}");
+
+    let out = run(&["session", "list", "--format", "table"], &dir);
+    assert!(out.status.success());
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("1 session,"), "output: {text}");
+
+    // JSON output stays footer-free for scripting.
+    let out = run(&["kv", "list"], &dir);
+    assert!(out.status.success());
+    assert!(!String::from_utf8_lossy(&out.stdout).contains("total"));
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}

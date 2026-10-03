@@ -73,7 +73,16 @@ pub fn cmd_kv_list(con: &Connection, older_than: Option<&str>) -> Result<()> {
     for r in rows {
         out.push(r?);
     }
-    output::emit_cols(&serde_json::to_value(out)?, &["key", "bytes", "updated"])
+    let value = serde_json::to_value(out)?;
+    let rows = value.as_array().map(Vec::as_slice).unwrap_or_default();
+    let bytes: i64 = rows.iter().filter_map(|r| r["bytes"].as_i64()).sum();
+    let footer = format!(
+        "{} key{}, {} total",
+        rows.len(),
+        if rows.len() == 1 { "" } else { "s" },
+        output::human_bytes(bytes)
+    );
+    output::emit_cols_footer(&value, &["key", "bytes", "updated"], &footer)
 }
 
 fn read_entry(r: &rusqlite::Row) -> rusqlite::Result<KvEntry> {
@@ -169,6 +178,88 @@ pub fn cmd_kv_delete(
     output::emit(&serde_json::to_value(&out)?)
 }
 
+#[derive(Serialize)]
+struct KvPurgeOut {
+    #[serde(flatten)]
+    env: EnvStatus,
+    dry_run: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    older_than: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    larger_than: Option<String>,
+    keys: Vec<KvKeyRow>,
+    total_keys: usize,
+    total_bytes: i64,
+    deleted: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    note: Option<String>,
+}
+
+/// Delete every kv entry matching the age/size filters. At least one
+/// filter is required so a bare `kv purge` can never wipe the table.
+pub fn cmd_kv_purge(
+    con: &mut Connection,
+    older_than: Option<&str>,
+    larger_than: Option<&str>,
+    dry_run: bool,
+    db_path: &Path,
+) -> Result<()> {
+    if older_than.is_none() && larger_than.is_none() {
+        return Err(AppError::usage(
+            "usage: opencode-dbtool kv purge --older-than <age> | --larger-than <size>",
+        ));
+    }
+    let cutoff = match older_than {
+        Some(age) => Some(now_ms()? - parse_age_ms(age)?),
+        None => None,
+    };
+    let min_bytes = match larger_than {
+        Some(size) => Some(crate::util::parse_size_bytes(size)?),
+        None => None,
+    };
+    let mut stmt = con.prepare(
+        "SELECT key, COALESCE(length(CAST(value AS BLOB)),0) FROM kv \
+         WHERE (?1 IS NULL OR time_updated < ?1) \
+           AND (?2 IS NULL OR COALESCE(length(CAST(value AS BLOB)),0) > ?2) \
+         ORDER BY 2 DESC, key",
+    )?;
+    let rows = stmt.query_map(params![cutoff, min_bytes], |r| {
+        Ok(KvKeyRow {
+            key: r.get(0)?,
+            bytes: r.get(1)?,
+        })
+    })?;
+    let mut keys = Vec::new();
+    for r in rows {
+        keys.push(r?);
+    }
+    drop(stmt);
+    let total_bytes: i64 = keys.iter().map(|k| k.bytes).sum();
+    let mut out = KvPurgeOut {
+        env: env_status(db_path),
+        dry_run,
+        older_than: older_than.map(str::to_string),
+        larger_than: larger_than.map(str::to_string),
+        total_keys: keys.len(),
+        keys,
+        total_bytes,
+        deleted: false,
+        note: None,
+    };
+    if dry_run {
+        return output::emit(&serde_json::to_value(&out)?);
+    }
+    con.execute_batch("PRAGMA foreign_keys = ON;")?;
+    let tx = con.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    for k in &out.keys {
+        tx.execute("DELETE FROM kv WHERE key = ?1", params![k.key])?;
+    }
+    tx.commit()?;
+    out.deleted = true;
+    out.note = Some("file size is unchanged until `opencode-dbtool vacuum` is run".into());
+    output::emit(&serde_json::to_value(&out)?)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -238,5 +329,36 @@ mod tests {
             Path::new("/tmp/x.db")
         )
         .is_err());
+    }
+
+    #[test]
+    fn purge_requires_a_filter_and_honors_them() {
+        let mut con = kv_db();
+        // No filter is a usage error: a bare purge must never wipe the table.
+        assert!(cmd_kv_purge(&mut con, None, None, true, Path::new("/tmp/x.db")).is_err());
+
+        // `--larger-than 10` selects only the 16-byte key.
+        cmd_kv_purge(&mut con, None, Some("10"), true, Path::new("/tmp/x.db")).unwrap();
+        let n: i64 = con
+            .query_row("SELECT COUNT(*) FROM kv", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 2, "dry-run changes nothing");
+
+        cmd_kv_purge(&mut con, None, Some("10"), false, Path::new("/tmp/x.db")).unwrap();
+        let n: i64 = con
+            .query_row("SELECT COUNT(*) FROM kv", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1);
+        let left: String = con
+            .query_row("SELECT key FROM kv", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(left, "a");
+
+        // `--older-than` matches rows with old timestamps.
+        cmd_kv_purge(&mut con, Some("1d"), None, false, Path::new("/tmp/x.db")).unwrap();
+        let n: i64 = con
+            .query_row("SELECT COUNT(*) FROM kv", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 0);
     }
 }

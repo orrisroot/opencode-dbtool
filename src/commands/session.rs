@@ -118,8 +118,18 @@ pub struct ListOptions<'a> {
 }
 
 pub fn cmd_session_list(con: &Connection, opts: &ListOptions) -> Result<()> {
-    output::emit_cols(
-        &session_list_value(con, opts)?,
+    let value = session_list_value(con, opts)?;
+    let rows = value.as_array().map(Vec::as_slice).unwrap_or_default();
+    let bytes: i64 = rows.iter().filter_map(|r| r["size_bytes"].as_i64()).sum();
+    let cost: f64 = rows.iter().filter_map(|r| r["cost"].as_f64()).sum();
+    let footer = format!(
+        "{} session{}, {} total, ${cost:.2}",
+        rows.len(),
+        if rows.len() == 1 { "" } else { "s" },
+        output::human_bytes(bytes)
+    );
+    output::emit_cols_footer(
+        &value,
         &[
             "id",
             "title",
@@ -129,6 +139,7 @@ pub fn cmd_session_list(con: &Connection, opts: &ListOptions) -> Result<()> {
             "size_bytes",
             "cost",
         ],
+        &footer,
     )
 }
 

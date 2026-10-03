@@ -161,6 +161,7 @@ fn mutation_guard<'a>(
         // Import goes through the server API; it fails without one.
         Command::Session(SessionCmd::Import(_)) => Some(("session import", None)),
         Command::Kv(KvCmd::Delete(_)) => Some(("kv delete", Some(IDLE_DELETE))),
+        Command::Kv(KvCmd::Purge(_)) => Some(("kv purge", Some(IDLE_DELETE))),
         // Listing backups is read-only; creating one uses the online
         // backup API, and restoring needs exclusive access.
         Command::Backup(a) => match &a.command {
@@ -504,6 +505,16 @@ fn dispatch(
             KvCmd::Delete(a) => {
                 let mut con = db::open_conn(db_path, dry_run)?;
                 commands::kv::cmd_kv_delete(&mut con, &a.keys, dry_run, db_path)
+            }
+            KvCmd::Purge(a) => {
+                let mut con = db::open_conn(db_path, dry_run)?;
+                commands::kv::cmd_kv_purge(
+                    &mut con,
+                    a.older_than.as_deref(),
+                    a.larger_than.as_deref(),
+                    dry_run,
+                    db_path,
+                )
             }
         },
         Command::Db(cmd) => match cmd {

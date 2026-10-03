@@ -138,6 +138,19 @@ pub fn emit_cols(v: &Value, columns: &[&str]) -> Result<()> {
     write_stdout(&text)
 }
 
+/// Like `emit_cols`, but appends a summary footer in table mode
+/// (JSON and CSV output stay machine-readable and unaffected).
+pub fn emit_cols_footer(v: &Value, columns: &[&str], footer: &str) -> Result<()> {
+    if !table_mode() {
+        return emit_cols(v, columns);
+    }
+    let effective = effective_columns(columns);
+    set_cell_limit_for(effective.len());
+    let refs: Vec<&str> = effective.iter().map(String::as_str).collect();
+    let text = format!("{}\n\n{footer}", render(v, &refs));
+    write_stdout(&text)
+}
+
 /// `--fields` overrides the command's column selection.
 fn effective_columns(columns: &[&str]) -> Vec<String> {
     match FIELDS.get() {

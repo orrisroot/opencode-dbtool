@@ -77,8 +77,21 @@ pub fn cmd_project_list(
         None => {}
     }
     let arr: Vec<ProjectOut> = rows.iter().map(|p| project_json(p)).collect();
-    output::emit_cols(
-        &serde_json::to_value(arr)?,
+    let value = serde_json::to_value(arr)?;
+    let out_rows = value.as_array().map(Vec::as_slice).unwrap_or_default();
+    let bytes: i64 = out_rows
+        .iter()
+        .filter_map(|r| r["size_bytes"].as_i64())
+        .sum();
+    let cost: f64 = out_rows.iter().filter_map(|r| r["cost"].as_f64()).sum();
+    let footer = format!(
+        "{} project{}, {} total, ${cost:.2}",
+        out_rows.len(),
+        if out_rows.len() == 1 { "" } else { "s" },
+        output::human_bytes(bytes)
+    );
+    output::emit_cols_footer(
+        &value,
         &[
             "id",
             "worktree",
@@ -88,6 +101,7 @@ pub fn cmd_project_list(
             "cost",
             "updated",
         ],
+        &footer,
     )
 }
 
