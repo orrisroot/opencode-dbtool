@@ -301,16 +301,36 @@ pub struct SessionSearchArgs {
 
 #[derive(Args)]
 pub struct SessionExportArgs {
-    /// Session id or unique id prefix
-    #[arg(value_name = "ID")]
-    pub id: String,
+    /// Session id or unique id prefix (omit with --out-dir)
+    #[arg(value_name = "ID", required_unless_present = "out_dir")]
+    pub id: Option<String>,
     /// Write the export to this file instead of stdout
-    #[arg(long, value_name = "FILE")]
+    #[arg(long, value_name = "FILE", conflicts_with = "out_dir")]
     pub out: Option<PathBuf>,
     /// Render the conversation as Markdown from the local database
     /// (no running server needed)
     #[arg(long)]
     pub markdown: bool,
+    /// Include tool calls and other non-text parts (requires --markdown)
+    #[arg(long, requires = "markdown")]
+    pub include_tools: bool,
+    /// Export every matching session into this directory
+    #[arg(long, value_name = "DIR", conflicts_with = "out")]
+    pub out_dir: Option<PathBuf>,
+    /// Only sessions not updated since the cutoff (batch mode)
+    #[arg(
+        long = "older-than",
+        value_name = "AGE",
+        value_parser = age_value,
+        requires = "out_dir"
+    )]
+    pub older_than: Option<String>,
+    /// Only sessions of this project (batch mode)
+    #[arg(long, value_name = "REF", requires = "out_dir")]
+    pub project: Option<String>,
+    /// Maximum number of sessions to export (batch mode)
+    #[arg(long, value_name = "N", requires = "out_dir")]
+    pub limit: Option<usize>,
 }
 
 #[derive(Args)]
@@ -367,6 +387,9 @@ pub struct SessionShowArgs {
     /// Render the conversation as Markdown (requires --messages)
     #[arg(long, requires = "messages", conflicts_with_all = ["limit", "last"])]
     pub markdown: bool,
+    /// Include tool calls and other non-text parts (requires --markdown)
+    #[arg(long, requires = "markdown")]
+    pub include_tools: bool,
     /// Maximum number of message previews (requires --messages)
     #[arg(long, value_name = "N", requires = "messages")]
     pub limit: Option<usize>,

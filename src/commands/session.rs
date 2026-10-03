@@ -1,7 +1,7 @@
 //! `session` subcommands: list, show, delete, purge, strip-reasoning.
 //! V2-only.
 
-use crate::cli::SortKey;
+use crate::cli::{SessionExportArgs, SortKey};
 use crate::db::{env_status, EnvStatus, SESSION_TABLE};
 use crate::error::{AppError, Result};
 use crate::models::{session_json, PurgeFilter, PurgeFilterJson, SessionOut};
@@ -357,11 +357,12 @@ pub fn cmd_session_show(
     full: bool,
     last: Option<usize>,
     markdown: bool,
+    include_tools: bool,
 ) -> Result<()> {
     let reference = reference.trim();
     let id = resolve_session_id(con, reference)?;
     if markdown {
-        return output::emit_text(&session_markdown(con, &id)?);
+        return output::emit_text(&session_markdown(con, &id, include_tools)?);
     }
     let s = load_session(con, &id)?
         .ok_or_else(|| AppError::usage(format!("session not found: {reference}")))?;
@@ -466,8 +467,51 @@ fn message_text(data: &str) -> String {
     }
 }
 
+/// Markdown body of one message. With `include_tools`, non-text content
+/// parts (tool calls, files, ...) are rendered as JSON code blocks and
+/// reasoning parts as blockquotes.
+fn message_markdown(data: &str, include_tools: bool) -> String {
+    if !include_tools {
+        return extract_message_text(data).trim().to_string();
+    }
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(data) else {
+        return data.trim().to_string();
+    };
+    let Some(parts) = v.get("content").and_then(|c| c.as_array()) else {
+        return extract_message_text(data).trim().to_string();
+    };
+    let mut out: Vec<String> = Vec::new();
+    for part in parts {
+        match part.get("type").and_then(|t| t.as_str()) {
+            Some("text") => {
+                if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
+                    out.push(text.trim().to_string());
+                }
+            }
+            Some("reasoning") => {
+                if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
+                    out.push(format!(
+                        "> reasoning\n>\n> {}",
+                        text.trim().replace('\n', "\n> ")
+                    ));
+                }
+            }
+            Some(_) => out.push(format!(
+                "```json\n{}\n```",
+                serde_json::to_string_pretty(part).unwrap_or_default()
+            )),
+            None => {}
+        }
+    }
+    if out.is_empty() {
+        extract_message_text(data).trim().to_string()
+    } else {
+        out.join("\n\n")
+    }
+}
+
 /// Render a session conversation as Markdown (all messages, full text).
-pub fn session_markdown(con: &Connection, id: &str) -> Result<String> {
+pub fn session_markdown(con: &Connection, id: &str, include_tools: bool) -> Result<String> {
     let s = load_session(con, id)?
         .ok_or_else(|| AppError::usage(format!("session not found: {id}")))?;
     let (total, rows) = crate::repo::list_all_messages(con, id)?;
@@ -483,8 +527,7 @@ pub fn session_markdown(con: &Connection, id: &str) -> Result<String> {
     text.push_str(&format!("- messages: {total}\n\n"));
     for m in rows {
         text.push_str(&format!("## {} ({})\n\n", m.msg_type, dt(m.created)));
-        let body = extract_message_text(&m.data);
-        text.push_str(body.trim());
+        text.push_str(&message_markdown(&m.data, include_tools));
         text.push_str("\n\n");
     }
     Ok(text)
@@ -509,21 +552,25 @@ fn require_service<'a>(
     Ok(svc)
 }
 
-/// Export a session through the server API; the raw export goes to stdout
-/// unless `--out` names a file. With `--markdown` the conversation is
-/// rendered locally and no server is needed.
+/// Export one session (API JSON or local Markdown), or every matching
+/// session into `--out-dir`.
 pub fn cmd_session_export(
     db_path: &Path,
-    reference: &str,
-    out: Option<&Path>,
-    markdown: bool,
+    args: &SessionExportArgs,
+    dry_run: bool,
     service: Option<&ServiceInfo>,
 ) -> Result<()> {
-    if markdown {
+    if let Some(out_dir) = &args.out_dir {
+        return batch_export(db_path, args, out_dir, dry_run, service);
+    }
+    let Some(reference) = args.id.as_deref() else {
+        return Err(AppError::usage("a session id or --out-dir is required"));
+    };
+    if args.markdown {
         let con = crate::db::open_conn(db_path, true)?;
         let id = resolve_session_id(&con, reference)?;
-        let text = session_markdown(&con, &id)?;
-        return match out {
+        let text = session_markdown(&con, &id, args.include_tools)?;
+        return match args.out.as_deref() {
             Some(path) => {
                 crate::util::write_private(path, text.as_bytes())?;
                 output::emit(&serde_json::json!({
@@ -543,7 +590,7 @@ pub fn cmd_session_export(
         resolve_session_id(&con, reference)?
     };
     let body = svc.export_session(&id)?;
-    match out {
+    match args.out.as_deref() {
         Some(path) => {
             crate::util::write_private(path, body.as_bytes())?;
             output::emit(&serde_json::json!({
@@ -555,6 +602,148 @@ pub fn cmd_session_export(
         }
         None => output::emit_text(&body),
     }
+}
+
+/// One file written by a batch export.
+#[derive(Serialize)]
+struct BatchExportFile {
+    session: String,
+    file: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bytes: Option<u64>,
+}
+
+#[derive(Serialize)]
+struct BatchExportOut {
+    #[serde(flatten)]
+    env: EnvStatus,
+    db: String,
+    dir: String,
+    format: &'static str,
+    dry_run: bool,
+    sessions: Vec<BatchExportFile>,
+    total: usize,
+    total_bytes: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    note: Option<String>,
+}
+
+/// Ids selected by the batch filters, newest first.
+fn select_export_ids(
+    con: &Connection,
+    older_than: Option<&str>,
+    project: Option<&str>,
+    limit: Option<usize>,
+) -> Result<Vec<String>> {
+    let cutoff = match older_than {
+        Some(age) => Some(now_ms()? - parse_age_ms(age)?),
+        None => None,
+    };
+    let project_id = match project {
+        Some(reference) => Some(crate::repo::resolve_project(con, reference)?.id),
+        None => None,
+    };
+    let mut meta = load_session_meta(con)?;
+    if let Some(cutoff) = cutoff {
+        meta.retain(|m| m.updated < cutoff);
+    }
+    if let Some(project) = project_id.as_deref() {
+        meta.retain(|m| m.project_id.as_deref() == Some(project));
+    }
+    let mut ids: Vec<String> = meta.into_iter().map(|m| m.id).collect();
+    if let Some(limit) = limit {
+        ids.truncate(limit);
+    }
+    Ok(ids)
+}
+
+/// Keep ids usable as file names on every platform.
+fn safe_file_name(id: &str) -> String {
+    id.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+fn batch_export(
+    db_path: &Path,
+    args: &SessionExportArgs,
+    out_dir: &Path,
+    dry_run: bool,
+    service: Option<&ServiceInfo>,
+) -> Result<()> {
+    let con = crate::db::open_conn(db_path, true)?;
+    let ids = select_export_ids(
+        &con,
+        args.older_than.as_deref(),
+        args.project.as_deref(),
+        args.limit,
+    )?;
+    let (format, ext) = if args.markdown {
+        ("markdown", "md")
+    } else {
+        ("json", "json")
+    };
+    // Markdown renders locally; dry-run never needs the server.
+    let svc = if args.markdown || dry_run {
+        None
+    } else {
+        Some(require_service(service, db_path)?)
+    };
+    let mut out = BatchExportOut {
+        env: env_status(db_path),
+        db: db_path.to_string_lossy().to_string(),
+        dir: out_dir.to_string_lossy().to_string(),
+        format,
+        dry_run,
+        sessions: Vec::new(),
+        total: 0,
+        total_bytes: 0,
+        note: None,
+    };
+    if !dry_run {
+        std::fs::create_dir_all(out_dir)
+            .map_err(|e| AppError::db(format!("cannot create {}: {e}", out_dir.display())))?;
+    }
+    for id in ids {
+        let file = format!("{}.{}", safe_file_name(&id), ext);
+        if dry_run {
+            out.sessions.push(BatchExportFile {
+                session: id,
+                file,
+                bytes: None,
+            });
+            continue;
+        }
+        let bytes = if args.markdown {
+            let text = session_markdown(&con, &id, args.include_tools)?;
+            crate::util::write_private(&out_dir.join(&file), text.as_bytes())?;
+            text.len() as u64
+        } else {
+            let svc = svc
+                .as_ref()
+                .ok_or_else(|| AppError::db("internal: missing service for export"))?;
+            let body = svc.export_session(&id)?;
+            crate::util::write_private(&out_dir.join(&file), body.as_bytes())?;
+            body.len() as u64
+        };
+        out.total_bytes += bytes;
+        out.sessions.push(BatchExportFile {
+            session: id,
+            file,
+            bytes: Some(bytes),
+        });
+    }
+    out.total = out.sessions.len();
+    if dry_run {
+        out.note = Some("dry-run: no files were written".to_string());
+    }
+    output::emit(&serde_json::to_value(&out)?)
 }
 
 /// Import a session export through the server API.
@@ -2329,10 +2518,10 @@ mod tests {
         assert!(v.get("messages").is_none());
 
         // `Some(limit)` includes previews; the default limit is 50.
-        cmd_session_show(&con, "s1", Some(50), false, None, false).unwrap();
-        cmd_session_show(&con, "s1", Some(1), false, None, false).unwrap();
+        cmd_session_show(&con, "s1", Some(50), false, None, false, false).unwrap();
+        cmd_session_show(&con, "s1", Some(1), false, None, false, false).unwrap();
         // A unique prefix resolves to the full id.
-        cmd_session_show(&con, "s", Some(1), false, None, false).unwrap();
+        cmd_session_show(&con, "s", Some(1), false, None, false, false).unwrap();
     }
 
     #[test]
@@ -2346,12 +2535,29 @@ mod tests {
             "user",
             r#"{"content":[{"type":"text","text":"hello markdown"}]}"#,
         );
-        let text = session_markdown(&con, "s1").unwrap();
+        let text = session_markdown(&con, "s1", false).unwrap();
         assert!(text.starts_with("# s1"), "text: {text}");
         assert!(text.contains("- id: `s1`"), "text: {text}");
         assert!(text.contains("## user ("), "text: {text}");
         assert!(text.contains("hello markdown"), "text: {text}");
-        assert!(session_markdown(&con, "missing").is_err());
+        assert!(session_markdown(&con, "missing", false).is_err());
+    }
+
+    #[test]
+    fn markdown_include_tools_renders_non_text_parts() {
+        let con = testdb::create();
+        testdb::insert_session(&con, "s1", "/a", None);
+        let data = r#"{"content":[{"type":"text","text":"hi"},{"type":"tool","tool":"bash","state":{"status":"completed"}},{"type":"reasoning","text":"thinking"}]}"#;
+        testdb::insert_session_message(&con, "m1", "s1", "assistant", data);
+
+        let plain = session_markdown(&con, "s1", false).unwrap();
+        assert!(plain.contains("hi"), "text: {plain}");
+        assert!(!plain.contains("```json"), "text: {plain}");
+
+        let full = session_markdown(&con, "s1", true).unwrap();
+        assert!(full.contains("```json"), "text: {full}");
+        assert!(full.contains("\"tool\": \"bash\""), "text: {full}");
+        assert!(full.contains("> reasoning"), "text: {full}");
     }
 
     #[test]

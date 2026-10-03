@@ -2368,7 +2368,7 @@ fn session_markdown_show_and_export_work_locally() {
             .query_row("SELECT id FROM session_v2 LIMIT 1", [], |r| r.get(0))
             .unwrap();
         con.execute(
-            "INSERT INTO session_message (id, session_id, type, data) VALUES ('md1', ?1, 'user', '{\"content\":[{\"type\":\"text\",\"text\":\"hello md\"}]}')",
+            "INSERT INTO session_message (id, session_id, type, data) VALUES ('md1', ?1, 'user', '{\"content\":[{\"type\":\"text\",\"text\":\"hello md\"},{\"type\":\"tool\",\"tool\":\"bash\"}]}')",
             [&id],
         )
         .unwrap();
@@ -2389,6 +2389,27 @@ fn session_markdown_show_and_export_work_locally() {
     assert!(text.starts_with("# "), "output: {text}");
     assert!(text.contains("hello md"), "output: {text}");
     assert!(text.contains("## user ("), "output: {text}");
+    assert!(
+        !text.contains("```json"),
+        "tool parts need --include-tools: {text}"
+    );
+
+    // Non-text parts are rendered as JSON code blocks with --include-tools.
+    let out = run(
+        &[
+            "session",
+            "show",
+            &id,
+            "--messages",
+            "--markdown",
+            "--include-tools",
+        ],
+        &dir,
+    );
+    assert!(out.status.success());
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("```json"), "output: {text}");
+    assert!(text.contains("\"tool\": \"bash\""), "output: {text}");
 
     // Markdown export renders locally, no server required.
     let out = run(&["session", "export", &id, "--markdown"], &dir);
@@ -2615,6 +2636,60 @@ fn report_scope_filters_by_age_and_project() {
     // An unknown project is a usage error.
     let out = run(&["report", "--project", "nope"], &dir);
     assert_eq!(out.status.code(), Some(2));
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn session_batch_export_writes_markdown_files() {
+    let dir = temp_dir("batch-export");
+    create_db(&dir.join("opencode.db"));
+    let out_dir = dir.join("exports");
+
+    // Dry-run lists the session without writing anything.
+    let out = run(
+        &[
+            "session",
+            "export",
+            "--out-dir",
+            out_dir.to_str().unwrap(),
+            "--markdown",
+            "--dry-run",
+        ],
+        &dir,
+    );
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v = stdout_json(&out);
+    assert_eq!(v["dry_run"], true);
+    assert_eq!(v["total"], 1);
+    assert!(!out_dir.exists(), "dry-run writes nothing");
+
+    // Real run writes <id>.md into the directory.
+    let out = run(
+        &[
+            "session",
+            "export",
+            "--out-dir",
+            out_dir.to_str().unwrap(),
+            "--markdown",
+        ],
+        &dir,
+    );
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v = stdout_json(&out);
+    assert_eq!(v["format"], "markdown");
+    assert_eq!(v["total"], 1);
+    assert!(v["total_bytes"].as_u64().unwrap() > 0);
+    let file = v["sessions"][0]["file"].as_str().unwrap();
+    assert!(out_dir.join(file).exists(), "missing export file");
 
     std::fs::remove_dir_all(&dir).unwrap();
 }
