@@ -590,6 +590,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)] // uses Unix permission bits to force a removal failure
     fn clean_shell_failure_reports_progress() {
         use std::os::unix::fs::PermissionsExt;
 
