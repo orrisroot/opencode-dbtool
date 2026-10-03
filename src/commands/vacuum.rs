@@ -1,10 +1,10 @@
 //! `vacuum` command: safe VACUUM with backup and journal mode handling.
 
-use crate::cli::VacuumArgs;
-use crate::db::{file_size, quick_check, EnvStatus};
+use crate::cli::{BackupPruneArgs, BackupSort, VacuumArgs};
+use crate::db::{env_status, file_size, quick_check, EnvStatus};
 use crate::error::{AppError, Result};
 use crate::output;
-use crate::util::{file_mtime_ms, now_ms, timestamp_utc};
+use crate::util::{file_mtime_ms, now_ms, parse_age_ms, timestamp_utc};
 use rusqlite::Connection;
 use serde::Serialize;
 use std::path::{Path, PathBuf};
@@ -435,12 +435,124 @@ pub fn list_backup_files(db_path: &Path, verify: bool) -> Result<Vec<BackupFileO
     Ok(out)
 }
 
-/// List timestamped backups, newest first.
-pub fn cmd_backup_list(db_path: &Path, verify: bool) -> Result<()> {
-    output::emit_cols(
-        &serde_json::to_value(list_backup_files(db_path, verify)?)?,
+/// List timestamped backups (newest first by default; `--sort size`).
+pub fn cmd_backup_list(db_path: &Path, verify: bool, sort: Option<BackupSort>) -> Result<()> {
+    let mut files = list_backup_files(db_path, verify)?;
+    if sort == Some(BackupSort::Size) {
+        files.sort_by(|a, b| b.bytes.cmp(&a.bytes).then_with(|| b.file.cmp(&a.file)));
+    }
+    let total: u64 = files.iter().map(|b| b.bytes).sum();
+    let footer = format!(
+        "{} backup{}, {} total",
+        files.len(),
+        if files.len() == 1 { "" } else { "s" },
+        output::human_bytes(total as i64)
+    );
+    output::emit_cols_footer(
+        &serde_json::to_value(files)?,
         &["file", "bytes", "created", "integrity"],
+        &footer,
     )
+}
+
+/// One backup selected by `backup prune`.
+#[derive(Serialize)]
+struct PruneFile {
+    file: String,
+    bytes: u64,
+    created: String,
+}
+
+#[derive(Serialize)]
+struct BackupPruneOut {
+    #[serde(flatten)]
+    env: EnvStatus,
+    dry_run: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    keep: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    older_than: Option<String>,
+    removed: Vec<PruneFile>,
+    total_files: usize,
+    total_bytes: u64,
+    failed: usize,
+    deleted: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    note: Option<String>,
+}
+
+/// Delete old backups without creating a new one.
+pub fn cmd_backup_prune(db_path: &Path, args: &BackupPruneArgs, dry_run: bool) -> Result<()> {
+    output::emit(&backup_prune_value(
+        db_path,
+        args.keep,
+        args.older_than.as_deref(),
+        dry_run,
+    )?)
+}
+
+/// Select and (unless `dry_run`) remove backups by retention rule.
+/// Removal is best-effort: failures are counted, not fatal.
+pub fn backup_prune_value(
+    db_path: &Path,
+    keep: Option<i64>,
+    older_than: Option<&str>,
+    dry_run: bool,
+) -> Result<serde_json::Value> {
+    if keep.is_none() && older_than.is_none() {
+        return Err(AppError::usage(
+            "usage: opencode-dbtool backup prune --keep <N> | --older-than <age>",
+        ));
+    }
+    let cutoff = match older_than {
+        Some(age) => Some(now_ms()? - parse_age_ms(age)?),
+        None => None,
+    };
+    let dir = db_path.parent().unwrap_or(Path::new("."));
+    let files = list_backup_files(db_path, false)?;
+    let mut removed: Vec<PruneFile> = Vec::new();
+    for (i, b) in files.iter().enumerate() {
+        let select = if let Some(n) = keep {
+            i >= n.max(0) as usize
+        } else if let Some(cutoff) = cutoff {
+            file_mtime_ms(&dir.join(&b.file)).unwrap_or(0) < cutoff
+        } else {
+            false
+        };
+        if select {
+            removed.push(PruneFile {
+                file: b.file.clone(),
+                bytes: b.bytes,
+                created: b.created.clone(),
+            });
+        }
+    }
+    let total_bytes: u64 = removed.iter().map(|f| f.bytes).sum();
+    let mut out = BackupPruneOut {
+        env: env_status(db_path),
+        dry_run,
+        keep,
+        older_than: older_than.map(str::to_string),
+        total_files: removed.len(),
+        removed,
+        total_bytes,
+        failed: 0,
+        deleted: false,
+        note: None,
+    };
+    if dry_run {
+        return Ok(serde_json::to_value(&out)?);
+    }
+    for f in &out.removed {
+        if std::fs::remove_file(dir.join(&f.file)).is_err() {
+            out.failed += 1;
+        }
+    }
+    out.deleted = true;
+    if out.failed > 0 {
+        out.note = Some(format!("{} file(s) could not be removed", out.failed));
+    }
+    Ok(serde_json::to_value(&out)?)
 }
 
 /// JSON shape of the `backup restore` output.
@@ -835,5 +947,42 @@ mod tests {
         assert!(name.starts_with("opencode.db.backup-"), "got: {name}");
         assert!(name.ends_with('Z'), "got: {name}");
         assert!(!name.contains(':'), "got: {name}");
+    }
+
+    #[test]
+    fn prune_selects_by_keep_and_age() {
+        let (con, path) = temp_db("prune");
+        let dir = path.parent().unwrap();
+        let names = [
+            "prune.db.backup-20260101-000000",
+            "prune.db.backup-20260102-000000",
+            "prune.db.backup-20260103-000000",
+        ];
+        for name in names {
+            std::fs::write(dir.join(name), b"x").unwrap();
+        }
+
+        // A filter is required.
+        assert!(backup_prune_value(&path, None, None, true).is_err());
+
+        // Dry-run with --keep 1 lists the two oldest and changes nothing.
+        let v = backup_prune_value(&path, Some(1), None, true).unwrap();
+        assert_eq!(v["total_files"], 2);
+        assert_eq!(v["deleted"], false);
+        assert!(dir.join(names[0]).exists());
+
+        // Real run keeps only the newest.
+        let v = backup_prune_value(&path, Some(1), None, false).unwrap();
+        assert_eq!(v["deleted"], true);
+        assert!(!dir.join(names[0]).exists());
+        assert!(!dir.join(names[1]).exists());
+        assert!(dir.join(names[2]).exists());
+
+        // A fresh backup is not older than 1d, so --older-than removes nothing.
+        let v = backup_prune_value(&path, None, Some("1d"), false).unwrap();
+        assert_eq!(v["total_files"], 0);
+
+        drop(con);
+        cleanup(&path);
     }
 }

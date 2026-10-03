@@ -2465,3 +2465,100 @@ fn wait_lock_flag_is_validated() {
 
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+#[test]
+fn db_query_is_read_only_with_dynamic_columns() {
+    let dir = temp_dir("db-query");
+    create_db(&dir.join("opencode.db"));
+
+    let out = run(&["db", "query", "SELECT id FROM session_v2 LIMIT 5"], &dir);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v = stdout_json(&out);
+    assert_eq!(v["columns"][0], "id");
+    assert!(!v["rows"].as_array().unwrap().is_empty());
+    assert_eq!(v["truncated"], false);
+
+    // Writes and PRAGMAs are refused.
+    let out = run(&["db", "query", "DELETE FROM session_v2"], &dir);
+    assert_eq!(out.status.code(), Some(2));
+    let out = run(&["db", "query", "PRAGMA journal_mode"], &dir);
+    assert_eq!(out.status.code(), Some(2));
+
+    // Table mode renders the dynamic columns.
+    let out = run(
+        &[
+            "db",
+            "query",
+            "SELECT id FROM session_v2",
+            "--format",
+            "table",
+        ],
+        &dir,
+    );
+    assert!(out.status.success());
+    assert!(String::from_utf8_lossy(&out.stdout).contains("id"));
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn backup_prune_and_list_footer() {
+    let dir = temp_dir("backup-prune");
+    create_db(&dir.join("opencode.db"));
+
+    // Create two timestamped backups.
+    for _ in 0..2 {
+        let out = run(&["backup", "--yes"], &dir);
+        assert!(
+            out.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    let out = run(&["backup", "list", "--format", "table"], &dir);
+    assert!(out.status.success());
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("2 backups,"), "output: {text}");
+
+    let out = run(&["backup", "prune", "--keep", "1", "--dry-run"], &dir);
+    assert!(out.status.success());
+    let v = stdout_json(&out);
+    assert_eq!(v["total_files"], 1);
+    assert_eq!(v["deleted"], false);
+
+    let out = run(&["backup", "prune", "--keep", "1", "--yes"], &dir);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(stdout_json(&out)["deleted"], true);
+
+    let out = run(&["backup", "list"], &dir);
+    assert_eq!(stdout_json(&out).as_array().unwrap().len(), 1);
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn doctor_backup_freshness_warning_is_advisory() {
+    let dir = temp_dir("doctor-backup");
+    create_db(&dir.join("opencode.db"));
+
+    let out = run(&["doctor", "--max-backup-age", "1d"], &dir);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v = stdout_json(&out);
+    assert!(v["backups"]["warning"].is_string(), "output: {v}");
+    assert_eq!(v["ok"], true);
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}

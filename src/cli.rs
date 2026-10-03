@@ -144,6 +144,9 @@ pub struct DoctorArgs {
     /// parent/fork/workspace references
     #[arg(long)]
     pub fix: bool,
+    /// Warn when the newest backup is missing or older than this age
+    #[arg(long = "max-backup-age", value_name = "AGE", value_parser = age_value)]
+    pub max_backup_age: Option<String>,
 }
 
 #[derive(Args)]
@@ -500,6 +503,21 @@ pub enum DbCmd {
     Path,
     /// Run `PRAGMA optimize` (query-planner statistics, safe online)
     Optimize,
+    /// Run a read-only SQL query (SELECT/WITH/EXPLAIN only)
+    #[command(
+        after_help = "Examples:\n  opencode-dbtool db query \"SELECT id, cost FROM session_v2 ORDER BY cost DESC LIMIT 5\"\n  opencode-dbtool db query \"SELECT COUNT(*) AS n FROM kv\" --format table"
+    )]
+    Query(DbQueryArgs),
+}
+
+#[derive(Args)]
+pub struct DbQueryArgs {
+    /// Read-only SQL (a single SELECT, WITH, or EXPLAIN statement)
+    #[arg(value_name = "SQL")]
+    pub sql: String,
+    /// Maximum rows to print (0 = no limit)
+    #[arg(long, value_name = "N", default_value_t = 100)]
+    pub limit: usize,
 }
 
 #[derive(Args)]
@@ -536,6 +554,11 @@ pub enum BackupCmd {
     List(BackupListArgs),
     /// Restore a backup over the current database
     Restore(BackupRestoreArgs),
+    /// Delete old backups without creating a new one
+    #[command(
+        after_help = "Examples:\n  opencode-dbtool backup prune --keep 3 --dry-run\n  opencode-dbtool backup prune --older-than 30d --yes"
+    )]
+    Prune(BackupPruneArgs),
 }
 
 #[derive(Args)]
@@ -543,6 +566,35 @@ pub struct BackupListArgs {
     /// Verify every backup with an integrity check (slower)
     #[arg(long)]
     pub verify: bool,
+    /// Sort key (default: date, newest first)
+    #[arg(long, value_enum, value_name = "KEY")]
+    pub sort: Option<BackupSort>,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+pub enum BackupSort {
+    Date,
+    Size,
+}
+
+#[derive(Args)]
+pub struct BackupPruneArgs {
+    /// Keep only the newest N backups
+    #[arg(
+        long,
+        value_name = "N",
+        value_parser = keep_backups_value,
+        conflicts_with = "older_than"
+    )]
+    pub keep: Option<i64>,
+    /// Delete backups older than this age
+    #[arg(
+        long,
+        value_name = "AGE",
+        value_parser = age_value,
+        conflicts_with = "keep"
+    )]
+    pub older_than: Option<String>,
 }
 
 #[derive(Args)]

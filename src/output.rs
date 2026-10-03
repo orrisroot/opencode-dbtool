@@ -151,6 +151,16 @@ pub fn emit_cols_footer(v: &Value, columns: &[&str], footer: &str) -> Result<()>
     write_stdout(&text)
 }
 
+/// Print a result with dynamic columns: table/CSV render `rows` with
+/// `columns`, JSON prints the full value (metadata plus rows).
+pub fn emit_dynamic(full: &Value, rows: &Value, columns: &[&str]) -> Result<()> {
+    if table_mode() || csv_mode() {
+        emit_cols(rows, columns)
+    } else {
+        emit(full)
+    }
+}
+
 /// `--fields` overrides the command's column selection.
 fn effective_columns(columns: &[&str]) -> Vec<String> {
     match FIELDS.get() {

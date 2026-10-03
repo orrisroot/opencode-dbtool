@@ -170,6 +170,7 @@ fn mutation_guard<'a>(
                 "backup restore",
                 Some("restoring while opencode is running is not allowed"),
             )),
+            Some(BackupCmd::Prune(_)) => Some(("backup prune", None)),
             None => Some(("backup", None)),
         },
         Command::Fs(FsCmd::Snapshots(a)) => Some((
@@ -412,7 +413,13 @@ fn dispatch(
         Command::Doctor(a) => {
             let read_only = !a.fix || dry_run;
             let mut con = db::open_conn(db_path, read_only)?;
-            commands::doctor::cmd_doctor(&mut con, db_path, a.fix, dry_run)
+            commands::doctor::cmd_doctor(
+                &mut con,
+                db_path,
+                a.fix,
+                a.max_backup_age.as_deref(),
+                dry_run,
+            )
         }
         Command::Project(cmd) => match cmd {
             ProjectCmd::List(a) => {
@@ -541,6 +548,7 @@ fn dispatch(
                 let con = db::open_conn(db_path, false)?;
                 commands::dbinfo::cmd_db_optimize(&con, db_path)
             }
+            DbCmd::Query(a) => commands::dbinfo::cmd_db_query(db_path, &a.sql, a.limit),
         },
         Command::Backup(a) => {
             if a.keep_backups.is_some() && a.command.is_some() {
@@ -549,7 +557,9 @@ fn dispatch(
                 ));
             }
             match &a.command {
-                Some(BackupCmd::List(l)) => commands::vacuum::cmd_backup_list(db_path, l.verify),
+                Some(BackupCmd::List(l)) => {
+                    commands::vacuum::cmd_backup_list(db_path, l.verify, l.sort)
+                }
                 Some(BackupCmd::Restore(r)) => {
                     let path = if r.latest {
                         let files = commands::vacuum::list_backup_files(db_path, false)?;
@@ -563,6 +573,9 @@ fn dispatch(
                         })?
                     };
                     commands::vacuum::cmd_restore(db_path, &path, dry_run)
+                }
+                Some(BackupCmd::Prune(p)) => {
+                    commands::vacuum::cmd_backup_prune(db_path, p, dry_run)
                 }
                 None => commands::vacuum::cmd_backup(db_path, dry_run, a.keep_backups),
             }
