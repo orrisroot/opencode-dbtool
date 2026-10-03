@@ -797,6 +797,7 @@ fn subcommand_help_lists_flags() {
     let text = String::from_utf8_lossy(&out.stdout);
     assert!(text.contains("--older-than"), "stdout: {text}");
     assert!(text.contains("--keep-latest-per-project"), "stdout: {text}");
+    assert!(text.contains("Examples:"), "stdout: {text}");
 
     std::fs::remove_dir_all(&dir).unwrap();
 }

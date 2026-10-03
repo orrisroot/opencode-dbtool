@@ -121,6 +121,9 @@ pub enum Command {
 // ---------------------------------------------------------------------------
 
 #[derive(Args)]
+#[command(
+    after_help = "Examples:\n  opencode-dbtool stats\n  opencode-dbtool stats --detail --format json"
+)]
 pub struct StatsArgs {
     /// Add message-type breakdown, 30-day activity, and subagent shares
     #[arg(long)]
@@ -128,6 +131,9 @@ pub struct StatsArgs {
 }
 
 #[derive(Args)]
+#[command(
+    after_help = "Examples:\n  opencode-dbtool doctor\n  opencode-dbtool doctor --fix --dry-run"
+)]
 pub struct DoctorArgs {
     /// Repair what can be repaired: orphan blobs/events and dangling
     /// parent/fork/workspace references
@@ -136,6 +142,9 @@ pub struct DoctorArgs {
 }
 
 #[derive(Args)]
+#[command(
+    after_help = "Examples:\n  opencode-dbtool report\n  opencode-dbtool report --costs --format table"
+)]
 pub struct ReportArgs {
     /// Add cost aggregates by project and day
     #[arg(long)]
@@ -237,6 +246,9 @@ pub enum SessionCmd {
 }
 
 #[derive(Args)]
+#[command(
+    after_help = "Examples:\n  opencode-dbtool session search TODO --limit 5\n  opencode-dbtool session search \"error\" --since 30d --format table"
+)]
 pub struct SessionSearchArgs {
     /// Text to find in message content (case-insensitive)
     #[arg(value_name = "TEXT")]
@@ -278,6 +290,9 @@ pub enum SortKey {
 }
 
 #[derive(Args)]
+#[command(
+    after_help = "Examples:\n  opencode-dbtool session list --sort size --limit 10\n  opencode-dbtool session list --search opencode --project /work/repo"
+)]
 pub struct SessionListArgs {
     /// Sort key (default: time_updated descending)
     #[arg(long, value_enum, value_name = "KEY")]
@@ -327,6 +342,9 @@ pub struct SessionShowArgs {
 }
 
 #[derive(Args)]
+#[command(
+    after_help = "Examples:\n  opencode-dbtool session purge --older-than 30d --subagents --dry-run\n  opencode-dbtool session purge --older-than 90d --keep-latest-per-project 5 --restart-service --yes"
+)]
 pub struct SessionPurgeArgs {
     /// Sessions with `time_updated` older than the age (e.g. 30d, 12h, 2w)
     #[arg(long, value_name = "AGE", value_parser = age_value)]
@@ -464,6 +482,9 @@ pub struct DbCheckpointArgs {
 // ---------------------------------------------------------------------------
 
 #[derive(Args)]
+#[command(
+    after_help = "Examples:\n  opencode-dbtool backup\n  opencode-dbtool backup list --verify\n  opencode-dbtool backup restore --latest --dry-run"
+)]
 pub struct BackupArgs {
     /// List backups or restore one (default: create a backup)
     #[command(subcommand)]
@@ -513,6 +534,9 @@ pub enum ServiceCmd {
 }
 
 #[derive(Args)]
+#[command(
+    after_help = "Examples:\n  opencode-dbtool vacuum --dry-run\n  opencode-dbtool vacuum --online --yes"
+)]
 pub struct VacuumArgs {
     /// Skip the timestamped backup (dangerous)
     #[arg(long, conflicts_with = "keep_backups")]
@@ -589,6 +613,9 @@ pub struct DeleteIdsArgs {
 // ---------------------------------------------------------------------------
 
 #[derive(Args)]
+#[command(
+    after_help = "Examples:\n  opencode-dbtool cleanup --older-than 30d --subagents --dry-run\n  opencode-dbtool cleanup --older-than 30d --restart-service --yes"
+)]
 pub struct CleanupArgs {
     #[command(flatten)]
     pub purge: SessionPurgeArgs,
