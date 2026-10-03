@@ -575,9 +575,11 @@ fn execute_delete(con: &mut Connection, resolved: &[String]) -> Result<()> {
 
 /// Delete the given sessions through the running opencode server, deepest
 /// children first, then verify the rows are gone. The server owns its
-/// caches and event log, so no stale-state or FK failures arise.
+/// caches and event log, so no stale-state or FK failures arise. Any
+/// `event`/`event_sequence` rows the server did not remove are cleaned up
+/// so the API path matches the direct path exactly.
 fn execute_delete_via_api(
-    con: &Connection,
+    con: &mut Connection,
     resolved: &[String],
     service: &ServiceInfo,
 ) -> Result<()> {
@@ -605,6 +607,43 @@ fn execute_delete_via_api(
             "sessions still exist after API delete: {remaining}"
         )));
     }
+    cleanup_orphan_events(con, resolved)?;
+    for table in ["event", "event_sequence"] {
+        let mut left: i64 = 0;
+        for chunk in resolved.chunks(SQL_VAR_CHUNK) {
+            let in_sql = placeholders(chunk.len());
+            left += con.query_row(
+                &format!("SELECT COUNT(*) FROM \"{table}\" WHERE aggregate_id IN ({in_sql})"),
+                rusqlite::params_from_iter(chunk),
+                |r| r.get::<_, i64>(0),
+            )?;
+        }
+        if left != 0 {
+            return Err(AppError::db(format!(
+                "{table} rows still exist after API delete: {left}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Remove `event`/`event_sequence` rows left behind by an API delete; a
+/// server that already removed them makes this a no-op.
+fn cleanup_orphan_events(con: &mut Connection, ids: &[String]) -> Result<()> {
+    con.execute_batch("PRAGMA foreign_keys = ON;")?;
+    let tx = con.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    for chunk in ids.chunks(SQL_VAR_CHUNK) {
+        let in_sql = placeholders(chunk.len());
+        tx.execute(
+            &format!("DELETE FROM event WHERE aggregate_id IN ({in_sql})"),
+            rusqlite::params_from_iter(chunk),
+        )?;
+        tx.execute(
+            &format!("DELETE FROM event_sequence WHERE aggregate_id IN ({in_sql})"),
+            rusqlite::params_from_iter(chunk),
+        )?;
+    }
+    tx.commit()?;
     Ok(())
 }
 

@@ -41,7 +41,9 @@ pub fn execute(cli: Cli) -> Result<()> {
 
     match mutation_guard(command, service.as_ref(), &db_path, restart) {
         Some((what, idle)) => {
-            let stop_service = restart && idle.is_some();
+            // Stop the service only when one is actually registered; with
+            // none, fall through to the normal running-instance guard.
+            let stop_service = restart && service.is_some() && idle.is_some();
             // When the service is stopped for maintenance, run the direct
             // (offline) path instead of the server API.
             let service_for_run = if stop_service { None } else { service.as_ref() };
@@ -55,7 +57,14 @@ pub fn execute(cli: Cli) -> Result<()> {
                 |dry| dispatch(command, &dir, &db_path, dry, cli.quiet, service_for_run),
             )
         }
-        None => dispatch(command, &dir, &db_path, false, cli.quiet, service.as_ref()),
+        None => dispatch(
+            command,
+            &dir,
+            &db_path,
+            cli.dry_run,
+            cli.quiet,
+            service.as_ref(),
+        ),
     }
 }
 
@@ -337,7 +346,9 @@ fn dispatch(
             }
         },
         Command::Db(cmd) => match cmd {
-            DbCmd::Checkpoint(a) => commands::checkpoint::cmd_checkpoint(db_path, a.truncate),
+            DbCmd::Checkpoint(a) => {
+                commands::checkpoint::cmd_checkpoint(db_path, a.truncate, dry_run)
+            }
         },
         Command::Backup(a) => commands::vacuum::cmd_backup(db_path, dry_run, a.keep_backups),
         Command::Fs(cmd) => match cmd {

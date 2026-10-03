@@ -847,6 +847,17 @@ fn db_checkpoint_reports_wal_state() {
     let dir = temp_dir("checkpoint");
     create_db(&dir.join("opencode.db"));
 
+    // --dry-run reports the plan without running the pragma.
+    let out = run(&["db", "checkpoint", "--truncate", "--dry-run"], &dir);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v = stdout_json(&out);
+    assert_eq!(v["dry_run"], true);
+    assert_eq!(v["wal_bytes_after"], v["wal_bytes_before"]);
+
     let out = run(&["db", "checkpoint", "--truncate"], &dir);
     assert!(
         out.status.success(),
@@ -854,6 +865,7 @@ fn db_checkpoint_reports_wal_state() {
         String::from_utf8_lossy(&out.stderr)
     );
     let v = stdout_json(&out);
+    assert_eq!(v["dry_run"], false);
     assert_eq!(v["mode"], "truncate");
     assert!(v["busy"].is_number());
     assert!(v["wal_bytes_after"].is_number());
@@ -918,6 +930,17 @@ fn session_delete_routes_through_the_running_service() {
             [],
         )
         .unwrap();
+        con.execute(
+            "INSERT INTO event (aggregate_id, type, data) \
+             VALUES ('ses_api_child', 'session.next.text.ended', '{}')",
+            [],
+        )
+        .unwrap();
+        con.execute(
+            "INSERT INTO event_sequence (aggregate_id, seq) VALUES ('ses_api_child', 1)",
+            [],
+        )
+        .unwrap();
     }
 
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -931,8 +954,23 @@ fn session_delete_routes_through_the_running_service() {
         let con = Connection::open(&db_thread).unwrap();
         con.busy_timeout(std::time::Duration::from_secs(5)).unwrap();
         con.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
-        for _ in 0..2 {
-            let (mut stream, _) = listener.accept().unwrap();
+        // Serve up to two requests, but never block forever: a regression
+        // that sends fewer requests must fail the test rather than hang it.
+        listener.set_nonblocking(true).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut served = 0;
+        while served < 2 && std::time::Instant::now() < deadline {
+            let (mut stream, _) = match listener.accept() {
+                Ok(pair) => pair,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                    continue;
+                }
+                Err(e) => panic!("mock server accept failed: {e}"),
+            };
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
             let mut buf: Vec<u8> = Vec::new();
             let mut tmp = [0u8; 1024];
             loop {
@@ -967,6 +1005,7 @@ fn session_delete_routes_through_the_running_service() {
                 body.len()
             );
             stream.write_all(response.as_bytes()).unwrap();
+            served += 1;
         }
     });
 
@@ -1018,13 +1057,31 @@ fn session_delete_routes_through_the_running_service() {
         )
         .unwrap();
     assert_eq!(left, 0, "API deletes removed the rows");
+    // The mock server only removes session rows; the tool cleans up the
+    // event/event_sequence leftovers of the API path.
+    let events: i64 = con
+        .query_row(
+            "SELECT COUNT(*) FROM event WHERE aggregate_id LIKE 'ses_api_%'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let sequences: i64 = con
+        .query_row(
+            "SELECT COUNT(*) FROM event_sequence WHERE aggregate_id LIKE 'ses_api_%'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(events, 0, "event rows cleaned up");
+    assert_eq!(sequences, 0, "event_sequence rows cleaned up");
     drop(con);
 
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
 #[test]
-fn restart_service_requires_a_registered_service() {
+fn restart_service_without_service_falls_back_to_the_guard() {
     let dir = temp_dir("restart-missing");
     create_db(&dir.join("opencode.db"));
 
@@ -1039,17 +1096,22 @@ fn restart_service_requires_a_registered_service() {
         ],
         &dir,
     );
-    assert_eq!(
-        out.status.code(),
-        Some(2),
-        "stderr: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
+    // With no registered service the flag falls back to the normal
+    // running-instance guard: exit 0 when nothing is running, exit 1 when
+    // opencode is (the test harness itself may run under opencode).
+    let code = out.status.code();
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("no running opencode service"),
-        "stderr: {stderr}"
+        code == Some(0) || code == Some(1),
+        "unexpected exit code: {code:?} stderr: {stderr}"
     );
+    assert!(
+        !stderr.contains("no running opencode service"),
+        "the flag must not require a service: {stderr}"
+    );
+    if code == Some(1) {
+        assert!(stderr.contains("opencode is running"), "stderr: {stderr}");
+    }
 
     std::fs::remove_dir_all(&dir).unwrap();
 }

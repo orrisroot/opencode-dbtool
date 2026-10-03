@@ -145,10 +145,22 @@ impl ServiceRestart {
                 ))
             })?;
         if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            if !process_alive(service.pid) {
+                // The service did stop despite the non-zero exit; put it
+                // back so opencode is not left down.
+                let _ = std::process::Command::new(&exe)
+                    .args(["service", "start"])
+                    .output();
+                return Err(AppError::db(format!(
+                    "--restart-service: {} service stop failed ({stderr}); \
+                     the service had already stopped and was restarted",
+                    exe.display()
+                )));
+            }
             return Err(AppError::db(format!(
-                "--restart-service: {} service stop failed: {}",
-                exe.display(),
-                String::from_utf8_lossy(&output.stderr).trim()
+                "--restart-service: {} service stop failed: {stderr}",
+                exe.display()
             )));
         }
         wait_for_exit(service.pid, 100);
@@ -208,8 +220,14 @@ impl Drop for ServiceRestart {
 }
 
 fn wait_for_exit(pid: i32, steps: usize) {
+    if pid <= 0 {
+        return;
+    }
+    let pid = sysinfo::Pid::from_u32(pid as u32);
+    let mut sys = sysinfo::System::new();
     for _ in 0..steps {
-        if !process_alive(pid) {
+        sys.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[pid]), true);
+        if sys.process(pid).is_none() {
             return;
         }
         std::thread::sleep(Duration::from_millis(100));
@@ -231,14 +249,19 @@ impl ServiceInfo {
     /// it safe to route deletes through it (otherwise the tool would
     /// modify the server's database instead of the target one).
     ///
-    /// On Linux this checks the process's open file descriptors exactly;
-    /// elsewhere it only trusts the default database location (no
-    /// `OPENCODE_DB` / `OPENCODE_DATA_DIR` override).
+    /// The check is exact on Linux (open file descriptors). Other
+    /// platforms cannot verify process file handles, so API routing is
+    /// disabled there; use `--restart-service` or stop opencode instead.
     pub fn targets_db(&self, db_path: &Path) -> bool {
-        if cfg!(target_os = "linux") {
-            return linux_process_has_open(self.pid, db_path);
+        #[cfg(target_os = "linux")]
+        {
+            linux_process_has_open(self.pid, db_path)
         }
-        env_unset("OPENCODE_DB") && env_unset("OPENCODE_DATA_DIR")
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = db_path;
+            false
+        }
     }
 
     /// `DELETE /api/session/{id}`; a 404 `SessionNotFoundError` counts as
@@ -248,6 +271,9 @@ impl ServiceInfo {
             ureq::Agent::config_builder()
                 .timeout_global(Some(Duration::from_secs(15)))
                 .http_status_as_error(false)
+                // The URL is the locally registered server: never route it
+                // through an HTTP(S)_PROXY from the environment.
+                .proxy(None)
                 .build(),
         );
         let url = format!("{}/api/session/{id}", self.url);
@@ -269,10 +295,6 @@ impl ServiceInfo {
             ))),
         }
     }
-}
-
-fn env_unset(name: &str) -> bool {
-    std::env::var(name).map(|v| v.is_empty()).unwrap_or(true)
 }
 
 #[cfg(target_os = "linux")]
@@ -403,6 +425,9 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::channel();
         let handle = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
             let mut buf = [0u8; 4096];
             let n = stream.read(&mut buf).unwrap();
             let request = String::from_utf8_lossy(&buf[..n]).to_string();
@@ -435,7 +460,9 @@ mod tests {
         service_at(url)
             .delete_session("ses_1")
             .expect("delete succeeds");
-        let (line, auth) = rx.recv().unwrap();
+        let (line, auth) = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("mock server received no request");
         handle.join().unwrap();
         assert_eq!(line, "DELETE /api/session/ses_1 HTTP/1.1");
         let expected = format!(

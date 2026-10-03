@@ -141,8 +141,10 @@ tool adapts:
   that still need exclusive access (`project delete/purge`, `session
   strip-reasoning`, `kv delete`, `fs clean-log`, full `fs
   clean-snapshots`/`clean-shell`, `vacuum`, and `cleanup` including its
-  VACUUM). A running TUI may need to be restarted if the service comes
-  back on a different port.
+  VACUUM). With no registered service the flag falls back to the normal
+  running-instance guard, so it is safe to pass unconditionally. A running
+  TUI may need to be restarted if the service comes back on a different
+  port.
 - `project delete/purge`, `session strip-reasoning`, `kv delete`,
   `fs clean-log`, `fs clean-snapshots` without `--orphans-only`, and
   `fs clean-shell` without `--older-than` still require stopping opencode
@@ -164,11 +166,11 @@ opencode-dbtool cleanup --older-than 30d --subagents --restart-service
 ```
 
 The tool discovers the service through `service.json` (or `server.json`)
-under `$XDG_STATE_HOME/opencode` (`~/.local/state/opencode`). On Linux it
-only routes through the server after verifying, via `/proc/<pid>/fd`, that
-the server has the target database open; elsewhere it trusts the service
-only for the default database location (no `OPENCODE_DB` /
-`OPENCODE_DATA_DIR` override).
+under `$XDG_STATE_HOME/opencode` (`~/.local/state/opencode`). API routing
+is Linux-only: the server is used only after `/proc/<pid>/fd` confirms it
+has the target database open. On other platforms the delete commands keep
+the normal running-instance guard; use `--restart-service` or stop
+opencode.
 
 ### `stats`
 
@@ -609,8 +611,9 @@ added on a real run (dry-run reports nothing since no backup is touched):
 
 Checkpoint the WAL into the database file. PASSIVE (the default) never
 blocks; `--truncate` additionally shrinks `opencode.db-wal` when no
-connection holds a read snapshot. Both are safe while opencode runs and
-report the lock state instead of failing:
+connection holds a read snapshot. `--dry-run` reports the plan without
+running the pragma. Both modes are safe while opencode runs and report
+the lock state instead of failing:
 
 ```json
 {
