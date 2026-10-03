@@ -1,9 +1,11 @@
 //! `project` subcommands: list, show, delete, purge.
 
+use crate::cli::ProjectSort;
 use crate::db::{env_status, EnvStatus};
 use crate::error::{AppError, Result};
 use crate::models::{
-    filter_projects, project_json, ProjectFilter, ProjectFilterJson, ProjectOut, ProjectRow,
+    filter_projects, project_json, project_total_bytes, ProjectFilter, ProjectFilterJson,
+    ProjectOut, ProjectRow,
 };
 use crate::output;
 use crate::repo::{load_project, load_projects, project_impact, resolve_project};
@@ -48,13 +50,33 @@ struct ProjectDeleteOut {
     note: Option<String>,
 }
 
-pub fn cmd_project_list(con: &Connection, paths: &[String]) -> Result<()> {
+pub fn cmd_project_list(
+    con: &Connection,
+    paths: &[String],
+    sort: Option<ProjectSort>,
+) -> Result<()> {
     let projects = load_projects(con)?;
     let refs: Vec<&str> = paths.iter().map(String::as_str).collect();
-    let arr: Vec<ProjectOut> = filter_projects(&projects, &refs)
-        .iter()
-        .map(|p| project_json(p))
-        .collect();
+    let mut rows: Vec<&ProjectRow> = filter_projects(&projects, &refs);
+    match sort {
+        Some(ProjectSort::Size) => rows.sort_by(|a, b| {
+            project_total_bytes(b)
+                .cmp(&project_total_bytes(a))
+                .then_with(|| a.worktree.cmp(&b.worktree))
+        }),
+        Some(ProjectSort::Updated) => rows.sort_by(|a, b| {
+            b.updated
+                .cmp(&a.updated)
+                .then_with(|| a.worktree.cmp(&b.worktree))
+        }),
+        Some(ProjectSort::Sessions) => rows.sort_by(|a, b| {
+            b.sessions
+                .cmp(&a.sessions)
+                .then_with(|| a.worktree.cmp(&b.worktree))
+        }),
+        None => {}
+    }
+    let arr: Vec<ProjectOut> = rows.iter().map(|p| project_json(p)).collect();
     output::emit_cols(
         &serde_json::to_value(arr)?,
         &[

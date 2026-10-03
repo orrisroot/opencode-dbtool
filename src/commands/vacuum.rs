@@ -8,7 +8,27 @@ use crate::util::{file_mtime_ms, now_ms, timestamp_utc};
 use rusqlite::Connection;
 use serde::Serialize;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::Duration;
+
+/// Last printed backup percentage, to throttle progress output.
+static BACKUP_PERCENT: AtomicU8 = AtomicU8::new(0);
+
+/// Progress callback for the online backup API (prints every ~10%).
+fn backup_progress(p: rusqlite::backup::Progress) {
+    if p.pagecount <= 0 {
+        return;
+    }
+    let done = (p.pagecount - p.remaining).max(0) as u64;
+    let percent = (done * 100 / p.pagecount as u64) as u8;
+    let last = BACKUP_PERCENT.swap(percent, Ordering::Relaxed);
+    if percent != last && (percent.is_multiple_of(10) || percent >= 99) {
+        output::progress_replace(&format!(
+            "backup: {percent}% ({done}/{} pages)",
+            p.pagecount
+        ));
+    }
+}
 
 /// JSON shape of the `backup` field.
 #[derive(Serialize)]
@@ -159,17 +179,20 @@ pub fn vacuum_value(
 /// a final integrity check. Returns the post-state plus the backup
 /// report.
 pub fn cmd_vacuum(con: &Connection, db_path: &Path, opts: &VacuumOpts) -> Result<VacuumResult> {
+    output::progress("vacuum: checkpointing");
     checkpoint(con);
     if quick_check(con) != "ok" {
         return Err(AppError::db("integrity check not ok - abort"));
     }
 
     let backup = if opts.backup {
+        output::progress("vacuum: creating verified backup");
         Some(create_backup(db_path)?)
     } else {
         None
     };
 
+    output::progress("vacuum: running VACUUM");
     con.execute_batch("VACUUM;")
         .map_err(|e| AppError::db(format!("VACUUM failed: {e}")))?;
     // VACUUM rebuilds the database header; restore the WAL journal mode.
@@ -178,6 +201,7 @@ pub fn cmd_vacuum(con: &Connection, db_path: &Path, opts: &VacuumOpts) -> Result
     checkpoint(con);
 
     let freelist: i64 = con.query_row("PRAGMA freelist_count", [], |r| r.get(0))?;
+    output::progress("vacuum: verifying");
     let integrity = quick_check(con);
     if integrity != "ok" {
         return Err(AppError::db(format!(
@@ -524,11 +548,12 @@ fn create_backup(db_path: &Path) -> Result<BackupInfo> {
             let backup = rusqlite::backup::Backup::new(&src, &mut dst)
                 .map_err(|e| AppError::db(format!("backup failed ({}): {e}", path.display())))?;
             backup
-                .run_to_completion(256, Duration::from_millis(0), None)
+                .run_to_completion(256, Duration::from_millis(0), Some(backup_progress))
                 .map_err(|e| AppError::db(format!("backup failed ({}): {e}", path.display())))?;
         }
         Ok(())
     })();
+    output::progress_finish();
     if let Err(e) = copied {
         let _ = std::fs::remove_file(&path);
         return Err(e);

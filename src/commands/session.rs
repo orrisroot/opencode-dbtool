@@ -1,6 +1,7 @@
 //! `session` subcommands: list, show, delete, purge, strip-reasoning.
 //! V2-only.
 
+use crate::cli::SortKey;
 use crate::db::{env_status, EnvStatus, SESSION_TABLE};
 use crate::error::{AppError, Result};
 use crate::models::{session_json, PurgeFilter, PurgeFilterJson, SessionOut};
@@ -94,12 +95,13 @@ struct StripOut {
 
 pub fn cmd_session_list(
     con: &Connection,
-    sort_size: bool,
+    sort: Option<SortKey>,
     limit: Option<usize>,
     search: Option<&str>,
+    min_size: Option<i64>,
 ) -> Result<()> {
     output::emit_cols(
-        &session_list_value(con, sort_size, limit, search)?,
+        &session_list_value(con, sort, limit, search, min_size)?,
         &[
             "id",
             "title",
@@ -115,9 +117,10 @@ pub fn cmd_session_list(
 /// Build the session list array (exposed for tests).
 pub fn session_list_value(
     con: &Connection,
-    sort_size: bool,
+    sort: Option<SortKey>,
     limit: Option<usize>,
     search: Option<&str>,
+    min_size: Option<i64>,
 ) -> Result<serde_json::Value> {
     let mut sessions = load_sessions(con)?;
     if let Some(search) = search {
@@ -126,12 +129,23 @@ pub fn session_list_value(
             s.title.to_lowercase().contains(&needle) || s.directory.to_lowercase().contains(&needle)
         });
     }
-    if sort_size {
-        sessions.sort_by(|a, b| {
+    if let Some(min) = min_size {
+        sessions.retain(|s| s.size_bytes() >= min);
+    }
+    match sort {
+        Some(SortKey::Size) => sessions.sort_by(|a, b| {
             b.size_bytes()
                 .cmp(&a.size_bytes())
                 .then_with(|| a.id.cmp(&b.id))
-        });
+        }),
+        Some(SortKey::Cost) => {
+            sessions.sort_by(|a, b| b.cost.total_cmp(&a.cost).then_with(|| a.id.cmp(&b.id)))
+        }
+        Some(SortKey::Messages) => {
+            sessions.sort_by(|a, b| b.sm_msgs.cmp(&a.sm_msgs).then_with(|| a.id.cmp(&b.id)))
+        }
+        // `Updated` is the default order from `load_sessions`.
+        Some(SortKey::Updated) | None => {}
     }
     if let Some(n) = limit {
         sessions.truncate(n);
@@ -140,7 +154,12 @@ pub fn session_list_value(
     Ok(serde_json::to_value(out)?)
 }
 
-pub fn cmd_session_show(con: &Connection, reference: &str, messages: Option<usize>) -> Result<()> {
+pub fn cmd_session_show(
+    con: &Connection,
+    reference: &str,
+    messages: Option<usize>,
+    full: bool,
+) -> Result<()> {
     let reference = reference.trim();
     let id = resolve_session_id(con, reference)?;
     let s = load_session(con, &id)?
@@ -151,7 +170,11 @@ pub fn cmd_session_show(con: &Connection, reference: &str, messages: Option<usiz
         let msgs: Vec<serde_json::Value> = rows
             .iter()
             .map(|m| {
-                let preview: String = m.data.chars().take(300).collect();
+                let preview: String = if full {
+                    m.data.clone()
+                } else {
+                    m.data.chars().take(300).collect()
+                };
                 serde_json::json!({
                     "id": m.id,
                     "type": m.msg_type,
@@ -159,7 +182,7 @@ pub fn cmd_session_show(con: &Connection, reference: &str, messages: Option<usiz
                     "time": crate::util::dt(m.created),
                     "bytes": m.bytes,
                     "preview": preview,
-                    "truncated": m.data.len() > preview.len(),
+                    "truncated": m.data != preview,
                 })
             })
             .collect();
@@ -536,6 +559,7 @@ fn placeholders(n: usize) -> String {
 /// `event_sequence` rows (which reference aggregates, not sessions) are
 /// deleted explicitly.
 fn execute_delete(con: &mut Connection, resolved: &[String]) -> Result<()> {
+    output::progress("deleting sessions");
     con.execute_batch("PRAGMA foreign_keys = ON;")?;
     let tx = con.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     for chunk in resolved.chunks(SQL_VAR_CHUNK) {
@@ -586,12 +610,16 @@ fn execute_delete_via_api(
     let order = delete_order(con, resolved)?;
     let total = order.len();
     for (done, id) in order.iter().enumerate() {
+        if total > 1 {
+            output::progress_replace(&format!("deleting: {}/{total} sessions", done + 1));
+        }
         service.delete_session(id).map_err(|e| {
             AppError::db(format!(
                 "{e} ({done} of {total} session(s) already deleted; re-run to converge)"
             ))
         })?;
     }
+    output::progress_finish();
     let mut remaining: i64 = 0;
     for chunk in resolved.chunks(SQL_VAR_CHUNK) {
         let in_sql = placeholders(chunk.len());
@@ -1520,7 +1548,7 @@ mod tests {
         testdb::insert_session(&con, "medium", "/a", None);
         testdb::insert_session_message(&con, "m3", "medium", "assistant", "xxxxxxxx");
 
-        let all = session_list_value(&con, false, None, None).unwrap();
+        let all = session_list_value(&con, None, None, None, None).unwrap();
         let ids: Vec<&str> = all
             .as_array()
             .unwrap()
@@ -1529,7 +1557,7 @@ mod tests {
             .collect();
         assert_eq!(ids.len(), 3);
 
-        let sized = session_list_value(&con, true, None, None).unwrap();
+        let sized = session_list_value(&con, Some(SortKey::Size), None, None, None).unwrap();
         let ids: Vec<&str> = sized
             .as_array()
             .unwrap()
@@ -1538,7 +1566,7 @@ mod tests {
             .collect();
         assert_eq!(ids, vec!["big", "medium", "small"]);
 
-        let limited = session_list_value(&con, true, Some(2), None).unwrap();
+        let limited = session_list_value(&con, Some(SortKey::Size), Some(2), None, None).unwrap();
         let ids: Vec<&str> = limited
             .as_array()
             .unwrap()
@@ -1548,7 +1576,7 @@ mod tests {
         assert_eq!(ids, vec!["big", "medium"]);
 
         // Search matches title or directory (case-insensitive).
-        let searched = session_list_value(&con, false, None, Some("MED")).unwrap();
+        let searched = session_list_value(&con, None, None, Some("MED"), None).unwrap();
         let ids: Vec<&str> = searched
             .as_array()
             .unwrap()
@@ -1556,7 +1584,7 @@ mod tests {
             .map(|s| s["id"].as_str().unwrap())
             .collect();
         assert_eq!(ids, vec!["medium"]);
-        assert!(session_list_value(&con, false, None, Some("nope"))
+        assert!(session_list_value(&con, None, None, Some("nope"), None)
             .unwrap()
             .as_array()
             .unwrap()
@@ -1836,9 +1864,9 @@ mod tests {
         assert!(v.get("messages").is_none());
 
         // `Some(limit)` includes previews; the default limit is 50.
-        cmd_session_show(&con, "s1", Some(50)).unwrap();
-        cmd_session_show(&con, "s1", Some(1)).unwrap();
+        cmd_session_show(&con, "s1", Some(50), false).unwrap();
+        cmd_session_show(&con, "s1", Some(1), false).unwrap();
         // A unique prefix resolves to the full id.
-        cmd_session_show(&con, "s", Some(1)).unwrap();
+        cmd_session_show(&con, "s", Some(1), false).unwrap();
     }
 }

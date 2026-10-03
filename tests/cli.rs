@@ -131,6 +131,8 @@ fn stats_reports_tables_and_message_types() {
     assert_eq!(v["tables"]["session_message"], 1);
     assert_eq!(v["message_types"]["assistant"]["count"], 1);
     assert!(v["storage"]["snapshot_bytes"].is_number());
+    assert!(v["reclaimable_bytes"].is_number());
+    assert!(v["table_bytes"]["session_message"].is_number());
 
     std::fs::remove_dir_all(&dir).unwrap();
 }
@@ -1410,6 +1412,171 @@ fn service_status_with_mock_service() {
     assert_eq!(v["db_matches"], true);
     assert_eq!(v["api_ok"], true);
     assert_eq!(v["version"], "2.0.22");
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn session_list_sort_and_min_size() {
+    let dir = temp_dir("list-sort");
+    let db = dir.join("opencode.db");
+    create_db(&db);
+    {
+        let con = Connection::open(&db).unwrap();
+        con.execute("UPDATE session_v2 SET cost = 0.5 WHERE id = 'ses_1'", [])
+            .unwrap();
+        con.execute(
+            "INSERT INTO session_v2 (id, directory, title, time_updated, cost) \
+             VALUES ('ses_big', '/work/a', 'big', 0, 0.1)",
+            [],
+        )
+        .unwrap();
+        con.execute(
+            "INSERT INTO session_message (id, session_id, type, data) VALUES ('mbig', 'ses_big', 'assistant', ?1)",
+            [&"x".repeat(2000)],
+        )
+        .unwrap();
+        con.execute(
+            "INSERT INTO session_message (id, session_id, type, data) VALUES ('mbig2', 'ses_big', 'assistant', 'y')",
+            [],
+        )
+        .unwrap();
+    }
+
+    let out = run(&["session", "list", "--sort", "size"], &dir);
+    assert!(out.status.success());
+    assert_eq!(stdout_json(&out)[0]["id"], "ses_big");
+
+    let out = run(&["session", "list", "--sort", "cost"], &dir);
+    assert!(out.status.success());
+    assert_eq!(stdout_json(&out)[0]["id"], "ses_1");
+
+    let out = run(&["session", "list", "--sort", "messages"], &dir);
+    assert!(out.status.success());
+    assert_eq!(stdout_json(&out)[0]["id"], "ses_big");
+
+    let out = run(&["session", "list", "--min-size", "1000"], &dir);
+    assert!(out.status.success());
+    let v = stdout_json(&out);
+    assert_eq!(v.as_array().unwrap().len(), 1);
+    assert_eq!(v[0]["id"], "ses_big");
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn project_list_sort_size() {
+    let dir = temp_dir("project-sort");
+    let db = dir.join("opencode.db");
+    create_db(&db);
+    {
+        let con = Connection::open(&db).unwrap();
+        con.execute(
+            "INSERT INTO project (id, worktree, name) VALUES ('p2', '/work/b', 'b')",
+            [],
+        )
+        .unwrap();
+    }
+
+    let out = run(&["project", "list", "--sort", "size"], &dir);
+    assert!(out.status.success());
+    assert_eq!(stdout_json(&out)[0]["id"], "p1");
+
+    let out = run(&["project", "list", "--sort", "sessions"], &dir);
+    assert!(out.status.success());
+    assert_eq!(stdout_json(&out)[0]["id"], "p1");
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn kv_show_raw_prints_value_verbatim() {
+    let dir = temp_dir("kv-raw");
+    let db = dir.join("opencode.db");
+    create_db(&db);
+    {
+        let con = Connection::open(&db).unwrap();
+        con.execute(
+            "INSERT INTO kv (key, value, time_created, time_updated) VALUES ('k', 'line1' || char(10) || 'line2', 0, 0)",
+            [],
+        )
+        .unwrap();
+    }
+
+    let out = run(&["kv", "show", "k", "--raw"], &dir);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.stdout, b"line1\nline2\n");
+
+    let out = run(&["kv", "show", "k"], &dir);
+    assert_eq!(stdout_json(&out)["value"], "line1\nline2");
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn session_show_full_does_not_truncate() {
+    let dir = temp_dir("show-full");
+    let db = dir.join("opencode.db");
+    create_db(&db);
+    {
+        let con = Connection::open(&db).unwrap();
+        con.execute(
+            "UPDATE session_message SET data = ?1 WHERE id = 'm1'",
+            [&"x".repeat(500)],
+        )
+        .unwrap();
+    }
+
+    let out = run(&["session", "show", "ses_1", "--messages"], &dir);
+    assert!(out.status.success());
+    let v = stdout_json(&out);
+    assert_eq!(v["messages"][0]["truncated"], true);
+
+    let out = run(&["session", "show", "ses_1", "--messages", "--full"], &dir);
+    assert!(out.status.success());
+    let v = stdout_json(&out);
+    assert_eq!(v["messages"][0]["truncated"], false);
+    assert_eq!(
+        v["messages"][0]["preview"]
+            .as_str()
+            .unwrap()
+            .chars()
+            .count(),
+        500
+    );
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn table_relative_time_and_absolute_flag() {
+    let dir = temp_dir("relative");
+    create_db(&dir.join("opencode.db"));
+
+    // ses_1 has time_updated = 1700000000000 (2023-11-14T22:13:20Z).
+    let out = run(&["session", "list", "--format", "table"], &dir);
+    assert!(out.status.success());
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !text.contains("2023-11-14T22:13:20Z"),
+        "relative by default: {text}"
+    );
+    assert!(text.contains("2023-11-14"), "date fallback: {text}");
+
+    let out = run(
+        &["session", "list", "--format", "table", "--absolute"],
+        &dir,
+    );
+    assert!(out.status.success());
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.contains("2023-11-14T22:13:20Z"),
+        "absolute flag: {text}"
+    );
 
     std::fs::remove_dir_all(&dir).unwrap();
 }

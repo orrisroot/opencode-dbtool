@@ -14,6 +14,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 /// Table rendering is off by default so unit tests and piped runs keep
 /// seeing JSON.
 static TABLE_MODE: AtomicBool = AtomicBool::new(false);
+/// Relative timestamps in tables (`--absolute` disables).
+static RELATIVE_TIME: AtomicBool = AtomicBool::new(true);
+/// ANSI colors in tables (TTY only, `--no-color` / `NO_COLOR` disable).
+static COLOR: AtomicBool = AtomicBool::new(false);
+/// `--quiet`: suppress progress and confirmation hints on stderr.
+static QUIET: AtomicBool = AtomicBool::new(false);
 
 /// Effective format for this process: an explicit `--format` wins,
 /// otherwise table on a terminal and JSON when piped.
@@ -34,8 +40,46 @@ pub fn set_format(format: Format) {
     TABLE_MODE.store(format == Format::Table, Ordering::Relaxed);
 }
 
+pub fn set_relative(enabled: bool) {
+    RELATIVE_TIME.store(enabled, Ordering::Relaxed);
+}
+
+pub fn set_color(enabled: bool) {
+    COLOR.store(enabled, Ordering::Relaxed);
+}
+
+pub fn set_quiet(quiet: bool) {
+    QUIET.store(quiet, Ordering::Relaxed);
+}
+
 pub fn table_mode() -> bool {
     TABLE_MODE.load(Ordering::Relaxed)
+}
+
+/// Progress output is on when stderr is a terminal and `--quiet` is off.
+pub fn progress_enabled() -> bool {
+    !QUIET.load(Ordering::Relaxed) && std::io::stderr().is_terminal()
+}
+
+/// One progress line on stderr.
+pub fn progress(message: &str) {
+    if progress_enabled() {
+        eprintln!("{message}");
+    }
+}
+
+/// In-place progress counter on stderr; finish with `progress_finish`.
+pub fn progress_replace(message: &str) {
+    if progress_enabled() {
+        eprint!("\r{message}\x1b[K");
+    }
+}
+
+/// Clear the in-place progress counter.
+pub fn progress_finish() {
+    if progress_enabled() {
+        eprint!("\r\x1b[K");
+    }
 }
 
 /// Print a command result in the active format.
@@ -186,15 +230,19 @@ fn render_rows(items: &[Value], columns: &[&str], indent: usize, out: &mut Strin
         }
     }
     let p = pad(indent);
-    out.push_str(&format!("{p}{}\n", format_row(&keys, &widths)));
-    out.push_str(&format!(
-        "{p}{}\n",
-        widths
-            .iter()
-            .map(|w| "-".repeat((*w).max(1)))
-            .collect::<Vec<_>>()
-            .join("  ")
-    ));
+    let header = format_row(&keys, &widths);
+    let separator = widths
+        .iter()
+        .map(|w| "-".repeat((*w).max(1)))
+        .collect::<Vec<_>>()
+        .join("  ");
+    if COLOR.load(Ordering::Relaxed) {
+        out.push_str(&format!("{p}\x1b[1m{header}\x1b[0m\n"));
+        out.push_str(&format!("{p}\x1b[2m{separator}\x1b[0m\n"));
+    } else {
+        out.push_str(&format!("{p}{header}\n"));
+        out.push_str(&format!("{p}{separator}\n"));
+    }
     for row in &rows {
         out.push_str(&format!("{p}{}\n", format_row(row, &widths)));
     }
@@ -218,7 +266,14 @@ fn scalar_text(key: &str, v: &Value) -> String {
     match v {
         Value::Null => "-".to_string(),
         Value::Bool(b) => b.to_string(),
-        Value::String(s) => truncate(s),
+        Value::String(s) => {
+            if RELATIVE_TIME.load(Ordering::Relaxed) && is_time_key(key) {
+                if let Some(ms) = crate::util::parse_iso_utc(s) {
+                    return crate::util::human_age(crate::util::now_ms().unwrap_or(0), ms);
+                }
+            }
+            truncate(s)
+        }
         Value::Number(n) => {
             if is_byte_key(key) {
                 if let Some(i) = n.as_i64() {
@@ -229,6 +284,10 @@ fn scalar_text(key: &str, v: &Value) -> String {
         }
         compound => truncate(&serde_json::to_string(compound).unwrap_or_default()),
     }
+}
+
+fn is_time_key(key: &str) -> bool {
+    matches!(key, "updated" | "time" | "created")
 }
 
 fn is_byte_key(key: &str) -> bool {

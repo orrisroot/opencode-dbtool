@@ -84,7 +84,7 @@ fn read_entry(r: &rusqlite::Row) -> rusqlite::Result<KvEntry> {
     })
 }
 
-pub fn cmd_kv_show(con: &Connection, key: &str) -> Result<()> {
+pub fn cmd_kv_show(con: &Connection, key: &str, raw: bool) -> Result<()> {
     let (value, updated): (String, i64) = con
         .query_row(
             "SELECT value, time_updated FROM kv WHERE key = ?1",
@@ -97,6 +97,9 @@ pub fn cmd_kv_show(con: &Connection, key: &str) -> Result<()> {
             }
             other => AppError::db(other.to_string()),
         })?;
+    if raw {
+        return output::emit_text(&value);
+    }
     let bytes = value.len() as i64;
     let truncated = value.chars().count() > SHOW_PREVIEW_CHARS;
     let preview: String = value.chars().take(SHOW_PREVIEW_CHARS).collect();
@@ -190,9 +193,9 @@ mod tests {
     fn show_truncates_large_values() {
         let con = kv_db();
         // Small value fits.
-        cmd_kv_show(&con, "a").unwrap();
+        cmd_kv_show(&con, "a", false).unwrap();
         // Missing key is a usage error.
-        assert!(cmd_kv_show(&con, "nope").is_err());
+        assert!(cmd_kv_show(&con, "nope", false).is_err());
     }
 
     #[test]

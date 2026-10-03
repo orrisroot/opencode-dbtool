@@ -229,6 +229,57 @@ pub fn dt(ms: i64) -> String {
     format!("{y:04}-{m:02}-{d:02}T{h:02}:{mi:02}:{s:02}Z")
 }
 
+/// Parse a UTC ISO-8601 timestamp (`YYYY-MM-DDTHH:MM:SS[.mmm]Z`) into
+/// epoch milliseconds; `None` when it has a different shape.
+pub fn parse_iso_utc(s: &str) -> Option<i64> {
+    let (date, rest) = s.split_once('T')?;
+    if date.len() != 10 || rest.len() < 8 {
+        return None;
+    }
+    let y = date.get(0..4)?.parse::<i64>().ok()?;
+    let m = date.get(5..7)?.parse::<i64>().ok()?;
+    let d = date.get(8..10)?.parse::<i64>().ok()?;
+    let hh = rest.get(0..2)?.parse::<i64>().ok()?;
+    let mm = rest.get(3..5)?.parse::<i64>().ok()?;
+    let ss = rest.get(6..8)?.parse::<i64>().ok()?;
+    let tail = rest.get(8..).unwrap_or("");
+    if !(tail.is_empty() || tail == "Z" || tail.starts_with('.')) {
+        return None;
+    }
+    let days = days_from_civil(y, m, d)?;
+    Some((days * 86_400 + hh * 3600 + mm * 60 + ss) * 1000)
+}
+
+/// Human age of `then_ms` relative to `now_ms`: `now`, `5m ago`,
+/// `3h ago`, `2d ago`, or a plain date once older than a month.
+pub fn human_age(now_ms: i64, then_ms: i64) -> String {
+    if then_ms <= 0 {
+        return "-".to_string();
+    }
+    let delta = now_ms - then_ms;
+    if delta < 0 {
+        return dt(then_ms);
+    }
+    let secs = delta / 1000;
+    if secs < 60 {
+        return "now".to_string();
+    }
+    let mins = secs / 60;
+    if mins < 60 {
+        return format!("{mins}m ago");
+    }
+    let hours = mins / 60;
+    if hours < 24 {
+        return format!("{hours}h ago");
+    }
+    let days = hours / 24;
+    if days < 30 {
+        return format!("{days}d ago");
+    }
+    let (y, m, d, _, _, _) = calendar(then_ms);
+    format!("{y:04}-{m:02}-{d:02}")
+}
+
 /// Compact UTC timestamp for backup filenames (no colons), e.g.
 /// `20260830T120000Z`.
 pub fn timestamp_utc(ms: i64) -> String {
@@ -252,6 +303,27 @@ mod tests {
         assert_eq!(super::dt(1451606400000), "2016-01-01T00:00:00Z");
         assert_eq!(super::dt(1582934400000), "2020-02-29T00:00:00Z");
         assert_eq!(super::dt(1592611200000), "2020-06-20T00:00:00Z");
+    }
+
+    #[test]
+    fn parse_iso_utc_round_trips() {
+        for ms in [1136214245000i64, 1451606400000, 1582934400000] {
+            assert_eq!(parse_iso_utc(&dt(ms)), Some(ms));
+        }
+        assert_eq!(parse_iso_utc("2026-02-30T00:00:00Z"), None);
+        assert_eq!(parse_iso_utc("not a date"), None);
+        assert_eq!(parse_iso_utc("2026-01-01 00:00:00"), None);
+    }
+
+    #[test]
+    fn human_age_buckets() {
+        let now = 1_000_000_000_000i64;
+        assert_eq!(human_age(now, now - 5_000), "now");
+        assert_eq!(human_age(now, now - 5 * 60_000), "5m ago");
+        assert_eq!(human_age(now, now - 3 * 3_600_000), "3h ago");
+        assert_eq!(human_age(now, now - 2 * 86_400_000), "2d ago");
+        assert_eq!(human_age(now, now - 400 * 86_400_000), "2000-08-05");
+        assert_eq!(human_age(now, 0), "-");
     }
 
     #[test]

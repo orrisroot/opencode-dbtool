@@ -45,8 +45,12 @@ struct StatsOut {
     db_bytes: u64,
     wal_bytes: u64,
     free_pages: i64,
+    /// Bytes a VACUUM could reclaim (`free_pages` * `page_size`).
+    reclaimable_bytes: i64,
     /// Table name -> row count.
     tables: serde_json::Map<String, serde_json::Value>,
+    /// Table name -> content bytes, largest first.
+    table_bytes: serde_json::Map<String, serde_json::Value>,
     total_data_bytes: i64,
     storage: StorageSizes,
     /// `session_message` rows grouped by `type`, largest first (requires
@@ -76,10 +80,12 @@ pub fn stats_value(
 fn stats_out(con: &Connection, data_dir: &Path, db_path: &Path, detail: bool) -> Result<StatsOut> {
     let env = env_status(db_path);
     let freelist: i64 = con.query_row("PRAGMA freelist_count", [], |r| r.get(0))?;
+    let page_size: i64 = con.query_row("PRAGMA page_size", [], |r| r.get(0))?;
 
     let message_types = message_types(con)?;
 
     let mut tables: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
+    let mut table_sizes: Vec<(String, i64)> = Vec::new();
     let mut total: i64 = 0;
     {
         let mut stmt = con.prepare(
@@ -94,9 +100,16 @@ fn stats_out(con: &Connection, data_dir: &Path, db_path: &Path, detail: bool) ->
                 [],
                 |r| r.get(0),
             )?;
-            total += content_bytes(con, &name)?;
-            tables.insert(name, serde_json::json!(rows));
+            let bytes = content_bytes(con, &name)?;
+            total += bytes;
+            tables.insert(name.clone(), serde_json::json!(rows));
+            table_sizes.push((name, bytes));
         }
+    }
+    table_sizes.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    let mut table_bytes: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
+    for (name, bytes) in table_sizes {
+        table_bytes.insert(name, serde_json::json!(bytes));
     }
 
     Ok(StatsOut {
@@ -104,7 +117,9 @@ fn stats_out(con: &Connection, data_dir: &Path, db_path: &Path, detail: bool) ->
         db_bytes: file_size(db_path),
         wal_bytes: file_size(&db_path.with_extension("db-wal")),
         free_pages: freelist,
+        reclaimable_bytes: freelist * page_size,
         tables,
+        table_bytes,
         total_data_bytes: total,
         storage: StorageSizes {
             snapshot_bytes: dir_size(&snapshot_dir(data_dir)),

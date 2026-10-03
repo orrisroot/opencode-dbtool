@@ -59,6 +59,14 @@ pub struct Cli {
     /// Load defaults from this config file instead of the standard location
     #[arg(long, global = true, value_name = "FILE")]
     pub config: Option<PathBuf>,
+
+    /// Print absolute timestamps in tables instead of relative ages
+    #[arg(long, global = true)]
+    pub absolute: bool,
+
+    /// Disable colors in table output (also honors NO_COLOR)
+    #[arg(long, global = true)]
+    pub no_color: bool,
 }
 
 #[derive(Subcommand)]
@@ -129,6 +137,16 @@ pub struct ProjectListArgs {
     /// Only projects registered at this directory (repeatable)
     #[arg(long = "path", value_name = "DIR")]
     pub paths: Vec<String>,
+    /// Sort key (default: worktree)
+    #[arg(long, value_enum, value_name = "KEY")]
+    pub sort: Option<ProjectSort>,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+pub enum ProjectSort {
+    Size,
+    Updated,
+    Sessions,
 }
 
 #[derive(Args)]
@@ -189,6 +207,9 @@ pub enum SessionCmd {
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
 pub enum SortKey {
     Size,
+    Cost,
+    Updated,
+    Messages,
 }
 
 #[derive(Args)]
@@ -202,6 +223,9 @@ pub struct SessionListArgs {
     /// Only sessions whose title or directory contains this text
     #[arg(long, value_name = "TEXT")]
     pub search: Option<String>,
+    /// Only sessions at least this large (e.g. 50M)
+    #[arg(long = "min-size", value_name = "SIZE", value_parser = size_value)]
+    pub min_size: Option<String>,
 }
 
 #[derive(Args)]
@@ -215,6 +239,9 @@ pub struct SessionShowArgs {
     /// Maximum number of message previews (requires --messages)
     #[arg(long, value_name = "N", requires = "messages")]
     pub limit: Option<usize>,
+    /// Do not truncate message previews (requires --messages)
+    #[arg(long, requires = "messages")]
+    pub full: bool,
 }
 
 #[derive(Args)]
@@ -312,6 +339,9 @@ pub struct KvShowArgs {
     /// Exact kv key
     #[arg(value_name = "KEY")]
     pub key: String,
+    /// Print the value verbatim (no JSON wrapper, no truncation)
+    #[arg(long)]
+    pub raw: bool,
 }
 
 #[derive(Args)]
@@ -661,6 +691,40 @@ mod tests {
             "5",
         ])
         .is_ok());
+    }
+
+    #[test]
+    fn list_and_show_options_parse() {
+        assert!(Cli::try_parse_from([
+            "opencode-dbtool",
+            "session",
+            "list",
+            "--sort",
+            "cost",
+            "--min-size",
+            "1M"
+        ])
+        .is_ok());
+        assert!(Cli::try_parse_from([
+            "opencode-dbtool",
+            "session",
+            "show",
+            "ses_1",
+            "--messages",
+            "--full"
+        ])
+        .is_ok());
+        // --full requires --messages.
+        assert!(
+            Cli::try_parse_from(["opencode-dbtool", "session", "show", "ses_1", "--full"]).is_err()
+        );
+        assert!(
+            Cli::try_parse_from(["opencode-dbtool", "project", "list", "--sort", "size"]).is_ok()
+        );
+        assert!(Cli::try_parse_from(["opencode-dbtool", "kv", "show", "k", "--raw"]).is_ok());
+        assert!(
+            Cli::try_parse_from(["opencode-dbtool", "stats", "--absolute", "--no-color"]).is_ok()
+        );
     }
 
     #[test]

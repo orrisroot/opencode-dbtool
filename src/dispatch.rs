@@ -1,7 +1,7 @@
 //! Command dispatch, confirmation flow, and running-instance guards.
 
 use crate::cli::{
-    BackupCmd, Cli, Command, DbCmd, FsCmd, KvCmd, ProjectCmd, ServiceCmd, SessionCmd, SortKey,
+    BackupCmd, Cli, Command, DbCmd, FsCmd, KvCmd, ProjectCmd, ServiceCmd, SessionCmd,
 };
 use crate::confirm;
 use crate::db;
@@ -24,6 +24,13 @@ pub fn execute(mut cli: Cli) -> Result<()> {
         return Ok(());
     };
     output::set_format(output::effective_format(cli.format));
+    output::set_relative(!cli.absolute);
+    output::set_quiet(cli.quiet);
+    let color = std::io::stdout().is_terminal()
+        && output::table_mode()
+        && !cli.no_color
+        && std::env::var_os("NO_COLOR").is_none();
+    output::set_color(color);
 
     if let Command::Completions(a) = command {
         let mut cmd = Cli::command();
@@ -342,7 +349,7 @@ fn dispatch(
         Command::Project(cmd) => match cmd {
             ProjectCmd::List(a) => {
                 let con = db::open_conn(db_path, true)?;
-                commands::project::cmd_project_list(&con, &a.paths)
+                commands::project::cmd_project_list(&con, &a.paths, a.sort)
             }
             ProjectCmd::Show(a) => {
                 let con = db::open_conn(db_path, true)?;
@@ -360,18 +367,24 @@ fn dispatch(
         },
         Command::Session(cmd) => match cmd {
             SessionCmd::List(a) => {
+                let min_size = a
+                    .min_size
+                    .as_deref()
+                    .map(crate::util::parse_size_bytes)
+                    .transpose()?;
                 let con = db::open_conn(db_path, true)?;
                 commands::session::cmd_session_list(
                     &con,
-                    a.sort == Some(SortKey::Size),
+                    a.sort,
                     a.limit,
                     a.search.as_deref(),
+                    min_size,
                 )
             }
             SessionCmd::Show(a) => {
                 let con = db::open_conn(db_path, true)?;
                 let messages = a.messages.then(|| a.limit.unwrap_or(50));
-                commands::session::cmd_session_show(&con, &a.id, messages)
+                commands::session::cmd_session_show(&con, &a.id, messages, a.full)
             }
             SessionCmd::Delete(a) => {
                 let mut con = db::open_conn(db_path, dry_run)?;
@@ -395,7 +408,7 @@ fn dispatch(
             }
             KvCmd::Show(a) => {
                 let con = db::open_conn(db_path, true)?;
-                commands::kv::cmd_kv_show(&con, &a.key)
+                commands::kv::cmd_kv_show(&con, &a.key, a.raw)
             }
             KvCmd::Delete(a) => {
                 let mut con = db::open_conn(db_path, dry_run)?;
