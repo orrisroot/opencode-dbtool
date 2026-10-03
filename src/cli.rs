@@ -221,6 +221,27 @@ pub enum SessionCmd {
     Purge(SessionPurgeArgs),
     /// Delete only the reasoning content of matching sessions
     StripReasoning(SessionPurgeArgs),
+    /// Export a session through the running opencode server
+    Export(SessionExportArgs),
+    /// Import a session through the running opencode server
+    Import(SessionImportArgs),
+}
+
+#[derive(Args)]
+pub struct SessionExportArgs {
+    /// Session id or unique id prefix
+    #[arg(value_name = "ID")]
+    pub id: String,
+    /// Write the export to this file instead of stdout
+    #[arg(long, value_name = "FILE")]
+    pub out: Option<PathBuf>,
+}
+
+#[derive(Args)]
+pub struct SessionImportArgs {
+    /// Export file to import (as written by `session export`)
+    #[arg(value_name = "FILE")]
+    pub file: PathBuf,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]

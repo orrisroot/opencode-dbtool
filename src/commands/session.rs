@@ -214,6 +214,67 @@ pub fn cmd_session_show(
     output::emit(&v)
 }
 
+/// Export/import need a running service that owns this exact database.
+fn require_service<'a>(
+    service: Option<&'a ServiceInfo>,
+    db_path: &Path,
+) -> Result<&'a ServiceInfo> {
+    let svc = service.ok_or_else(|| {
+        AppError::usage(
+            "no running opencode service was found; export/import needs the server \
+             (`opencode service start`)",
+        )
+    })?;
+    if !svc.targets_db(db_path) {
+        return Err(AppError::usage(
+            "the running opencode service is not using this database",
+        ));
+    }
+    Ok(svc)
+}
+
+/// Export a session through the server API; the raw export goes to stdout
+/// unless `--out` names a file.
+pub fn cmd_session_export(
+    db_path: &Path,
+    reference: &str,
+    out: Option<&Path>,
+    service: Option<&ServiceInfo>,
+) -> Result<()> {
+    let svc = require_service(service, db_path)?;
+    let id = {
+        let con = crate::db::open_conn(db_path, true)?;
+        resolve_session_id(&con, reference)?
+    };
+    let body = svc.export_session(&id)?;
+    match out {
+        Some(path) => {
+            std::fs::write(path, &body)
+                .map_err(|e| AppError::db(format!("cannot write {}: {e}", path.display())))?;
+            output::emit(&serde_json::json!({
+                "db": db_path.to_string_lossy(),
+                "session": id,
+                "file": path.to_string_lossy(),
+                "bytes": body.len(),
+            }))
+        }
+        None => output::emit_text(&body),
+    }
+}
+
+/// Import a session export through the server API.
+pub fn cmd_session_import(
+    db_path: &Path,
+    file: &Path,
+    service: Option<&ServiceInfo>,
+) -> Result<()> {
+    let svc = require_service(service, db_path)?;
+    let body = std::fs::read_to_string(file)
+        .map_err(|e| AppError::usage(format!("cannot read {}: {e}", file.display())))?;
+    let response = svc.import_session(&body)?;
+    output::emit(&response)
+}
+
 pub fn cmd_session_delete(
     con: &mut Connection,
     ids: &[String],

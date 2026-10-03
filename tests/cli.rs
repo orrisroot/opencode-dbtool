@@ -1870,3 +1870,37 @@ fn db_path_reports_pragmas() {
 
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+#[test]
+fn session_export_and_import_need_the_service() {
+    let dir = temp_dir("export-import");
+    create_db(&dir.join("opencode.db"));
+
+    let out = run(&["session", "export", "ses_1"], &dir);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("no running opencode service"),
+        "stderr: {stderr}"
+    );
+
+    let file = dir.join("export.json");
+    std::fs::write(&file, r#"{"session":{}}"#).unwrap();
+    let out = run(
+        &["session", "import", file.to_str().unwrap(), "--yes"],
+        &dir,
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}

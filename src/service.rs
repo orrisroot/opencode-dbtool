@@ -311,6 +311,43 @@ impl ServiceInfo {
             .map_err(|e| AppError::db(format!("invalid /api/info response: {e}")))
     }
 
+    /// `GET /api/experimental/session/{id}/export` (raw export body).
+    pub fn export_session(&self, id: &str) -> Result<String> {
+        let (status, body) = self.get_json(&format!("/api/experimental/session/{id}/export"))?;
+        if status != 200 {
+            return Err(AppError::db(format!(
+                "opencode API export failed for {id} (HTTP {status}): {}",
+                body.trim()
+            )));
+        }
+        Ok(body)
+    }
+
+    /// `POST /api/experimental/session/import`; returns the server's JSON
+    /// response (or a wrapper when it is not JSON).
+    pub fn import_session(&self, body: &str) -> Result<serde_json::Value> {
+        let value: serde_json::Value = serde_json::from_str(body)
+            .map_err(|e| AppError::usage(format!("invalid import file: {e}")))?;
+        let url = format!("{}/api/experimental/session/import", self.url);
+        let mut request = Self::agent().post(&url);
+        if let Some(header) = self.auth_header() {
+            request = request.header("Authorization", header);
+        }
+        let mut response = request
+            .send_json(&value)
+            .map_err(|e| AppError::db(format!("opencode API request failed: {e}")))?;
+        let status = response.status().as_u16();
+        let text = response.body_mut().read_to_string().unwrap_or_default();
+        if !(200..300).contains(&status) {
+            return Err(AppError::db(format!(
+                "opencode API import failed (HTTP {status}): {}",
+                text.trim()
+            )));
+        }
+        Ok(serde_json::from_str(&text)
+            .unwrap_or_else(|_| serde_json::json!({ "status": status, "body": text })))
+    }
+
     /// `DELETE /api/session/{id}`; a 404 `SessionNotFoundError` counts as
     /// success (the session is already gone).
     pub fn delete_session(&self, id: &str) -> Result<()> {
@@ -450,8 +487,8 @@ mod tests {
     }
 
     /// Minimal one-request HTTP server; returns (url, request line, auth
-    /// header) and runs the handler in a thread.
-    type MockRequest = (String, Option<String>);
+    /// header, full request) and runs the handler in a thread.
+    type MockRequest = (String, Option<String>, String);
     type MockServer = (
         String,
         std::sync::mpsc::Receiver<MockRequest>,
@@ -467,15 +504,35 @@ mod tests {
             stream
                 .set_read_timeout(Some(Duration::from_secs(10)))
                 .unwrap();
-            let mut buf = [0u8; 4096];
-            let n = stream.read(&mut buf).unwrap();
-            let request = String::from_utf8_lossy(&buf[..n]).to_string();
+            // Read until the headers and the declared body have arrived.
+            let mut buf: Vec<u8> = Vec::new();
+            let mut tmp = [0u8; 4096];
+            loop {
+                let n = stream.read(&mut tmp).unwrap();
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&tmp[..n]);
+                if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let header_end = pos + 4;
+                    let headers = String::from_utf8_lossy(&buf[..header_end]).to_lowercase();
+                    let content_length = headers
+                        .lines()
+                        .find_map(|l| l.strip_prefix("content-length:"))
+                        .and_then(|v| v.trim().parse::<usize>().ok())
+                        .unwrap_or(0);
+                    if buf.len() >= header_end + content_length {
+                        break;
+                    }
+                }
+            }
+            let request = String::from_utf8_lossy(&buf).to_string();
             let first = request.lines().next().unwrap_or("").to_string();
             let auth = request
                 .lines()
                 .find(|l| l.to_ascii_lowercase().starts_with("authorization:"))
                 .map(|l| l.split_once(':').unwrap().1.trim().to_string());
-            tx.send((first, auth)).unwrap();
+            tx.send((first, auth, request)).unwrap();
             let response = format!(
                 "HTTP/1.1 {status} X\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                 body.len()
@@ -500,7 +557,7 @@ mod tests {
         service_at(url)
             .delete_session("ses_1")
             .expect("delete succeeds");
-        let (line, auth) = rx
+        let (line, auth, _request) = rx
             .recv_timeout(Duration::from_secs(10))
             .expect("mock server received no request");
         handle.join().unwrap();
@@ -529,5 +586,43 @@ mod tests {
         handle.join().unwrap();
         assert!(err.message.contains("HTTP 500"), "got: {err}");
         assert!(err.message.contains("boom"), "got: {err}");
+    }
+
+    #[test]
+    fn api_export_returns_the_body() {
+        let (url, rx, handle) = mock_server(200, r#"{"session":"data"}"#);
+        let body = service_at(url).export_session("ses_1").unwrap();
+        let (line, _auth, _request) = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("mock server received no request");
+        handle.join().unwrap();
+        assert_eq!(line, "GET /api/experimental/session/ses_1/export HTTP/1.1");
+        assert_eq!(body, r#"{"session":"data"}"#);
+    }
+
+    #[test]
+    fn api_import_posts_the_json_body() {
+        let (url, rx, handle) = mock_server(200, r#"{"id":"ses_new"}"#);
+        let value = service_at(url)
+            .import_session(r#"{"session":{"id":"x"}}"#)
+            .unwrap();
+        let (line, _auth, request) = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("mock server received no request");
+        handle.join().unwrap();
+        assert_eq!(line, "POST /api/experimental/session/import HTTP/1.1");
+        let sent: serde_json::Value =
+            serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap_or(""))
+                .expect("request body is JSON");
+        assert_eq!(sent["session"]["id"], "x");
+        assert_eq!(value["id"], "ses_new");
+    }
+
+    #[test]
+    fn api_import_rejects_invalid_json_without_a_request() {
+        let svc = service_at("http://127.0.0.1:1".into());
+        let err = svc.import_session("not json").unwrap_err();
+        assert_eq!(err.code, 2, "usage error");
+        assert!(err.message.contains("invalid import file"), "got: {err}");
     }
 }

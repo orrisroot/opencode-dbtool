@@ -138,6 +138,8 @@ fn mutation_guard<'a>(
         Command::Session(SessionCmd::StripReasoning(_)) => {
             Some(("session strip-reasoning", Some(IDLE_DELETE)))
         }
+        // Import goes through the server API; it fails without one.
+        Command::Session(SessionCmd::Import(_)) => Some(("session import", None)),
         Command::Kv(KvCmd::Delete(_)) => Some(("kv delete", Some(IDLE_DELETE))),
         // Listing backups is read-only; creating one uses the online
         // backup API, and restoring needs exclusive access.
@@ -436,6 +438,12 @@ fn dispatch(
                 let filters = PurgeFilter::try_from(a)?;
                 let mut con = db::open_conn(db_path, dry_run)?;
                 commands::session::cmd_session_strip_reasoning(&mut con, &filters, dry_run, db_path)
+            }
+            SessionCmd::Export(a) => {
+                commands::session::cmd_session_export(db_path, &a.id, a.out.as_deref(), service)
+            }
+            SessionCmd::Import(a) => {
+                commands::session::cmd_session_import(db_path, &a.file, service)
             }
         },
         Command::Kv(cmd) => match cmd {
