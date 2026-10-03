@@ -422,8 +422,9 @@ fn dispatch(
             }
             SessionCmd::Show(a) => {
                 let con = db::open_conn(db_path, true)?;
-                let messages = a.messages.then(|| a.limit.unwrap_or(50));
-                commands::session::cmd_session_show(&con, &a.id, messages, a.full)
+                let limit = a.limit.or(a.last).unwrap_or(50);
+                let messages = a.messages.then_some(limit);
+                commands::session::cmd_session_show(&con, &a.id, messages, a.full, a.last)
             }
             SessionCmd::Delete(a) => {
                 let mut con = db::open_conn(db_path, dry_run)?;
@@ -444,6 +445,10 @@ fn dispatch(
             }
             SessionCmd::Import(a) => {
                 commands::session::cmd_session_import(db_path, &a.file, service)
+            }
+            SessionCmd::Search(a) => {
+                let con = db::open_conn(db_path, true)?;
+                commands::session::cmd_session_search(&con, a)
             }
         },
         Command::Kv(cmd) => match cmd {

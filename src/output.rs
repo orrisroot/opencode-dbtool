@@ -205,6 +205,11 @@ fn try_page(text: &str) -> bool {
     true
 }
 
+/// Render a value as the table view (used for curated renderings).
+pub fn render_value_text(v: &Value) -> String {
+    render(v, &[])
+}
+
 // ---------------------------------------------------------------------------
 // table rendering
 // ---------------------------------------------------------------------------

@@ -17,7 +17,7 @@ use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
-use crate::util::SQL_VAR_CHUNK;
+use crate::util::{now_ms, parse_age_ms, SQL_VAR_CHUNK};
 
 /// One session in a delete/purge preview.
 #[derive(Serialize)]
@@ -176,19 +176,142 @@ pub fn session_list_value(con: &Connection, opts: &ListOptions) -> Result<serde_
     Ok(serde_json::to_value(out)?)
 }
 
+/// Search message content across sessions (ASCII case-insensitive).
+pub fn cmd_session_search(con: &Connection, args: &crate::cli::SessionSearchArgs) -> Result<()> {
+    let cutoff = match &args.since {
+        Some(age) => Some(now_ms()? - parse_age_ms(age)?),
+        None => None,
+    };
+    output::emit_cols(
+        &session_search_value(con, &args.text, args.limit, args.snippets, cutoff)?,
+        &["id", "title", "updated", "matches", "directory"],
+    )
+}
+
+/// Build the search result (exposed for tests).
+pub fn session_search_value(
+    con: &Connection,
+    text: &str,
+    limit: usize,
+    snippets: usize,
+    cutoff: Option<i64>,
+) -> Result<serde_json::Value> {
+    let pattern = format!("%{}%", crate::repo::escape_like(text));
+    let hits: Vec<(String, i64, i64)> = {
+        let sql = format!(
+            "SELECT sm.session_id, COUNT(*), MAX(s.time_updated) \
+             FROM session_message sm JOIN \"{SESSION_TABLE}\" s ON s.id = sm.session_id \
+             WHERE sm.data LIKE ?1 ESCAPE '\\' AND (?2 IS NULL OR s.time_updated >= ?2) \
+             GROUP BY sm.session_id ORDER BY MAX(s.time_updated) DESC LIMIT ?3"
+        );
+        let mut stmt = con.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params![pattern, cutoff, limit as i64], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, i64>(2)?,
+            ))
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()?
+    };
+
+    let mut out = Vec::new();
+    for (id, matches, updated) in hits {
+        let (title, directory): (String, String) = con.query_row(
+            &format!("SELECT COALESCE(title,''), directory FROM \"{SESSION_TABLE}\" WHERE id = ?1"),
+            rusqlite::params![id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        let mut snips = Vec::new();
+        if snippets > 0 {
+            let sql = "SELECT id, type, time_created, data FROM session_message \
+                       WHERE session_id = ?1 AND data LIKE ?2 ESCAPE '\\' \
+                       ORDER BY seq, id LIMIT ?3";
+            let mut stmt = con.prepare(sql)?;
+            let rows = stmt.query_map(rusqlite::params![id, pattern, snippets as i64], |r| {
+                let data: String = r.get(3)?;
+                Ok(serde_json::json!({
+                    "message_id": r.get::<_, String>(0)?,
+                    "type": r.get::<_, String>(1)?,
+                    "time": crate::util::dt(r.get::<_, i64>(2)?),
+                    "snippet": snippet(&data, text),
+                }))
+            })?;
+            for row in rows {
+                snips.push(row?);
+            }
+        }
+        out.push(serde_json::json!({
+            "id": id,
+            "title": title,
+            "directory": directory,
+            "updated": crate::util::dt(updated),
+            "matches": matches,
+            "snippets": snips,
+        }));
+    }
+    Ok(serde_json::Value::Array(out))
+}
+
+/// A short window around the first occurrence of `needle`.
+fn snippet(data: &str, needle: &str) -> String {
+    const BEFORE: usize = 40;
+    const AFTER: usize = 80;
+    let lower = data.to_lowercase();
+    let needle_lower = needle.to_lowercase();
+    let pos = if lower.len() == data.len() {
+        lower.find(&needle_lower)
+    } else {
+        data.find(needle)
+    };
+    let Some(pos) = pos else {
+        return data.chars().take(BEFORE + AFTER).collect();
+    };
+    let start = floor_boundary(data, pos.saturating_sub(BEFORE));
+    let end = ceil_boundary(data, (pos + needle.len() + AFTER).min(data.len()));
+    let mut out = String::new();
+    if start > 0 {
+        out.push('…');
+    }
+    out.push_str(&data[start..end].replace('\n', " "));
+    if end < data.len() {
+        out.push('…');
+    }
+    out
+}
+
+fn floor_boundary(s: &str, mut i: usize) -> usize {
+    while i > 0 && !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
+fn ceil_boundary(s: &str, mut i: usize) -> usize {
+    while i < s.len() && !s.is_char_boundary(i) {
+        i += 1;
+    }
+    i
+}
+
 pub fn cmd_session_show(
     con: &Connection,
     reference: &str,
     messages: Option<usize>,
     full: bool,
+    last: Option<usize>,
 ) -> Result<()> {
     let reference = reference.trim();
     let id = resolve_session_id(con, reference)?;
     let s = load_session(con, &id)?
         .ok_or_else(|| AppError::usage(format!("session not found: {reference}")))?;
     let mut v = serde_json::to_value(session_json(&s))?;
+    let mut msg_rows: Option<Vec<serde_json::Value>> = None;
     if let Some(limit) = messages {
-        let (total, rows) = crate::repo::list_messages(con, &id, limit)?;
+        let (total, rows) = match last {
+            Some(_) => crate::repo::list_messages_tail(con, &id, limit)?,
+            None => crate::repo::list_messages(con, &id, limit)?,
+        };
         let msgs: Vec<serde_json::Value> = rows
             .iter()
             .map(|m| {
@@ -208,10 +331,75 @@ pub fn cmd_session_show(
                 })
             })
             .collect();
-        v["messages"] = serde_json::Value::Array(msgs);
+        v["messages"] = serde_json::Value::Array(msgs.clone());
         v["total_messages"] = serde_json::json!(total);
+        msg_rows = Some(msgs);
+    }
+
+    // Table mode renders a readable conversation instead of the raw
+    // JSON previews.
+    if output::table_mode() {
+        if let Some(msgs) = &msg_rows {
+            let mut base = v.clone();
+            if let Some(obj) = base.as_object_mut() {
+                obj.remove("messages");
+                obj.remove("total_messages");
+            }
+            let mut text = output::render_value_text(&base);
+            text.push_str(&format!(
+                "\n\nmessages ({} total, showing {}):\n",
+                v["total_messages"].as_i64().unwrap_or(0),
+                msgs.len()
+            ));
+            for m in msgs {
+                text.push_str(&format!(
+                    "[{}] {}\n  {}\n",
+                    m["type"].as_str().unwrap_or(""),
+                    m["time"].as_str().unwrap_or(""),
+                    message_text(m["preview"].as_str().unwrap_or(""))
+                ));
+            }
+            return output::emit_text(&text);
+        }
     }
     output::emit(&v)
+}
+
+/// Extract readable text from a message payload for the conversation view.
+fn message_text(data: &str) -> String {
+    let text = match serde_json::from_str::<serde_json::Value>(data) {
+        Ok(v) => {
+            if let Some(arr) = v.get("content").and_then(|c| c.as_array()) {
+                let parts: Vec<&str> = arr
+                    .iter()
+                    .filter(|e| e.get("type").and_then(|t| t.as_str()) == Some("text"))
+                    .filter_map(|e| e.get("text").and_then(|t| t.as_str()))
+                    .collect();
+                if !parts.is_empty() {
+                    parts.join("\n")
+                } else {
+                    v.get("content")
+                        .and_then(|c| c.as_str())
+                        .map(str::to_string)
+                        .unwrap_or_else(|| data.to_string())
+                }
+            } else {
+                v.get("content")
+                    .and_then(|c| c.as_str())
+                    .map(str::to_string)
+                    .unwrap_or_else(|| data.to_string())
+            }
+        }
+        Err(_) => data.to_string(),
+    };
+    let text = text.replace('\n', "\n  ");
+    let mut chars = text.chars();
+    let preview: String = chars.by_ref().take(500).collect();
+    if chars.next().is_some() {
+        format!("{preview}…")
+    } else {
+        preview
+    }
 }
 
 /// Export/import need a running service that owns this exact database.
@@ -1975,9 +2163,62 @@ mod tests {
         assert!(v.get("messages").is_none());
 
         // `Some(limit)` includes previews; the default limit is 50.
-        cmd_session_show(&con, "s1", Some(50), false).unwrap();
-        cmd_session_show(&con, "s1", Some(1), false).unwrap();
+        cmd_session_show(&con, "s1", Some(50), false, None).unwrap();
+        cmd_session_show(&con, "s1", Some(1), false, None).unwrap();
         // A unique prefix resolves to the full id.
-        cmd_session_show(&con, "s", Some(1), false).unwrap();
+        cmd_session_show(&con, "s", Some(1), false, None).unwrap();
+    }
+
+    #[test]
+    fn search_finds_message_content_case_insensitively() {
+        let con = testdb::create();
+        testdb::insert_session(&con, "s1", "/a", None);
+        testdb::insert_session_message(&con, "m1", "s1", "assistant", "hello UNIQUE_WORD world");
+        testdb::insert_session_message(&con, "m2", "s1", "user", "another UNIQUE_WORD here");
+        testdb::insert_session(&con, "s2", "/b", None);
+        testdb::insert_session_message(&con, "m3", "s2", "assistant", "nothing");
+
+        let v = session_search_value(&con, "unique_word", 10, 2, None).unwrap();
+        let arr = v.as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["id"], "s1");
+        assert_eq!(arr[0]["matches"], 2);
+        assert_eq!(arr[0]["snippets"].as_array().unwrap().len(), 2);
+        assert!(
+            arr[0]["snippets"][0]["snippet"]
+                .as_str()
+                .unwrap()
+                .contains("UNIQUE_WORD"),
+            "snippet: {}",
+            arr[0]["snippets"][0]["snippet"]
+        );
+
+        // The cutoff filters older sessions out.
+        let cutoff = crate::util::now_ms().unwrap() + 1_000;
+        assert!(
+            session_search_value(&con, "unique_word", 10, 1, Some(cutoff))
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn list_messages_tail_returns_the_newest_window() {
+        let con = testdb::create();
+        testdb::insert_session(&con, "s1", "/a", None);
+        for i in 0..5 {
+            con.execute(
+                "INSERT INTO session_message (id, session_id, type, seq, data) \
+                 VALUES (?1, 's1', 'user', ?2, 'x')",
+                rusqlite::params![format!("m{i}"), i],
+            )
+            .unwrap();
+        }
+        let (total, rows) = crate::repo::list_messages_tail(&con, "s1", 2).unwrap();
+        assert_eq!(total, 5);
+        let ids: Vec<&str> = rows.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, vec!["m3", "m4"]);
     }
 }

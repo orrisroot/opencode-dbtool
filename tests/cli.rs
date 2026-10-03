@@ -1904,3 +1904,98 @@ fn session_export_and_import_need_the_service() {
 
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+#[test]
+fn session_search_finds_messages() {
+    let dir = temp_dir("search-msg");
+    let db = dir.join("opencode.db");
+    create_db(&db);
+    {
+        let con = Connection::open(&db).unwrap();
+        con.execute(
+            "INSERT INTO session_message (id, session_id, type, data) \
+             VALUES ('m2', 'ses_1', 'user', 'find NEEDLE here')",
+            [],
+        )
+        .unwrap();
+    }
+
+    let out = run(&["session", "search", "needle"], &dir);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v = stdout_json(&out);
+    assert_eq!(v.as_array().unwrap().len(), 1);
+    assert_eq!(v[0]["id"], "ses_1");
+    assert!(v[0]["matches"].as_i64().unwrap() >= 1);
+    assert!(
+        v[0]["snippets"][0]["snippet"]
+            .as_str()
+            .unwrap()
+            .contains("NEEDLE"),
+        "snippet: {}",
+        v[0]["snippets"][0]["snippet"]
+    );
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn session_show_last_and_conversation_view() {
+    let dir = temp_dir("show-last");
+    let db = dir.join("opencode.db");
+    create_db(&db);
+    {
+        let con = Connection::open(&db).unwrap();
+        for i in 0..5 {
+            con.execute(
+                "INSERT INTO session_message (id, session_id, type, seq, data) \
+                 VALUES (?1, 'ses_1', 'user', ?2, ?3)",
+                rusqlite::params![format!("mm{i}"), i, format!("message {i}")],
+            )
+            .unwrap();
+        }
+    }
+
+    let out = run(
+        &["session", "show", "ses_1", "--messages", "--last", "2"],
+        &dir,
+    );
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v = stdout_json(&out);
+    let ids: Vec<&str> = v["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids.len(), 2);
+    assert_eq!(ids[1], "mm4", "newest window: {ids:?}");
+
+    let out = run(
+        &[
+            "session",
+            "show",
+            "ses_1",
+            "--messages",
+            "--last",
+            "2",
+            "--format",
+            "table",
+        ],
+        &dir,
+    );
+    assert!(out.status.success());
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("messages ("), "stdout: {text}");
+    assert!(text.contains("[user]"), "stdout: {text}");
+    assert!(text.contains("message 4"), "stdout: {text}");
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}

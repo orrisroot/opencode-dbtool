@@ -225,6 +225,24 @@ pub enum SessionCmd {
     Export(SessionExportArgs),
     /// Import a session through the running opencode server
     Import(SessionImportArgs),
+    /// Search message content across sessions
+    Search(SessionSearchArgs),
+}
+
+#[derive(Args)]
+pub struct SessionSearchArgs {
+    /// Text to find in message content (case-insensitive)
+    #[arg(value_name = "TEXT")]
+    pub text: String,
+    /// Maximum number of sessions to report
+    #[arg(long, value_name = "N", default_value_t = 20)]
+    pub limit: usize,
+    /// Maximum snippets per session
+    #[arg(long, value_name = "N", default_value_t = 3)]
+    pub snippets: usize,
+    /// Only sessions updated within this age (e.g. 30d)
+    #[arg(long, value_name = "AGE", value_parser = age_value)]
+    pub since: Option<String>,
 }
 
 #[derive(Args)]
@@ -288,6 +306,14 @@ pub struct SessionShowArgs {
     /// Do not truncate message previews (requires --messages)
     #[arg(long, requires = "messages")]
     pub full: bool,
+    /// Show the newest N messages instead of the oldest (requires --messages)
+    #[arg(
+        long,
+        value_name = "N",
+        requires = "messages",
+        conflicts_with = "limit"
+    )]
+    pub last: Option<usize>,
 }
 
 #[derive(Args)]
@@ -368,6 +394,9 @@ pub enum KvCmd {
     /// List kv entries with sizes, largest first
     List(KvListArgs),
     /// Show a kv value (truncated)
+    #[command(
+        after_help = "Examples:\n  opencode-dbtool kv show models-dev:catalog\n  opencode-dbtool kv show models-dev:catalog --raw | jq ."
+    )]
     Show(KvShowArgs),
     /// Delete kv entries (caches regenerate on demand)
     Delete(KvDeleteArgs),

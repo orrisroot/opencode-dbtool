@@ -189,7 +189,7 @@ pub fn child_session_ids(con: &Connection, id: &str) -> Result<Vec<String>> {
 }
 
 /// Escape `LIKE` wildcards so a user-supplied reference matches literally.
-fn escape_like(s: &str) -> String {
+pub(crate) fn escape_like(s: &str) -> String {
     s.replace('\\', "\\\\")
         .replace('%', "\\%")
         .replace('_', "\\_")
@@ -746,6 +746,37 @@ pub fn list_messages(
     let mut stmt = con.prepare(
         "SELECT id, type, seq, time_created, COALESCE(length(CAST(data AS BLOB)),0), data \
          FROM session_message WHERE session_id = ?1 ORDER BY seq, id LIMIT ?2",
+    )?;
+    let rows = stmt.query_map(params![session_id, limit as i64], |r| {
+        Ok(ListedMessage {
+            id: r.get(0)?,
+            msg_type: r.get(1)?,
+            seq: r.get(2)?,
+            created: r.get(3)?,
+            bytes: r.get(4)?,
+            data: r.get(5)?,
+        })
+    })?;
+    Ok((total, rows.collect::<std::result::Result<Vec<_>, _>>()?))
+}
+
+/// Total `session_message` count plus the newest `limit` rows (oldest
+/// first within the window) for a session.
+pub fn list_messages_tail(
+    con: &Connection,
+    session_id: &str,
+    limit: usize,
+) -> Result<(i64, Vec<ListedMessage>)> {
+    let total: i64 = con.query_row(
+        "SELECT COUNT(*) FROM session_message WHERE session_id = ?1",
+        params![session_id],
+        |r| r.get(0),
+    )?;
+    let mut stmt = con.prepare(
+        "SELECT * FROM (SELECT id, type, seq, time_created, \
+         COALESCE(length(CAST(data AS BLOB)),0), data \
+         FROM session_message WHERE session_id = ?1 ORDER BY seq DESC, id DESC LIMIT ?2) \
+         ORDER BY seq, id",
     )?;
     let rows = stmt.query_map(params![session_id, limit as i64], |r| {
         Ok(ListedMessage {
