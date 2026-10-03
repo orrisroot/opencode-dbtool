@@ -4,14 +4,16 @@
 //! freelist, old sessions, large kv caches, backups) and pairs each with
 //! the command that would act on it.
 
+use crate::cli::ReportArgs;
 use crate::db::{env_status, file_size, EnvStatus};
 use crate::error::Result;
 use crate::output;
 use crate::output::human_bytes;
 use crate::repo;
-use crate::util::{dt, now_ms, shell_quote};
-use rusqlite::Connection;
+use crate::util::{dt, now_ms, parse_age_ms, shell_quote};
+use rusqlite::{params, Connection};
 use serde::Serialize;
+use std::collections::HashMap;
 use std::path::Path;
 
 /// kv entries at least this large are reported (1 MiB).
@@ -82,6 +84,22 @@ struct CostsOut {
     by_day: Vec<DayCost>,
 }
 
+/// Active `--since`/`--project` scope (present only when filtering).
+#[derive(Serialize)]
+struct ScopeOut {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    since: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    project: Option<String>,
+}
+
+/// Session-derived sections are limited to this scope.
+pub struct ReportOptions<'a> {
+    pub costs: bool,
+    pub since: Option<&'a str>,
+    pub project: Option<&'a str>,
+}
+
 #[derive(Serialize)]
 struct ReportOut {
     #[serde(flatten)]
@@ -95,11 +113,18 @@ struct ReportOut {
     backups: BackupsInfo,
     suggestions: Vec<Suggestion>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    scope: Option<ScopeOut>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     costs: Option<CostsOut>,
 }
 
-pub fn cmd_report(con: &Connection, db_path: &Path, costs: bool) -> Result<()> {
-    let value = report_value(con, db_path, costs)?;
+pub fn cmd_report(con: &Connection, db_path: &Path, args: &ReportArgs) -> Result<()> {
+    let opts = ReportOptions {
+        costs: args.costs,
+        since: args.since.as_deref(),
+        project: args.project.as_deref(),
+    };
+    let value = report_value(con, db_path, &opts)?;
     if output::table_mode() {
         output::emit_text(&report_table(&value))
     } else {
@@ -108,25 +133,50 @@ pub fn cmd_report(con: &Connection, db_path: &Path, costs: bool) -> Result<()> {
 }
 
 /// Build the report (exposed for tests).
-pub fn report_value(con: &Connection, db_path: &Path, costs: bool) -> Result<serde_json::Value> {
+pub fn report_value(
+    con: &Connection,
+    db_path: &Path,
+    opts: &ReportOptions,
+) -> Result<serde_json::Value> {
+    let cutoff = match opts.since {
+        Some(age) => Some(now_ms()? - parse_age_ms(age)?),
+        None => None,
+    };
+    let project_id = match opts.project {
+        Some(reference) => Some(repo::resolve_project(con, reference)?.id),
+        None => None,
+    };
+    let scoped = cutoff.is_some() || project_id.is_some();
+
     let freelist: i64 = con.query_row("PRAGMA freelist_count", [], |r| r.get(0))?;
     let page_size: i64 = con.query_row("PRAGMA page_size", [], |r| r.get(0))?;
     let wal_bytes = file_size(&db_path.with_extension("db-wal"));
     let reclaimable = freelist * page_size;
 
-    // Old sessions (default 90 days).
-    let cutoff = now_ms()? - OLD_DAYS * 86_400_000;
-    let meta = repo::load_session_meta(con)?;
+    // Old sessions (default 90 days), limited to the scope.
+    let cutoff_old = now_ms()? - OLD_DAYS * 86_400_000;
+    let mut meta = repo::load_session_meta(con)?;
+    if let Some(cutoff) = cutoff {
+        meta.retain(|m| m.updated >= cutoff);
+    }
+    if let Some(project) = project_id.as_deref() {
+        meta.retain(|m| m.project_id.as_deref() == Some(project));
+    }
     let old_ids: Vec<String> = meta
         .iter()
-        .filter(|m| m.updated < cutoff)
+        .filter(|m| m.updated < cutoff_old)
         .map(|m| m.id.clone())
         .collect();
     let old_sizes = repo::session_sizes(con, &old_ids)?;
     let old_bytes: i64 = old_sizes.values().sum();
 
-    // Largest sessions.
+    // Largest sessions, limited to the scope.
     let mut sessions = repo::load_sessions(con)?;
+    if scoped {
+        let scoped_ids: std::collections::HashSet<&str> =
+            meta.iter().map(|m| m.id.as_str()).collect();
+        sessions.retain(|s| scoped_ids.contains(s.id.as_str()));
+    }
     sessions.sort_by(|a, b| {
         b.size_bytes()
             .cmp(&a.size_bytes())
@@ -230,29 +280,78 @@ pub fn report_value(con: &Connection, db_path: &Path, costs: bool) -> Result<ser
         kv_candidates,
         backups: backups_info,
         suggestions,
-        costs: if costs { Some(costs_out(con)?) } else { None },
+        scope: scoped.then(|| ScopeOut {
+            since: opts.since.map(str::to_string),
+            project: project_id.clone(),
+        }),
+        costs: if opts.costs {
+            Some(costs_out(
+                con,
+                cutoff,
+                project_id.as_deref(),
+                &meta,
+                scoped,
+            )?)
+        } else {
+            None
+        },
     };
     Ok(serde_json::to_value(&out)?)
 }
 
-/// Cost aggregates by project and by update day.
-fn costs_out(con: &Connection) -> Result<CostsOut> {
-    // Total across every session, including ones without a project.
+/// Cost aggregates by project and by update day, limited to the scope.
+fn costs_out(
+    con: &Connection,
+    cutoff: Option<i64>,
+    project: Option<&str>,
+    meta: &[crate::models::SessionMeta],
+    scoped: bool,
+) -> Result<CostsOut> {
     let total: f64 = con.query_row(
-        "SELECT COALESCE(SUM(cost),0) FROM \"session_v2\"",
-        [],
+        "SELECT COALESCE(SUM(cost),0) FROM \"session_v2\" \
+         WHERE (?1 IS NULL OR time_updated >= ?1) \
+           AND (?2 IS NULL OR project_id = ?2)",
+        params![cutoff, project],
         |r| r.get(0),
     )?;
     let total = crate::util::round4(total);
-    let mut by_project: Vec<ProjectCost> = repo::load_projects(con)?
-        .into_iter()
-        .map(|p| ProjectCost {
-            id: p.id,
-            name: p.name,
-            worktree: p.worktree,
-            cost: crate::util::round4(p.cost),
-        })
-        .collect();
+
+    // Unscoped reports keep listing every project (including empty ones);
+    // a scoped report recomputes from the filtered session set.
+    let mut by_project: Vec<ProjectCost> = if scoped {
+        let mut names: HashMap<String, (String, String)> = repo::load_projects(con)?
+            .into_iter()
+            .map(|p| (p.id, (p.name, p.worktree)))
+            .collect();
+        let mut costs: HashMap<String, f64> = HashMap::new();
+        for m in meta {
+            if let Some(id) = &m.project_id {
+                *costs.entry(id.clone()).or_default() += m.cost;
+            }
+        }
+        costs
+            .into_iter()
+            .map(|(id, cost)| {
+                let (name, worktree) = names.remove(&id).unwrap_or_default();
+                ProjectCost {
+                    id,
+                    name,
+                    worktree,
+                    cost: crate::util::round4(cost),
+                }
+            })
+            .collect()
+    } else {
+        repo::load_projects(con)?
+            .into_iter()
+            .map(|p| ProjectCost {
+                id: p.id,
+                name: p.name,
+                worktree: p.worktree,
+                cost: crate::util::round4(p.cost),
+            })
+            .collect()
+    };
     by_project.sort_by(|a, b| {
         b.cost
             .total_cmp(&a.cost)
@@ -264,9 +363,12 @@ fn costs_out(con: &Connection) -> Result<CostsOut> {
         let mut stmt = con.prepare(
             "SELECT date(time_updated/1000, 'unixepoch', 'localtime'), \
              COALESCE(SUM(cost),0), COUNT(*) \
-             FROM \"session_v2\" GROUP BY 1 ORDER BY 1 DESC LIMIT 30",
+             FROM \"session_v2\" \
+             WHERE (?1 IS NULL OR time_updated >= ?1) \
+               AND (?2 IS NULL OR project_id = ?2) \
+             GROUP BY 1 ORDER BY 1 DESC LIMIT 30",
         )?;
-        let rows = stmt.query_map([], |r| {
+        let rows = stmt.query_map(params![cutoff, project], |r| {
             Ok(DayCost {
                 day: r.get(0)?,
                 cost: crate::util::round4(r.get(1)?),
@@ -291,6 +393,18 @@ fn report_table(value: &serde_json::Value) -> String {
         "reclaimable".into(),
         human_bytes(num(value, "reclaimable_bytes")),
     ));
+    if let Some(scope) = value.get("scope") {
+        let mut parts = Vec::new();
+        if let Some(since) = scope.get("since").and_then(|v| v.as_str()) {
+            parts.push(format!("since {since}"));
+        }
+        if let Some(project) = scope.get("project").and_then(|v| v.as_str()) {
+            parts.push(format!("project {project}"));
+        }
+        if !parts.is_empty() {
+            lines.push(("scope".into(), parts.join(", ")));
+        }
+    }
     let old = value.get("old_sessions").cloned().unwrap_or_default();
     lines.push((
         "old sessions".into(),
@@ -418,7 +532,16 @@ mod tests {
         con.execute("UPDATE session_v2 SET cost = 0.75 WHERE id = 'old'", [])
             .unwrap();
 
-        let v = report_value(&con, &db_path, true).unwrap();
+        let v = report_value(
+            &con,
+            &db_path,
+            &ReportOptions {
+                costs: true,
+                since: None,
+                project: None,
+            },
+        )
+        .unwrap();
         assert_eq!(v["old_sessions"]["count"], 1);
         assert_eq!(v["kv_candidates"][0]["key"], "big");
         assert_eq!(v["costs"]["total"], 0.75);
@@ -442,6 +565,71 @@ mod tests {
             "suggestions: {}",
             v["suggestions"]
         );
+
+        drop(con);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn report_scope_filters_sessions_and_costs() {
+        let dir = testdb::temp_data_dir("report-scope");
+        let db_path = dir.join("opencode.db");
+        let con = testdb::create_at(&db_path);
+        con.execute(
+            "INSERT INTO project (id, worktree, name) VALUES ('p1','/a','p1')",
+            [],
+        )
+        .unwrap();
+        con.execute(
+            "INSERT INTO project (id, worktree, name) VALUES ('p2','/b','p2')",
+            [],
+        )
+        .unwrap();
+        let now = crate::util::now_ms().unwrap();
+        for (id, project, updated, cost) in [
+            ("old1", "p1", 0, 1.0),
+            ("new1", "p1", now, 2.0),
+            ("new2", "p2", now, 4.0),
+        ] {
+            con.execute(
+                "INSERT INTO session_v2 (id, directory, title, project_id, time_updated, cost) \
+                 VALUES (?1, '/a', 't', ?2, ?3, ?4)",
+                rusqlite::params![id, project, updated, cost],
+            )
+            .unwrap();
+        }
+
+        // --since limits every session-derived section.
+        let v = report_value(
+            &con,
+            &db_path,
+            &ReportOptions {
+                costs: true,
+                since: Some("1d"),
+                project: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(v["scope"]["since"], "1d");
+        assert_eq!(v["costs"]["total"], 6.0);
+        assert_eq!(v["old_sessions"]["count"], 0);
+        assert_eq!(v["largest_sessions"].as_array().unwrap().len(), 2);
+
+        // --project limits to one project (id, prefix, or worktree).
+        let v = report_value(
+            &con,
+            &db_path,
+            &ReportOptions {
+                costs: true,
+                since: None,
+                project: Some("p1"),
+            },
+        )
+        .unwrap();
+        assert_eq!(v["scope"]["project"], "p1");
+        assert_eq!(v["costs"]["total"], 3.0);
+        assert_eq!(v["old_sessions"]["count"], 1);
+        assert_eq!(v["costs"]["by_project"][0]["id"], "p1");
 
         drop(con);
         std::fs::remove_dir_all(&dir).unwrap();

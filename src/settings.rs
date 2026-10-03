@@ -7,41 +7,67 @@
 
 use crate::cli::{Cli, Command, Format, SessionCmd, SessionPurgeArgs};
 use crate::error::{AppError, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Settings {
     /// Default output format (`table` or `json`).
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub format: Option<String>,
     /// Default for `--quiet`.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub quiet: Option<bool>,
     /// Default for `--restart-service`.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub restart_service: Option<bool>,
     /// Default for `--no-input`.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub no_input: Option<bool>,
     /// Default age cutoff for `cleanup --fs-older-than` (default `7d`).
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub fs_older_than: Option<String>,
     /// Defaults for `session purge` / `strip-reasoning` / `cleanup`.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "PurgeDefaults::is_empty")]
     pub purge: PurgeDefaults,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct PurgeDefaults {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub older_than: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub subagents: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub archived: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub empty: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub larger_than: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub keep_latest: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub keep_latest_per_project: Option<i64>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub path: Vec<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub path_prefix: Vec<String>,
+}
+
+impl PurgeDefaults {
+    fn is_empty(&self) -> bool {
+        self.older_than.is_none()
+            && self.subagents.is_none()
+            && self.archived.is_none()
+            && self.empty.is_none()
+            && self.larger_than.is_none()
+            && self.keep_latest.is_none()
+            && self.keep_latest_per_project.is_none()
+            && self.path.is_empty()
+            && self.path_prefix.is_empty()
+    }
 }
 
 impl Settings {

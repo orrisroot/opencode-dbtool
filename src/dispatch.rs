@@ -45,6 +45,9 @@ pub fn execute(mut cli: Cli) -> Result<()> {
             commands::selfupdate::cmd_self_update(dry)
         });
     }
+    if let Command::Config(cmd) = command {
+        return commands::configcmd::cmd_config(cmd, &settings, cli.config.as_deref());
+    }
 
     let Some(dir) = config::data_dir() else {
         return Err(AppError::usage("cannot determine opencode data dir"));
@@ -612,8 +615,10 @@ fn dispatch(
         },
         Command::Report(a) => {
             let con = db::open_conn(db_path, true)?;
-            commands::report::cmd_report(&con, db_path, a.costs)
+            commands::report::cmd_report(&con, db_path, a)
         }
+        // Handled in `execute` before the database is required.
+        Command::Config(_) => unreachable!("config is handled in execute()"),
         Command::Cleanup(a) => {
             commands::cleanup::cmd_cleanup(dir, db_path, a, dry_run, quiet, service)
         }

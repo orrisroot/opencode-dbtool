@@ -113,6 +113,9 @@ pub enum Command {
     Vacuum(VacuumArgs),
     /// Read-only suggestions for reclaiming space (never deletes)
     Report(ReportArgs),
+    /// Show effective configuration and resolved paths
+    #[command(subcommand)]
+    Config(ConfigCmd),
     /// Update the binary from the latest GitHub release
     SelfUpdate,
     /// Remove old sessions and stale files/storage in one run
@@ -157,6 +160,24 @@ pub struct ReportArgs {
     /// Add cost aggregates by project and day
     #[arg(long)]
     pub costs: bool,
+    /// Only sessions updated since this age (e.g. 7d, 24h)
+    #[arg(long, value_name = "AGE", value_parser = age_value)]
+    pub since: Option<String>,
+    /// Only sessions of this project (id, prefix, or worktree)
+    #[arg(long, value_name = "REF")]
+    pub project: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+// config
+// ---------------------------------------------------------------------------
+
+#[derive(Subcommand)]
+pub enum ConfigCmd {
+    /// Show effective settings and where they come from
+    Show,
+    /// Print resolved paths (config, data dir, state dir, database)
+    Path,
 }
 
 // ---------------------------------------------------------------------------

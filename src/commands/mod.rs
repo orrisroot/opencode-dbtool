@@ -2,6 +2,7 @@
 
 pub mod checkpoint;
 pub mod cleanup;
+pub mod configcmd;
 pub mod dbinfo;
 pub mod doctor;
 pub mod fsops;

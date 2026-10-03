@@ -2562,3 +2562,59 @@ fn doctor_backup_freshness_warning_is_advisory() {
 
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+#[test]
+fn config_show_and_path_report_settings() {
+    let dir = temp_dir("config-cmd");
+    create_db(&dir.join("opencode.db"));
+    let cfg = dir.join("config.toml");
+    std::fs::write(&cfg, "quiet = true\n").unwrap();
+
+    let out = run(&["--config", cfg.to_str().unwrap(), "config", "show"], &dir);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v = stdout_json(&out);
+    assert_eq!(v["config_file_exists"], true);
+    assert_eq!(v["source"], "file");
+    assert_eq!(v["settings"]["quiet"], true);
+
+    let out = run(&["config", "path"], &dir);
+    assert!(out.status.success());
+    let v = stdout_json(&out);
+    assert!(v["data_dir"].is_string());
+    assert!(v["db"].is_string());
+    assert!(v["config_file"].is_string());
+
+    // Table mode renders the settings.
+    let out = run(&["config", "show", "--format", "table"], &dir);
+    assert!(out.status.success());
+    assert!(String::from_utf8_lossy(&out.stdout).contains("config"));
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn report_scope_filters_by_age_and_project() {
+    let dir = temp_dir("report-scope");
+    create_db(&dir.join("opencode.db"));
+
+    let out = run(&["report", "--costs", "--since", "1d"], &dir);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v = stdout_json(&out);
+    assert_eq!(v["scope"]["since"], "1d");
+    assert_eq!(v["costs"]["total"], 0.0);
+    assert_eq!(v["old_sessions"]["count"], 0);
+
+    // An unknown project is a usage error.
+    let out = run(&["report", "--project", "nope"], &dir);
+    assert_eq!(out.status.code(), Some(2));
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
