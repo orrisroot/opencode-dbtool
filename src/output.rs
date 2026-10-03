@@ -43,6 +43,11 @@ pub fn emit(v: &Value) -> Result<()> {
     emit_cols(v, &[])
 }
 
+/// Print pre-rendered text (curated table summaries).
+pub fn emit_text(text: &str) -> Result<()> {
+    write_stdout(text)
+}
+
 /// Print a command result; `columns` selects (and orders) the table
 /// columns in table mode. JSON mode always prints the full value.
 pub fn emit_cols(v: &Value, columns: &[&str]) -> Result<()> {

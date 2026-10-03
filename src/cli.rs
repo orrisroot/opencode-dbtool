@@ -55,6 +55,10 @@ pub struct Cli {
     /// Never prompt; destructive commands then require --yes
     #[arg(long, global = true)]
     pub no_input: bool,
+
+    /// Load defaults from this config file instead of the standard location
+    #[arg(long, global = true, value_name = "FILE")]
+    pub config: Option<PathBuf>,
 }
 
 #[derive(Subcommand)]
@@ -465,8 +469,8 @@ pub struct CleanupArgs {
     #[command(flatten)]
     pub purge: SessionPurgeArgs,
     /// Age cutoff for shell/log cleanup
-    #[arg(long = "fs-older-than", value_name = "AGE", value_parser = age_value, default_value = "7d")]
-    pub fs_older_than: String,
+    #[arg(long = "fs-older-than", value_name = "AGE", value_parser = age_value)]
+    pub fs_older_than: Option<String>,
     /// Skip the pre-cleanup database backup
     #[arg(long)]
     pub no_backup: bool,
@@ -665,7 +669,10 @@ mod tests {
         let Some(Command::Cleanup(a)) = cli.command else {
             panic!("expected cleanup");
         };
-        assert_eq!(a.fs_older_than, "7d");
+        assert!(
+            a.fs_older_than.is_none(),
+            "resolved to the 7d default at runtime"
+        );
         assert!(!a.no_backup);
         assert!(!a.no_vacuum);
         let f = PurgeFilter::try_from(&a.purge).unwrap();

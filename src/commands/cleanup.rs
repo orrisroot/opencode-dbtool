@@ -12,11 +12,36 @@ use crate::db::{env_status, EnvStatus};
 use crate::error::Result;
 use crate::models::{PurgeFilter, PurgeFilterJson};
 use crate::output;
+use crate::output::human_bytes;
 use crate::service::ServiceInfo;
 use crate::{commands, db};
 use serde::Serialize;
 use std::io::IsTerminal;
 use std::path::Path;
+
+/// Compact aggregate of all steps, for scripts and the table summary.
+#[derive(Serialize)]
+struct CleanupSummary {
+    sessions: usize,
+    rows: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    backup: Option<String>,
+    blob_orphans: usize,
+    blob_orphan_bytes: u64,
+    snapshot_entries: usize,
+    snapshot_bytes: u64,
+    shell_files: usize,
+    shell_bytes: u64,
+    log_bytes_before: u64,
+    log_bytes_after: u64,
+    /// `ran`, `planned` (dry-run), `skipped` (service running), or
+    /// `disabled` (`--no-vacuum`).
+    vacuum: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    db_bytes_before: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    db_bytes_after: Option<u64>,
+}
 
 #[derive(Serialize)]
 struct CleanupOut {
@@ -26,6 +51,7 @@ struct CleanupOut {
     action: &'static str,
     filters: PurgeFilterJson,
     fs_older_than: String,
+    summary: CleanupSummary,
     /// Pre-run verified backup (omitted without session filters or with
     /// `--no-backup`).
     backup: Option<serde_json::Value>,
@@ -68,7 +94,7 @@ pub fn cmd_cleanup(
     service: Option<&ServiceInfo>,
 ) -> Result<()> {
     let filters = PurgeFilter::try_from(&args.purge)?;
-    let fs_age = args.fs_older_than.as_str();
+    let fs_age = args.fs_older_than.as_deref().unwrap_or("7d");
     let service_running = service.is_some();
     let mut con = db::open_conn(db_path, dry_run)?;
 
@@ -168,12 +194,62 @@ pub fn cmd_cleanup(
     } else {
         None
     };
+    let vacuum_status = if args.no_vacuum {
+        "disabled"
+    } else if service_running {
+        "skipped"
+    } else if dry_run {
+        "planned"
+    } else {
+        "ran"
+    };
+    let summary = CleanupSummary {
+        sessions: purge
+            .as_ref()
+            .and_then(|p| p.get("sessions"))
+            .and_then(|v| v.as_array())
+            .map(|a| a.len())
+            .unwrap_or(0),
+        rows: purge
+            .as_ref()
+            .and_then(|p| p.get("total_rows"))
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0),
+        backup: backup
+            .as_ref()
+            .and_then(|b| b.get("backup"))
+            .and_then(|b| b.get("path"))
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+        blob_orphans: json_u64(&blob_orphans, "total_blobs") as usize,
+        blob_orphan_bytes: json_u64(&blob_orphans, "total_bytes"),
+        snapshot_entries: snapshots
+            .get("entries")
+            .and_then(|v| v.as_array())
+            .map(|a| a.len())
+            .unwrap_or(0),
+        snapshot_bytes: json_u64(&snapshots, "total_bytes"),
+        shell_files: json_u64(&shell, "total_files") as usize,
+        shell_bytes: json_u64(&shell, "total_bytes"),
+        log_bytes_before: json_u64(&log, "bytes"),
+        log_bytes_after: json_u64(&log, "remaining_bytes"),
+        vacuum: vacuum_status.to_string(),
+        db_bytes_before: vacuum
+            .as_ref()
+            .and_then(|v| v.get("db_bytes_before"))
+            .and_then(|v| v.as_u64()),
+        db_bytes_after: vacuum
+            .as_ref()
+            .and_then(|v| v.get("db_bytes_after"))
+            .and_then(|v| v.as_u64()),
+    };
     let out = CleanupOut {
         env: env_status(db_path),
         dry_run,
         action: "cleanup",
         filters: filters.json(),
         fs_older_than: fs_age.to_string(),
+        summary,
         backup,
         purge,
         blob_orphans,
@@ -184,7 +260,85 @@ pub fn cmd_cleanup(
         cleaned: !dry_run,
         note,
     };
-    output::emit(&serde_json::to_value(&out)?)
+    if output::table_mode() {
+        output::emit_text(&summary_table(&out))
+    } else {
+        output::emit(&serde_json::to_value(&out)?)
+    }
+}
+
+fn json_u64(value: &serde_json::Value, key: &str) -> u64 {
+    value.get(key).and_then(|v| v.as_u64()).unwrap_or(0)
+}
+
+/// Concise table-mode rendering: one line per aggregate instead of the
+/// full nested step output.
+fn summary_table(out: &CleanupOut) -> String {
+    let s = &out.summary;
+    let mut lines: Vec<(&str, String)> = Vec::new();
+    lines.push((
+        "action",
+        if out.dry_run {
+            "cleanup (dry-run)".to_string()
+        } else {
+            "cleanup".to_string()
+        },
+    ));
+    if s.sessions > 0 {
+        lines.push(("sessions", format!("{} ({} rows)", s.sessions, s.rows)));
+    } else {
+        lines.push(("sessions", "none".to_string()));
+    }
+    if let Some(path) = &s.backup {
+        lines.push(("backup", path.clone()));
+    }
+    lines.push((
+        "blob orphans",
+        format!(
+            "{} ({})",
+            s.blob_orphans,
+            human_bytes(s.blob_orphan_bytes as i64)
+        ),
+    ));
+    lines.push((
+        "snapshots",
+        format!(
+            "{} ({})",
+            s.snapshot_entries,
+            human_bytes(s.snapshot_bytes as i64)
+        ),
+    ));
+    lines.push((
+        "shell files",
+        format!("{} ({})", s.shell_files, human_bytes(s.shell_bytes as i64)),
+    ));
+    lines.push((
+        "log",
+        format!(
+            "{} -> {}",
+            human_bytes(s.log_bytes_before as i64),
+            human_bytes(s.log_bytes_after as i64)
+        ),
+    ));
+    let vacuum = match (s.vacuum.as_str(), s.db_bytes_before, s.db_bytes_after) {
+        ("ran", Some(before), Some(after)) => format!(
+            "ran ({} -> {})",
+            human_bytes(before as i64),
+            human_bytes(after as i64)
+        ),
+        ("planned", Some(before), _) => format!("planned ({})", human_bytes(before as i64)),
+        (status, _, _) => status.to_string(),
+    };
+    lines.push(("vacuum", vacuum));
+    if let Some(note) = &out.note {
+        lines.push(("note", note.clone()));
+    }
+    let width = lines.iter().map(|(k, _)| k.len()).max().unwrap_or(0);
+    lines
+        .iter()
+        .map(|(k, v)| format!("{k:width$}  {v}"))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 #[cfg(test)]

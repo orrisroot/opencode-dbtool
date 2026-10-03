@@ -15,7 +15,10 @@ use std::path::Path;
 
 /// Entry point after clap parsing: set up output, then either handle the
 /// no-database commands or run dispatch behind the confirmation guard.
-pub fn execute(cli: Cli) -> Result<()> {
+pub fn execute(mut cli: Cli) -> Result<()> {
+    let settings = crate::settings::Settings::load(cli.config.as_deref())?;
+    settings.apply(&mut cli)?;
+
     let Some(command) = cli.command.as_ref() else {
         print_help();
         return Ok(());
@@ -197,7 +200,13 @@ where
     F: FnMut(bool) -> Result<()>,
 {
     if cli.dry_run {
-        return run(true);
+        let result = run(true);
+        if result.is_ok() && !cli.quiet {
+            if let Some(command) = suggested_apply_command(&std::env::args().collect::<Vec<_>>()) {
+                eprintln!("to apply: {command}");
+            }
+        }
+        return result;
     }
     if cli.yes {
         return execute_confirmed(cli, idle, service, restart, db_path, &mut run);
@@ -278,6 +287,39 @@ where
         sys::require_idle(message)?;
     }
     run(false)
+}
+
+/// The current command line with `--dry-run` removed and `--yes` added,
+/// printed after a preview so the confirmed command can be copied.
+fn suggested_apply_command(args: &[String]) -> Option<String> {
+    let (program, rest) = args.split_first()?;
+    let mut out = vec![shell_quote(program)];
+    let mut has_yes = false;
+    for arg in rest {
+        match arg.as_str() {
+            "--dry-run" | "-n" => continue,
+            "--yes" | "-y" => {
+                has_yes = true;
+                out.push(arg.clone());
+            }
+            _ => out.push(shell_quote(arg)),
+        }
+    }
+    if !has_yes {
+        out.push("--yes".to_string());
+    }
+    Some(out.join(" "))
+}
+
+fn shell_quote(arg: &str) -> String {
+    if !arg.is_empty()
+        && arg
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "-_./:=@,+".contains(c))
+    {
+        return arg.to_string();
+    }
+    format!("'{}'", arg.replace('\'', "'\\''"))
 }
 
 fn dispatch(
@@ -400,5 +442,50 @@ fn dispatch(
         Command::SelfUpdate | Command::Completions(_) | Command::Service(_) => {
             unreachable!("handled before database resolution")
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn suggested_command_drops_dry_run_and_adds_yes() {
+        let out = suggested_apply_command(&args(&[
+            "opencode-dbtool",
+            "session",
+            "purge",
+            "--older-than",
+            "30d",
+            "--dry-run",
+        ]))
+        .unwrap();
+        assert_eq!(out, "opencode-dbtool session purge --older-than 30d --yes");
+    }
+
+    #[test]
+    fn suggested_command_keeps_existing_yes_and_quotes_spaces() {
+        let out = suggested_apply_command(&args(&[
+            "opencode-dbtool",
+            "session",
+            "purge",
+            "--path",
+            "/work/my dir",
+            "-y",
+        ]))
+        .unwrap();
+        assert_eq!(
+            out,
+            "opencode-dbtool session purge --path '/work/my dir' -y"
+        );
+    }
+
+    #[test]
+    fn suggested_command_needs_a_program() {
+        assert!(suggested_apply_command(&[]).is_none());
     }
 }

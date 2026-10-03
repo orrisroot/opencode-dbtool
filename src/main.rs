@@ -25,6 +25,7 @@ mod models;
 mod output;
 mod repo;
 mod service;
+mod settings;
 mod sys;
 #[cfg(test)]
 mod testdb;

@@ -86,7 +86,8 @@ fn run_db_env(args: &[&str], data_dir: &Path, db: Option<&str>) -> Output {
     let mut cmd = Command::new(bin());
     cmd.args(args)
         .env("OPENCODE_DATA_DIR", data_dir)
-        .env("XDG_STATE_HOME", data_dir.join("state"));
+        .env("XDG_STATE_HOME", data_dir.join("state"))
+        .env("XDG_CONFIG_HOME", data_dir.join("config"));
     match db {
         Some(value) => {
             cmd.env("OPENCODE_DB", value);
@@ -1293,6 +1294,65 @@ fn service_status_without_service() {
             .contains("no registered opencode service"),
         "note: {}",
         v["note"]
+    );
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn dry_run_prints_the_apply_hint() {
+    let dir = temp_dir("apply-hint");
+    create_db(&dir.join("opencode.db"));
+
+    let out = run(
+        &["session", "purge", "--older-than", "30d", "--dry-run"],
+        &dir,
+    );
+    assert!(out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("to apply:") && stderr.contains("--yes"),
+        "stderr: {stderr}"
+    );
+    assert!(!stderr.contains("--dry-run"), "stderr: {stderr}");
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn config_defaults_apply_to_cleanup() {
+    let dir = temp_dir("config");
+    create_db(&dir.join("opencode.db"));
+    let cfg_dir = dir.join("config/opencode-dbtool");
+    std::fs::create_dir_all(&cfg_dir).unwrap();
+    std::fs::write(
+        cfg_dir.join("config.toml"),
+        "fs_older_than = \"14d\"\n\n[purge]\nolder_than = \"30d\"\n",
+    )
+    .unwrap();
+
+    let out = run(&["cleanup", "--dry-run"], &dir);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v = stdout_json(&out);
+    assert_eq!(
+        v["purge"]["sessions"].as_array().unwrap().len(),
+        1,
+        "config older_than selected the session"
+    );
+    assert_eq!(v["fs_older_than"], "14d");
+
+    // Command-line flags still win over the config.
+    let out = run(&["cleanup", "--path", "/nope", "--dry-run"], &dir);
+    assert!(out.status.success());
+    let v = stdout_json(&out);
+    assert_eq!(
+        v["purge"]["sessions"].as_array().unwrap().len(),
+        0,
+        "the CLI filter wins"
     );
 
     std::fs::remove_dir_all(&dir).unwrap();
