@@ -62,16 +62,6 @@ pub fn parse_size_bytes(s: &str) -> Result<i64> {
         .ok_or_else(|| AppError::usage(format!("size too large: {s}")))
 }
 
-/// Reject any argument for commands that take none.
-pub fn expect_no_args(args: &[String], usage: &str) -> Result<()> {
-    if let Some(a) = args.first() {
-        return Err(AppError::usage(format!(
-            "unexpected argument: {a} (usage: opencode-dbtool {usage})"
-        )));
-    }
-    Ok(())
-}
-
 /// Parse a non-negative count like `10` for `--keep-latest`.
 pub fn parse_count(s: &str) -> Result<i64> {
     let n: i64 = s
@@ -315,14 +305,6 @@ mod tests {
     fn parse_count_ok() {
         assert_eq!(parse_count("0").unwrap(), 0);
         assert_eq!(parse_count("10").unwrap(), 10);
-    }
-
-    #[test]
-    fn expect_no_args_ok() {
-        assert!(expect_no_args(&[], "doctor").is_ok());
-        let err = expect_no_args(&["x".into(), "--flag".into()], "doctor").unwrap_err();
-        assert_eq!(err.code, 2);
-        assert!(err.message.contains("unexpected argument: x"));
     }
 
     #[test]

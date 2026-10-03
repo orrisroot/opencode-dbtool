@@ -2,8 +2,8 @@
 //! message-type breakdowns, creation activity, and subagent shares.
 
 use crate::db::{env_status, file_size, EnvStatus};
-use crate::error::{AppError, Result};
-use crate::output::print_json;
+use crate::error::Result;
+use crate::output;
 use crate::util::{dir_size, log_dir, now_ms, quote_ident, repos_dir, shell_dir, snapshot_dir};
 use rusqlite::{params, Connection};
 use serde::Serialize;
@@ -58,21 +58,8 @@ struct StatsOut {
     subagent: Option<Subagent>,
 }
 
-pub fn cmd_stats(con: &Connection, data_dir: &Path, db_path: &Path, args: &[String]) -> Result<()> {
-    let detail = parse_stats_args(args)?;
-    print_json(&stats_value(con, data_dir, db_path, detail)?)
-}
-
-/// Parse `stats` flags: `--detail`. Unknown options are rejected.
-fn parse_stats_args(args: &[String]) -> Result<bool> {
-    let mut detail = false;
-    for a in args {
-        match a.as_str() {
-            "--detail" => detail = true,
-            other => return Err(AppError::usage(format!("unknown option: {other}"))),
-        }
-    }
-    Ok(detail)
+pub fn cmd_stats(con: &Connection, data_dir: &Path, db_path: &Path, detail: bool) -> Result<()> {
+    output::emit(&stats_value(con, data_dir, db_path, detail)?)
 }
 
 /// Build the stats object (exposed for tests).
@@ -262,7 +249,7 @@ fn subagent(con: &Connection) -> Result<Subagent> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_stats_args, stats_out, stats_value};
+    use super::{stats_out, stats_value};
     use crate::testdb;
     use std::fs;
     use std::path::Path;
@@ -392,13 +379,5 @@ mod tests {
         assert_eq!(days.len(), 2);
         assert_eq!(out["subagent"]["sessions"], 1);
         assert_eq!(out["subagent"]["total_sessions"], 3);
-    }
-
-    #[test]
-    fn parse_stats_args_ok() {
-        assert!(!parse_stats_args(&[]).unwrap());
-        assert!(parse_stats_args(&["--detail".into()]).unwrap());
-        assert!(parse_stats_args(&["--nope".into()]).is_err());
-        assert!(parse_stats_args(&["x".into()]).is_err());
     }
 }

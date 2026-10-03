@@ -5,9 +5,8 @@ use crate::error::{AppError, Result};
 use crate::models::{
     filter_projects, project_json, ProjectFilter, ProjectFilterJson, ProjectOut, ProjectRow,
 };
-use crate::output::print_json;
-use crate::repo::{load_project, load_projects, lookup_project, project_impact};
-use crate::util::{now_ms, parse_age_ms};
+use crate::output;
+use crate::repo::{load_project, load_projects, project_impact, resolve_project};
 use rusqlite::{params, Connection};
 use serde::Serialize;
 use std::path::Path;
@@ -49,38 +48,32 @@ struct ProjectDeleteOut {
     note: Option<String>,
 }
 
-pub fn cmd_project_list(con: &Connection, args: &[String]) -> Result<()> {
-    let mut paths: Vec<&str> = Vec::new();
-    let mut i = 0;
-    while i < args.len() {
-        if args[i] == "--path" {
-            match args.get(i + 1) {
-                Some(p) => paths.push(p.as_str()),
-                None => return Err(AppError::usage("--path requires a directory")),
-            }
-            i += 2;
-        } else {
-            return Err(AppError::usage(format!("unexpected argument: {}", args[i])));
-        }
-    }
+pub fn cmd_project_list(con: &Connection, paths: &[String]) -> Result<()> {
     let projects = load_projects(con)?;
-    let arr: Vec<ProjectOut> = filter_projects(&projects, &paths)
+    let refs: Vec<&str> = paths.iter().map(String::as_str).collect();
+    let arr: Vec<ProjectOut> = filter_projects(&projects, &refs)
         .iter()
         .map(|p| project_json(p))
         .collect();
-    print_json(&serde_json::to_value(arr)?)
+    output::emit_cols(
+        &serde_json::to_value(arr)?,
+        &[
+            "id",
+            "worktree",
+            "name",
+            "sessions",
+            "size_bytes",
+            "cost",
+            "updated",
+        ],
+    )
 }
 
-pub fn cmd_project_show(con: &Connection, args: &[String]) -> Result<()> {
-    if args.len() != 1 {
-        return Err(AppError::usage(
-            "usage: opencode-dbtool project show <project-id>",
-        ));
-    }
-    let id = args[0].trim();
-    let proj = load_project(con, id)?
-        .ok_or_else(|| AppError::usage(format!("project not found: {id}")))?;
-    print_json(&project_detail(con, proj)?)
+pub fn cmd_project_show(con: &Connection, reference: &str) -> Result<()> {
+    let brief = resolve_project(con, reference)?;
+    let proj = load_project(con, &brief.id)?
+        .ok_or_else(|| AppError::usage(format!("project not found: {reference}")))?;
+    output::emit(&project_detail(con, proj)?)
 }
 
 /// Project object plus per-session breakdown.
@@ -117,22 +110,15 @@ fn project_detail(con: &Connection, full: ProjectRow) -> Result<serde_json::Valu
 
 pub fn cmd_project_delete(
     con: &mut Connection,
-    args: &[String],
+    ids: &[String],
     dry_run: bool,
     db_path: &Path,
 ) -> Result<()> {
-    let ids = parse_id_args(args)?;
-    if ids.is_empty() {
-        return Err(AppError::usage(
-            "usage: opencode-dbtool project delete <project-id> [project-id...]",
-        ));
-    }
     let mut projects: Vec<ProjectRow> = Vec::new();
-    for id in &ids {
-        match lookup_project(con, id, false)? {
-            Some(p) if !projects.iter().any(|x| x.id == p.id) => projects.push(p),
-            Some(_) => {}
-            None => return Err(AppError::usage(format!("project not found: {id}"))),
+    for reference in ids {
+        let p = resolve_project(con, reference)?;
+        if !projects.iter().any(|x| x.id == p.id) {
+            projects.push(p);
         }
     }
     delete_output(con, &projects, dry_run, db_path, None)
@@ -142,11 +128,10 @@ pub fn cmd_project_delete(
 /// required.
 pub fn cmd_project_purge(
     con: &mut Connection,
-    args: &[String],
+    filters: &ProjectFilter,
     dry_run: bool,
     db_path: &Path,
 ) -> Result<()> {
-    let filters = parse_purge_args(args)?;
     if filters.is_empty() {
         return Err(AppError::usage(
             "usage: opencode-dbtool project purge [--older-than <age>] [--path <dir>...] [--empty]",
@@ -156,72 +141,7 @@ pub fn cmd_project_purge(
         .into_iter()
         .filter(|p| filters.matches(p))
         .collect();
-    delete_output(con, &projects, dry_run, db_path, Some(&filters))
-}
-
-/// Parse `project delete` args: ids only; flags are rejected.
-fn parse_id_args(args: &[String]) -> Result<Vec<String>> {
-    let mut ids = Vec::new();
-    for a in args {
-        let id = a.trim();
-        if id.is_empty() {
-            continue;
-        }
-        if id == "--path" {
-            return Err(AppError::usage(
-                "`--path` was removed; use `project purge --path <dir>`",
-            ));
-        }
-        if id.starts_with("--") {
-            return Err(AppError::usage(format!("unknown option: {id}")));
-        }
-        ids.push(id.to_string());
-    }
-    Ok(ids)
-}
-
-/// Parse purge filter flags: `--older-than <age>`, `--path <dir>`
-/// (repeatable), `--empty`. Positional args and `--subagents` are rejected.
-fn parse_purge_args(args: &[String]) -> Result<ProjectFilter> {
-    let mut f = ProjectFilter {
-        older_than_raw: None,
-        cutoff_ms: None,
-        paths: Vec::new(),
-        empty: false,
-    };
-    let mut i = 0;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--older-than" => {
-                let age = args
-                    .get(i + 1)
-                    .ok_or_else(|| AppError::usage("--older-than requires an age (e.g. 30d)"))?;
-                let ms = parse_age_ms(age)?;
-                f.older_than_raw = Some(age.clone());
-                f.cutoff_ms = Some(now_ms()? - ms);
-                i += 2;
-            }
-            "--path" => {
-                let p = args
-                    .get(i + 1)
-                    .ok_or_else(|| AppError::usage("--path requires a directory"))?;
-                f.paths.push(p.clone());
-                i += 2;
-            }
-            "--empty" => {
-                f.empty = true;
-                i += 1;
-            }
-            "--subagents" | "--larger-than" | "--keep-latest" => {
-                return Err(AppError::usage(format!(
-                    "{} does not apply to projects",
-                    args[i]
-                )));
-            }
-            other => return Err(AppError::usage(format!("unknown option: {other}"))),
-        }
-    }
-    Ok(f)
+    delete_output(con, &projects, dry_run, db_path, Some(filters))
 }
 
 /// Delete the given projects: preview/execute, with an optional purge
@@ -262,7 +182,7 @@ fn delete_output(
         note: None,
     };
     if dry_run {
-        return print_json(&serde_json::to_value(&out)?);
+        return output::emit(&serde_json::to_value(&out)?);
     }
 
     let plist: String = (1..=projects.len())
@@ -308,14 +228,33 @@ fn delete_output(
     }
     out.deleted = true;
     out.note = Some("file size is unchanged until `opencode-dbtool vacuum` is run".into());
-    print_json(&serde_json::to_value(&out)?)
+    output::emit(&serde_json::to_value(&out)?)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{cmd_project_delete, cmd_project_purge, parse_id_args, parse_purge_args};
+    use super::{cmd_project_delete, cmd_project_purge};
+    use crate::models::ProjectFilter;
     use crate::testdb;
     use std::path::Path;
+
+    fn path_filter(path: &str) -> ProjectFilter {
+        ProjectFilter {
+            older_than_raw: None,
+            cutoff_ms: None,
+            paths: vec![path.to_string()],
+            empty: false,
+        }
+    }
+
+    fn no_filter() -> ProjectFilter {
+        ProjectFilter {
+            older_than_raw: None,
+            cutoff_ms: None,
+            paths: Vec::new(),
+            empty: false,
+        }
+    }
 
     #[test]
     fn delete_removes_project_and_sessions() {
@@ -330,19 +269,16 @@ mod tests {
     }
 
     #[test]
-    fn delete_rejects_path() {
+    fn delete_accepts_worktree_and_unique_prefix() {
         let mut con = testdb::create();
         testdb::insert_project(&con, "p1", "/a");
 
-        let err = cmd_project_delete(
-            &mut con,
-            &["--path".to_string(), "/a".to_string()],
-            false,
-            Path::new("/tmp/x.db"),
-        )
-        .unwrap_err();
-        assert_eq!(err.code, 2);
-        assert!(err.message.contains("purge"));
+        cmd_project_delete(&mut con, &["p".to_string()], true, Path::new("/tmp/x.db")).unwrap();
+        cmd_project_delete(&mut con, &["/a".to_string()], true, Path::new("/tmp/x.db")).unwrap();
+        assert_eq!(testdb::project_count(&con), 1, "dry-run changes nothing");
+
+        cmd_project_delete(&mut con, &["/a".to_string()], false, Path::new("/tmp/x.db")).unwrap();
+        assert_eq!(testdb::project_count(&con), 0);
     }
 
     #[test]
@@ -352,13 +288,7 @@ mod tests {
             testdb::insert_project(&con, id, worktree);
         }
 
-        cmd_project_purge(
-            &mut con,
-            &["--path".to_string(), "/a".to_string()],
-            false,
-            Path::new("/tmp/x.db"),
-        )
-        .unwrap();
+        cmd_project_purge(&mut con, &path_filter("/a"), false, Path::new("/tmp/x.db")).unwrap();
 
         assert_eq!(testdb::project_count(&con), 1);
         let remaining: String = con
@@ -372,27 +302,28 @@ mod tests {
         let mut con = testdb::create();
         testdb::insert_project(&con, "p1", "/a");
 
-        let err = cmd_project_purge(&mut con, &[], false, Path::new("/tmp/x.db")).unwrap_err();
+        let err =
+            cmd_project_purge(&mut con, &no_filter(), false, Path::new("/tmp/x.db")).unwrap_err();
         assert_eq!(err.code, 2);
     }
 
     #[test]
     fn purge_older_than_uses_latest_session_activity() {
         let mut con = testdb::create();
-        let now = super::now_ms().unwrap();
+        let now = crate::util::now_ms().unwrap();
         testdb::insert_project(&con, "inactive", "/a");
         testdb::insert_project_session(&con, "s-old", "/a", "inactive", 0);
         testdb::insert_project(&con, "active", "/b");
         testdb::insert_project_session(&con, "s-old1", "/b", "active", 0);
         testdb::insert_project_session(&con, "s-recent", "/b", "active", now);
 
-        cmd_project_purge(
-            &mut con,
-            &["--older-than".to_string(), "30d".to_string()],
-            false,
-            Path::new("/tmp/x.db"),
-        )
-        .unwrap();
+        let filters = ProjectFilter {
+            older_than_raw: Some("30d".to_string()),
+            cutoff_ms: Some(now - 30 * 86_400_000),
+            paths: Vec::new(),
+            empty: false,
+        };
+        cmd_project_purge(&mut con, &filters, false, Path::new("/tmp/x.db")).unwrap();
 
         assert_eq!(testdb::project_count(&con), 1);
         let remaining: String = con
@@ -407,43 +338,9 @@ mod tests {
         let mut con = testdb::create();
         testdb::insert_project(&con, "p1", "/a");
 
-        cmd_project_purge(
-            &mut con,
-            &["--path".to_string(), "/a".to_string()],
-            true,
-            Path::new("/tmp/x.db"),
-        )
-        .unwrap();
+        cmd_project_purge(&mut con, &path_filter("/a"), true, Path::new("/tmp/x.db")).unwrap();
 
         assert_eq!(testdb::project_count(&con), 1);
-    }
-
-    #[test]
-    fn parse_purge_args_ok() {
-        let f = parse_purge_args(&[
-            "--older-than".to_string(),
-            "30d".to_string(),
-            "--path".to_string(),
-            "/a".to_string(),
-        ])
-        .unwrap();
-        assert_eq!(f.older_than_raw.as_deref(), Some("30d"));
-        assert!(f.cutoff_ms.is_some());
-        assert_eq!(f.paths, vec!["/a"]);
-    }
-
-    #[test]
-    fn parse_purge_args_rejects_bad_input() {
-        for args in [
-            vec!["--older-than".to_string()],
-            vec!["--older-than".to_string(), "xyz".to_string()],
-            vec!["--path".to_string()],
-            vec!["--subagents".to_string()],
-            vec!["p1".to_string()],
-            vec!["--unknown".to_string()],
-        ] {
-            assert!(parse_purge_args(&args).is_err(), "should reject: {args:?}");
-        }
     }
 
     #[test]
@@ -453,27 +350,18 @@ mod tests {
         testdb::insert_project(&con, "full", "/b");
         testdb::insert_project_session(&con, "s1", "/b", "full", 0);
 
-        cmd_project_purge(
-            &mut con,
-            &["--empty".to_string()],
-            false,
-            Path::new("/tmp/x.db"),
-        )
-        .unwrap();
+        let filters = ProjectFilter {
+            older_than_raw: None,
+            cutoff_ms: None,
+            paths: Vec::new(),
+            empty: true,
+        };
+        cmd_project_purge(&mut con, &filters, false, Path::new("/tmp/x.db")).unwrap();
 
         assert_eq!(testdb::project_count(&con), 1);
         let remaining: String = con
             .query_row("SELECT id FROM project", [], |r| r.get(0))
             .unwrap();
         assert_eq!(remaining, "full");
-    }
-
-    #[test]
-    fn parse_id_args_ok() {
-        assert_eq!(
-            parse_id_args(&["p1".to_string(), "  p2  ".to_string()]).unwrap(),
-            vec!["p1", "p2"]
-        );
-        assert!(parse_id_args(&[]).unwrap().is_empty());
     }
 }

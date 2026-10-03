@@ -6,7 +6,7 @@
 
 use crate::db::{env_status, EnvStatus};
 use crate::error::Result;
-use crate::output::print_json;
+use crate::output;
 use crate::util::{
     dir_size, file_mtime_ms, log_file, now_ms, parse_age_ms, shell_dir, snapshot_dir,
 };
@@ -98,31 +98,27 @@ struct LogOut {
 /// the only full option; both modes are guarded while opencode runs for
 /// the same reason as `clean-snapshots`.
 pub fn cmd_fs_clean_log(
-    args: &[String],
+    older_than: Option<&str>,
     dry_run: bool,
     data_dir: &Path,
     db_path: &Path,
 ) -> Result<()> {
-    let mut cutoff: Option<i64> = None;
-    let mut older_than_raw: Option<String> = None;
-    let mut i = 0;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--older-than" => {
-                let age = args.get(i + 1).ok_or_else(|| {
-                    crate::error::AppError::usage("--older-than requires an age (e.g. 30d)")
-                })?;
-                cutoff = Some(crate::util::now_ms()? - crate::util::parse_age_ms(age)?);
-                older_than_raw = Some(age.clone());
-                i += 2;
-            }
-            other => {
-                return Err(crate::error::AppError::usage(format!(
-                    "unknown option: {other} (usage: opencode-dbtool fs clean-log [--older-than <age>])"
-                )));
-            }
-        }
-    }
+    output::emit(&log_cleanup_value(older_than, dry_run, data_dir, db_path)?)
+}
+
+/// Truncate/prune the log and return the output value (also used by
+/// `cleanup`).
+pub fn log_cleanup_value(
+    older_than: Option<&str>,
+    dry_run: bool,
+    data_dir: &Path,
+    db_path: &Path,
+) -> Result<serde_json::Value> {
+    let cutoff = match older_than {
+        Some(age) => Some(crate::util::now_ms()? - crate::util::parse_age_ms(age)?),
+        None => None,
+    };
+    let older_than_raw = older_than.map(str::to_string);
     let file = log_file(data_dir);
 
     let mut out = LogOut {
@@ -135,12 +131,12 @@ pub fn cmd_fs_clean_log(
         deleted: false,
     };
     if !file.exists() {
-        return print_json(&serde_json::to_value(&out)?);
+        return Ok(serde_json::to_value(&out)?);
     }
     out.bytes = std::fs::metadata(&file).map(|m| m.len()).unwrap_or(0);
     if dry_run {
         out.remaining_bytes = Some(filtered_log_bytes(&file, cutoff));
-        return print_json(&serde_json::to_value(&out)?);
+        return Ok(serde_json::to_value(&out)?);
     }
 
     match cutoff {
@@ -162,7 +158,7 @@ pub fn cmd_fs_clean_log(
         }
     }
     out.deleted = true;
-    print_json(&serde_json::to_value(&out)?)
+    Ok(serde_json::to_value(&out)?)
 }
 
 /// Bytes the log would have (or now has) after dropping lines older than
@@ -202,34 +198,32 @@ fn filtered_log(file: &Path, cutoff: i64) -> String {
 /// during revert operations.
 pub fn cmd_fs_clean_snapshots(
     con: &Connection,
-    args: &[String],
+    projects: &[String],
+    orphans_only: bool,
     dry_run: bool,
     data_dir: &Path,
     db_path: &Path,
 ) -> Result<()> {
-    let mut projects: Vec<String> = Vec::new();
-    let mut orphans_only = false;
-    let mut i = 0;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--project" => {
-                let p = args.get(i + 1).ok_or_else(|| {
-                    crate::error::AppError::usage("--project requires a project id")
-                })?;
-                projects.push(p.clone());
-                i += 2;
-            }
-            "--orphans-only" => {
-                orphans_only = true;
-                i += 1;
-            }
-            other => {
-                return Err(crate::error::AppError::usage(format!(
-                    "unknown option: {other} (usage: opencode-dbtool fs clean-snapshots [--project <id>...] [--orphans-only])"
-                )));
-            }
-        }
-    }
+    output::emit(&snapshots_cleanup_value(
+        con,
+        projects,
+        orphans_only,
+        dry_run,
+        data_dir,
+        db_path,
+    )?)
+}
+
+/// Delete snapshot storage and return the output value (also used by
+/// `cleanup`).
+pub fn snapshots_cleanup_value(
+    con: &Connection,
+    projects: &[String],
+    orphans_only: bool,
+    dry_run: bool,
+    data_dir: &Path,
+    db_path: &Path,
+) -> Result<serde_json::Value> {
     let dir = snapshot_dir(data_dir);
     let known: HashSet<String> = if orphans_only {
         let mut stmt = con.prepare("SELECT id FROM project")?;
@@ -265,7 +259,7 @@ pub fn cmd_fs_clean_snapshots(
         env: env_status(db_path),
         dry_run,
         dir: dir.to_string_lossy().to_string(),
-        projects,
+        projects: projects.to_vec(),
         orphans_only,
         entries,
         total_bytes,
@@ -273,7 +267,7 @@ pub fn cmd_fs_clean_snapshots(
     };
     if dry_run {
         out.deleted = false;
-        return print_json(&serde_json::to_value(&out)?);
+        return Ok(serde_json::to_value(&out)?);
     }
 
     for e in &out.entries {
@@ -282,38 +276,36 @@ pub fn cmd_fs_clean_snapshots(
             crate::error::AppError::db(format!("cannot remove snapshot {}: {err}", e.name))
         })?;
     }
-    print_json(&serde_json::to_value(&out)?)
+    Ok(serde_json::to_value(&out)?)
 }
 
 /// Delete shell output files (`shell/<project>/sh_*.out`), oldest first
 /// in spirit: `--older-than <age>` keeps recent outputs. Guarded while
 /// opencode runs because live runs append to these files.
 pub fn cmd_fs_clean_shell(
-    args: &[String],
+    older_than: Option<&str>,
     dry_run: bool,
     data_dir: &Path,
     db_path: &Path,
 ) -> Result<()> {
-    let mut cutoff: Option<i64> = None;
-    let mut older_than_raw: Option<String> = None;
-    let mut i = 0;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--older-than" => {
-                let age = args.get(i + 1).ok_or_else(|| {
-                    crate::error::AppError::usage("--older-than requires an age (e.g. 30d)")
-                })?;
-                cutoff = Some(now_ms()? - parse_age_ms(age)?);
-                older_than_raw = Some(age.clone());
-                i += 2;
-            }
-            other => {
-                return Err(crate::error::AppError::usage(format!(
-                    "unknown option: {other} (usage: opencode-dbtool fs clean-shell [--older-than <age>])"
-                )));
-            }
-        }
-    }
+    output::emit(&shell_cleanup_value(
+        older_than, dry_run, data_dir, db_path,
+    )?)
+}
+
+/// Delete shell output files and return the output value (also used by
+/// `cleanup`).
+pub fn shell_cleanup_value(
+    older_than: Option<&str>,
+    dry_run: bool,
+    data_dir: &Path,
+    db_path: &Path,
+) -> Result<serde_json::Value> {
+    let cutoff = match older_than {
+        Some(age) => Some(now_ms()? - parse_age_ms(age)?),
+        None => None,
+    };
+    let older_than_raw = older_than.map(str::to_string);
     let dir = shell_dir(data_dir);
     let mut files: Vec<ShellEntry> = Vec::new();
     let mut total_bytes: u64 = 0;
@@ -333,7 +325,7 @@ pub fn cmd_fs_clean_shell(
     out.total_files = out.files.len();
     if dry_run {
         out.deleted = false;
-        return print_json(&serde_json::to_value(&out)?);
+        return Ok(serde_json::to_value(&out)?);
     }
     // Fail fast like `clean-snapshots`, but report how far the run got:
     // re-running converges, since already-removed files simply drop out of
@@ -348,7 +340,7 @@ pub fn cmd_fs_clean_shell(
         }
     }
     remove_empty_dirs(&dir);
-    print_json(&serde_json::to_value(&out)?)
+    Ok(serde_json::to_value(&out)?)
 }
 
 fn collect_shell_files(
@@ -405,11 +397,19 @@ fn remove_empty_dirs(dir: &Path) {
 /// the transaction, but the guard keeps it simple and safe).
 pub fn cmd_fs_clean_blob_orphans(
     con: &mut Connection,
-    args: &[String],
     dry_run: bool,
     db_path: &Path,
 ) -> Result<()> {
-    crate::util::expect_no_args(args, "fs clean-blob-orphans")?;
+    output::emit(&blob_orphans_value(con, dry_run, db_path)?)
+}
+
+/// Delete orphan blobs and return the output value (also used by
+/// `cleanup`).
+pub fn blob_orphans_value(
+    con: &mut Connection,
+    dry_run: bool,
+    db_path: &Path,
+) -> Result<serde_json::Value> {
     let orphans = crate::repo::blob_orphans(con)?;
     let total_bytes: u64 = orphans.iter().map(|(_, b)| *b as u64).sum();
     let mut out = BlobOrphansOut {
@@ -427,7 +427,7 @@ pub fn cmd_fs_clean_blob_orphans(
         deleted: false,
     };
     if dry_run {
-        return print_json(&serde_json::to_value(&out)?);
+        return Ok(serde_json::to_value(&out)?);
     }
     let (rows, bytes) = crate::repo::delete_blob_orphans(con)?;
     out.total_blobs = rows;
@@ -439,7 +439,7 @@ pub fn cmd_fs_clean_blob_orphans(
         .map(|(hash, bytes)| BlobEntry { hash, bytes })
         .collect();
     out.deleted = true;
-    print_json(&serde_json::to_value(&out)?)
+    Ok(serde_json::to_value(&out)?)
 }
 
 #[cfg(test)]
@@ -469,7 +469,7 @@ mod tests {
         fs::create_dir_all(dir.join("snapshot/p2/h")).unwrap();
         fs::write(dir.join("snapshot/p2/h/obj"), vec![0u8; 3]).unwrap();
 
-        cmd_fs_clean_snapshots(&con, &[], false, &dir, &db_path).unwrap();
+        cmd_fs_clean_snapshots(&con, &[], false, false, &dir, &db_path).unwrap();
 
         assert!(!dir.join("snapshot/p1").exists());
         assert!(!dir.join("snapshot/p2").exists());
@@ -484,7 +484,7 @@ mod tests {
         let con = testdb::create_at(&db_path);
         fs::create_dir_all(dir.join("snapshot/p1")).unwrap();
 
-        cmd_fs_clean_snapshots(&con, &[], true, &dir, &db_path).unwrap();
+        cmd_fs_clean_snapshots(&con, &[], false, true, &dir, &db_path).unwrap();
 
         assert!(dir.join("snapshot/p1").exists());
         drop(con);
@@ -497,7 +497,7 @@ mod tests {
         let db_path = dir.join("opencode.db");
         let con = testdb::create_at(&db_path);
 
-        cmd_fs_clean_snapshots(&con, &[], false, &dir, &db_path).unwrap();
+        cmd_fs_clean_snapshots(&con, &[], false, false, &dir, &db_path).unwrap();
         drop(con);
         fs::remove_dir_all(&dir).unwrap();
     }
@@ -514,14 +514,7 @@ mod tests {
         }
 
         // --project limits the scope.
-        cmd_fs_clean_snapshots(
-            &con,
-            &["--project".to_string(), "p1".to_string()],
-            false,
-            &dir,
-            &db_path,
-        )
-        .unwrap();
+        cmd_fs_clean_snapshots(&con, &["p1".to_string()], false, false, &dir, &db_path).unwrap();
         assert!(!dir.join("snapshot/p1").exists());
         assert!(dir.join("snapshot/p2").exists());
         assert!(dir.join("snapshot/p3").exists());
@@ -529,8 +522,7 @@ mod tests {
         // --orphans-only removes only unknown projects (p2; p3 was recreated
         // as known below... here p2/p3 are both unknown, p1 dir is gone).
         testdb::insert_project(&con, "p2", "/b");
-        cmd_fs_clean_snapshots(&con, &["--orphans-only".to_string()], false, &dir, &db_path)
-            .unwrap();
+        cmd_fs_clean_snapshots(&con, &[], true, false, &dir, &db_path).unwrap();
         assert!(dir.join("snapshot/p2").exists(), "known project kept");
         assert!(!dir.join("snapshot/p3").exists(), "orphan removed");
         drop(con);
@@ -559,18 +551,12 @@ mod tests {
             .set_modified(past)
             .unwrap();
 
-        cmd_fs_clean_shell(
-            &["--older-than".to_string(), "1d".to_string()],
-            false,
-            &dir,
-            &db_path,
-        )
-        .unwrap();
+        cmd_fs_clean_shell(Some("1d"), false, &dir, &db_path).unwrap();
         assert!(!old.exists(), "old file removed");
         assert!(recent.exists(), "recent file kept");
 
         // No filter removes everything, then prunes the empty dir.
-        cmd_fs_clean_shell(&[], false, &dir, &db_path).unwrap();
+        cmd_fs_clean_shell(None, false, &dir, &db_path).unwrap();
         assert!(!recent.exists());
         assert!(!shell.exists(), "empty project dir pruned");
         fs::remove_dir_all(&dir).unwrap();
@@ -584,7 +570,7 @@ mod tests {
         fs::create_dir_all(&shell).unwrap();
         fs::write(shell.join("sh_x.out"), vec![0u8; 4]).unwrap();
 
-        cmd_fs_clean_shell(&[], true, &dir, &db_path).unwrap();
+        cmd_fs_clean_shell(None, true, &dir, &db_path).unwrap();
         assert!(shell.join("sh_x.out").exists());
         fs::remove_dir_all(&dir).unwrap();
     }
@@ -604,7 +590,7 @@ mod tests {
         // Read-only dir: file removal inside it fails for non-root.
         fs::set_permissions(&shell, fs::Permissions::from_mode(0o555)).unwrap();
 
-        let err = cmd_fs_clean_shell(&[], false, &dir, &db_path).unwrap_err();
+        let err = cmd_fs_clean_shell(None, false, &dir, &db_path).unwrap_err();
         assert!(
             err.message.contains("0 of 2 file(s) already removed"),
             "unexpected message: {}",
@@ -628,30 +614,11 @@ mod tests {
         let recent = format!("timestamp={recent_day} level=INFO new\n");
         fs::write(&log, format!("{old}{recent}dateless line\n")).unwrap();
 
-        cmd_fs_clean_log(
-            &["--older-than".to_string(), "30d".to_string()],
-            false,
-            &dir,
-            &db_path,
-        )
-        .unwrap();
+        cmd_fs_clean_log(Some("30d"), false, &dir, &db_path).unwrap();
         let content = fs::read_to_string(&log).unwrap();
         assert!(!content.contains("old"), "old line pruned");
         assert!(content.contains("new"), "recent line kept");
         assert!(content.contains("dateless"), "dateless line kept");
-        fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn rejects_positional_args() {
-        let dir = temp_data_dir("reject-args");
-        let db_path = dir.join("opencode.db");
-        let con = testdb::create_at(&db_path);
-        assert!(cmd_fs_clean_snapshots(&con, &["x".into()], true, &dir, &db_path).is_err());
-        assert!(cmd_fs_clean_snapshots(&con, &[], true, &dir, &db_path).is_ok());
-        assert!(cmd_fs_clean_log(&["x".into()], true, &dir, &db_path).is_err());
-        assert!(cmd_fs_clean_shell(&["x".into()], true, &dir, &db_path).is_err());
-        drop(con);
         fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -663,7 +630,7 @@ mod tests {
         fs::create_dir_all(dir.join("log")).unwrap();
         fs::write(&log, vec![0u8; 100]).unwrap();
 
-        cmd_fs_clean_log(&[], false, &dir, &db_path).unwrap();
+        cmd_fs_clean_log(None, false, &dir, &db_path).unwrap();
 
         assert!(log.exists(), "file kept, only truncated");
         assert_eq!(fs::metadata(&log).unwrap().len(), 0);
@@ -678,7 +645,7 @@ mod tests {
         fs::create_dir_all(dir.join("log")).unwrap();
         fs::write(&log, vec![0u8; 100]).unwrap();
 
-        cmd_fs_clean_log(&[], true, &dir, &db_path).unwrap();
+        cmd_fs_clean_log(None, true, &dir, &db_path).unwrap();
 
         assert_eq!(fs::metadata(&log).unwrap().len(), 100);
         fs::remove_dir_all(&dir).unwrap();
@@ -689,7 +656,7 @@ mod tests {
         let dir = temp_data_dir("log-missing");
         let db_path = dir.join("opencode.db");
 
-        cmd_fs_clean_log(&[], false, &dir, &db_path).unwrap();
+        cmd_fs_clean_log(None, false, &dir, &db_path).unwrap();
         fs::remove_dir_all(&dir).unwrap();
     }
 }

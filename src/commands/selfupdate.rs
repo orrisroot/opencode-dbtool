@@ -75,10 +75,7 @@ fn updater(target: &str, current_version: &str, tag: Option<&str>) -> Result<Upd
 
 /// Check the latest GitHub release; with `--yes` download and replace the
 /// running binary, with `--dry-run` stop at the report.
-pub fn cmd_self_update(dry_run: bool, rest: &[String]) -> Result<()> {
-    if let Some(bad) = rest.first() {
-        return Err(AppError::usage(format!("unknown option: {bad}")));
-    }
+pub fn cmd_self_update(dry_run: bool) -> Result<()> {
     let current_version = env!("CARGO_PKG_VERSION").to_string();
     let target = release_target()?;
     let path = std::env::current_exe()
@@ -112,7 +109,7 @@ pub fn cmd_self_update(dry_run: bool, rest: &[String]) -> Result<()> {
         release_url,
     };
     if !available || dry_run {
-        return output::print_json(&serde_json::to_value(&out)?);
+        return output::emit(&serde_json::to_value(&out)?);
     }
 
     // Apply exactly the release the check reported (pinned by tag), so the
@@ -135,7 +132,7 @@ pub fn cmd_self_update(dry_run: bool, rest: &[String]) -> Result<()> {
         }
         _ => out.status = "up-to-date".to_string(),
     }
-    output::print_json(&serde_json::to_value(&out)?)
+    output::emit(&serde_json::to_value(&out)?)
 }
 
 #[cfg(test)]

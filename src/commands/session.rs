@@ -4,18 +4,18 @@
 use crate::db::{env_status, EnvStatus, SESSION_TABLE};
 use crate::error::{AppError, Result};
 use crate::models::{session_json, PurgeFilter, PurgeFilterJson, SessionOut};
-use crate::output::print_json;
+use crate::output;
 use crate::repo::{
     assistant_messages, child_session_ids, load_session, load_session_meta, load_sessions,
-    reasoning_event_counts, reasoning_events_left, reasoning_messages_left, resolve_session_ids,
-    rewrite_message, session_sizes, strip_reasoning_events,
+    reasoning_event_counts, reasoning_events_left, reasoning_messages_left, resolve_session_id,
+    resolve_session_ids, rewrite_message, session_sizes, strip_reasoning_events,
 };
 use rusqlite::Connection;
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
-use crate::util::{now_ms, parse_age_ms, parse_count, parse_size_bytes, SQL_VAR_CHUNK};
+use crate::util::SQL_VAR_CHUNK;
 
 /// One session in a delete/purge preview.
 #[derive(Serialize)]
@@ -91,43 +91,40 @@ struct StripOut {
     note: Option<String>,
 }
 
-pub fn cmd_session_list(con: &Connection, args: &[String]) -> Result<()> {
-    print_json(&session_list_value(con, args)?)
+pub fn cmd_session_list(
+    con: &Connection,
+    sort_size: bool,
+    limit: Option<usize>,
+    search: Option<&str>,
+) -> Result<()> {
+    output::emit_cols(
+        &session_list_value(con, sort_size, limit, search)?,
+        &[
+            "id",
+            "title",
+            "directory",
+            "updated",
+            "session_messages",
+            "size_bytes",
+            "cost",
+        ],
+    )
 }
 
 /// Build the session list array (exposed for tests).
-pub fn session_list_value(con: &Connection, args: &[String]) -> Result<serde_json::Value> {
-    let mut limit: Option<usize> = None;
-    let mut sort_size = false;
-    let mut i = 0;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--limit" => {
-                let n = args
-                    .get(i + 1)
-                    .ok_or_else(|| AppError::usage("--limit requires a count"))?;
-                let c = parse_count(n)?;
-                limit = Some(c as usize);
-                i += 2;
-            }
-            "--sort" => {
-                let key = args
-                    .get(i + 1)
-                    .ok_or_else(|| AppError::usage("--sort requires a key"))?;
-                match key.as_str() {
-                    "size" => sort_size = true,
-                    other => {
-                        return Err(AppError::usage(format!(
-                            "unknown sort key: {other} (only 'size')"
-                        )))
-                    }
-                }
-                i += 2;
-            }
-            other => return Err(AppError::usage(format!("unknown option: {other}"))),
-        }
-    }
+pub fn session_list_value(
+    con: &Connection,
+    sort_size: bool,
+    limit: Option<usize>,
+    search: Option<&str>,
+) -> Result<serde_json::Value> {
     let mut sessions = load_sessions(con)?;
+    if let Some(search) = search {
+        let needle = search.to_lowercase();
+        sessions.retain(|s| {
+            s.title.to_lowercase().contains(&needle) || s.directory.to_lowercase().contains(&needle)
+        });
+    }
     if sort_size {
         sessions.sort_by(|a, b| {
             b.size_bytes()
@@ -142,46 +139,14 @@ pub fn session_list_value(con: &Connection, args: &[String]) -> Result<serde_jso
     Ok(serde_json::to_value(out)?)
 }
 
-pub fn cmd_session_show(con: &Connection, args: &[String]) -> Result<()> {
-    let mut messages = false;
-    let mut limit: usize = 50;
-    let mut limit_given = false;
-    let mut ids: Vec<&str> = Vec::new();
-    let mut i = 0;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--messages" => {
-                messages = true;
-                i += 1;
-            }
-            "--limit" => {
-                let n = args
-                    .get(i + 1)
-                    .ok_or_else(|| AppError::usage("--limit requires a count"))?;
-                limit = parse_count(n)? as usize;
-                limit_given = true;
-                i += 2;
-            }
-            other if other.starts_with("--") => {
-                return Err(AppError::usage(format!("unknown option: {other}")));
-            }
-            id => {
-                ids.push(id);
-                i += 1;
-            }
-        }
-    }
-    if ids.len() != 1 || (limit_given && !messages) {
-        return Err(AppError::usage(
-            "usage: opencode-dbtool session show <session-id> [--messages [--limit <n>]]",
-        ));
-    }
-    let id = ids[0].trim();
-    let s = load_session(con, id)?
-        .ok_or_else(|| AppError::usage(format!("session not found: {id}")))?;
+pub fn cmd_session_show(con: &Connection, reference: &str, messages: Option<usize>) -> Result<()> {
+    let reference = reference.trim();
+    let id = resolve_session_id(con, reference)?;
+    let s = load_session(con, &id)?
+        .ok_or_else(|| AppError::usage(format!("session not found: {reference}")))?;
     let mut v = serde_json::to_value(session_json(&s))?;
-    if messages {
-        let (total, rows) = crate::repo::list_messages(con, id, limit)?;
+    if let Some(limit) = messages {
+        let (total, rows) = crate::repo::list_messages(con, &id, limit)?;
         let msgs: Vec<serde_json::Value> = rows
             .iter()
             .map(|m| {
@@ -200,21 +165,15 @@ pub fn cmd_session_show(con: &Connection, args: &[String]) -> Result<()> {
         v["messages"] = serde_json::Value::Array(msgs);
         v["total_messages"] = serde_json::json!(total);
     }
-    print_json(&v)
+    output::emit(&v)
 }
 
 pub fn cmd_session_delete(
     con: &mut Connection,
-    args: &[String],
+    ids: &[String],
     dry_run: bool,
     db_path: &Path,
 ) -> Result<()> {
-    let ids = parse_id_args(args)?;
-    if ids.is_empty() {
-        return Err(AppError::usage(
-            "usage: opencode-dbtool session delete <session-id> [session-id...]",
-        ));
-    }
     let refs: Vec<&str> = ids.iter().map(|s| s.as_str()).collect();
     let mut resolved = resolve_session_ids(con, &refs)?;
     expand_children(con, &mut resolved)?;
@@ -222,29 +181,39 @@ pub fn cmd_session_delete(
     let (total_rows, sessions_arr) = preview_impact(con, &resolved)?;
     let mut out = DeleteOut::from_preview(db_path, dry_run, None, None, total_rows, sessions_arr);
     if dry_run {
-        return print_json(&serde_json::to_value(&out)?);
+        return output::emit(&serde_json::to_value(&out)?);
     }
 
     execute_delete(con, &resolved)?;
     out.deleted = true;
     out.note = Some("file size is unchanged until `opencode-dbtool vacuum` is run".into());
-    print_json(&serde_json::to_value(&out)?)
+    output::emit(&serde_json::to_value(&out)?)
 }
 
 /// Delete sessions selected by filters. At least one filter is required.
 pub fn cmd_session_purge(
     con: &mut Connection,
-    args: &[String],
+    filters: &PurgeFilter,
     dry_run: bool,
     db_path: &Path,
 ) -> Result<()> {
-    let filters = parse_purge_args(args)?;
+    output::emit(&session_purge_value(con, filters, dry_run, db_path)?)
+}
+
+/// Delete sessions selected by filters and return the output value
+/// (exposed so `cleanup` can embed the result).
+pub fn session_purge_value(
+    con: &mut Connection,
+    filters: &PurgeFilter,
+    dry_run: bool,
+    db_path: &Path,
+) -> Result<serde_json::Value> {
     if filters.is_empty() {
         return Err(AppError::usage(
             "usage: opencode-dbtool session purge [--older-than <age>] [--subagents] [--archived] [--empty] [--path <dir>...] [--path-prefix <dir>...] [--larger-than <size>] [--keep-latest <n>] [--keep-latest-per-project <n>]",
         ));
     }
-    let mut selected = select_ids(con, &filters, true)?;
+    let mut selected = select_ids(con, filters, true)?;
     expand_children(con, &mut selected)?;
 
     let (total_rows, sessions_arr) = preview_impact(con, &selected)?;
@@ -257,13 +226,13 @@ pub fn cmd_session_purge(
         sessions_arr,
     );
     if dry_run {
-        return print_json(&serde_json::to_value(&out)?);
+        return Ok(serde_json::to_value(&out)?);
     }
 
     execute_delete(con, &selected)?;
     out.deleted = true;
     out.note = Some("file size is unchanged until `opencode-dbtool vacuum` is run".into());
-    print_json(&serde_json::to_value(&out)?)
+    Ok(serde_json::to_value(&out)?)
 }
 
 /// Delete reasoning content of the sessions selected by filters (optional
@@ -276,13 +245,12 @@ pub fn cmd_session_purge(
 /// log. Token/cost aggregates are kept.
 pub fn cmd_session_strip_reasoning(
     con: &mut Connection,
-    args: &[String],
+    filters: &PurgeFilter,
     dry_run: bool,
     db_path: &Path,
 ) -> Result<()> {
-    let filters = parse_purge_args(args)?;
     // No child expansion for strip: only matching sessions are stripped.
-    let selected = select_ids(con, &filters, false)?;
+    let selected = select_ids(con, filters, false)?;
 
     // Durable reasoning events, per session.
     let mut event_map: std::collections::HashMap<String, (i64, i64)> =
@@ -349,7 +317,7 @@ pub fn cmd_session_strip_reasoning(
     };
     out.total_sessions = out.sessions.len();
     if dry_run {
-        return print_json(&serde_json::to_value(&out)?);
+        return output::emit(&serde_json::to_value(&out)?);
     }
 
     con.execute_batch("PRAGMA foreign_keys = ON;")?;
@@ -374,7 +342,7 @@ pub fn cmd_session_strip_reasoning(
     }
     out.stripped = true;
     out.note = Some("file size is unchanged until `opencode-dbtool vacuum` is run".into());
-    print_json(&serde_json::to_value(&out)?)
+    output::emit(&serde_json::to_value(&out)?)
 }
 
 /// Remove `type: "reasoning"` elements from an assistant message's
@@ -389,110 +357,6 @@ fn sanitize_assistant_data(data: &str) -> Option<String> {
         return None;
     }
     Some(v.to_string())
-}
-
-/// Parse `session delete` args: ids only; flags are rejected.
-fn parse_id_args(args: &[String]) -> Result<Vec<String>> {
-    let mut ids = Vec::new();
-    for a in args {
-        let id = a.trim();
-        if id.is_empty() {
-            continue;
-        }
-        if id == "--path" {
-            return Err(AppError::usage(
-                "`--path` was removed; use `session purge --path <dir>`",
-            ));
-        }
-        if id.starts_with("--") {
-            return Err(AppError::usage(format!("unknown option: {id}")));
-        }
-        ids.push(id.to_string());
-    }
-    Ok(ids)
-}
-
-/// Parse purge/strip-reasoning filter flags: `--older-than <age>`,
-/// `--subagents`, `--archived`, `--empty`, `--path <dir>` (repeatable,
-/// exact), `--path-prefix <dir>` (repeatable), `--larger-than`,
-/// `--keep-latest`, `--keep-latest-per-project`. Positional args are
-/// rejected.
-fn parse_purge_args(args: &[String]) -> Result<PurgeFilter> {
-    let mut f = PurgeFilter::default();
-    let mut i = 0;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--older-than" => {
-                let age = args
-                    .get(i + 1)
-                    .ok_or_else(|| AppError::usage("--older-than requires an age (e.g. 30d)"))?;
-                let ms = parse_age_ms(age)?;
-                f.older_than_raw = Some(age.clone());
-                f.cutoff_ms = Some(now_ms()? - ms);
-                i += 2;
-            }
-            "--subagents" => {
-                f.subagents = true;
-                i += 1;
-            }
-            "--archived" => {
-                f.archived = true;
-                i += 1;
-            }
-            "--empty" => {
-                f.empty = true;
-                i += 1;
-            }
-            "--path" => {
-                let p = args
-                    .get(i + 1)
-                    .ok_or_else(|| AppError::usage("--path requires a directory"))?;
-                f.paths.push(p.clone());
-                i += 2;
-            }
-            "--path-prefix" => {
-                let p = args
-                    .get(i + 1)
-                    .ok_or_else(|| AppError::usage("--path-prefix requires a directory"))?;
-                f.path_prefixes.push(p.clone());
-                i += 2;
-            }
-            "--larger-than" => {
-                let size = args
-                    .get(i + 1)
-                    .ok_or_else(|| AppError::usage("--larger-than requires a size (e.g. 50M)"))?;
-                let bytes = parse_size_bytes(size)?;
-                f.larger_than_raw = Some(size.clone());
-                f.larger_than_bytes = Some(bytes);
-                i += 2;
-            }
-            "--keep-latest" => {
-                let n = args
-                    .get(i + 1)
-                    .ok_or_else(|| AppError::usage("--keep-latest requires a count"))?;
-                let c = parse_count(n)?;
-                f.keep_latest_raw = Some(n.clone());
-                f.keep_latest = Some(c);
-                i += 2;
-            }
-            "--keep-latest-per-project" => {
-                let n = args
-                    .get(i + 1)
-                    .ok_or_else(|| AppError::usage("--keep-latest-per-project requires a count"))?;
-                let c = parse_count(n)?;
-                f.keep_latest_per_project_raw = Some(n.clone());
-                f.keep_latest_per_project = Some(c);
-                i += 2;
-            }
-            other => return Err(AppError::usage(format!("unknown option: {other}"))),
-        }
-    }
-    if f.keep_latest.is_some() && f.keep_latest_per_project.is_some() {
-        return Err(AppError::usage(
-            "--keep-latest and --keep-latest-per-project are mutually exclusive",
-        ));
-    }
-    Ok(f)
 }
 
 /// Sessions matching the filters. `keep_latest` keeps the N most recent
@@ -693,7 +557,54 @@ fn execute_delete(con: &mut Connection, resolved: &[String]) -> Result<()> {
 mod tests {
     use super::*;
     use crate::testdb;
+    use clap::Parser;
     use std::path::Path;
+
+    /// Build a `PurgeFilter` through the real clap definitions, so tests
+    /// exercise the same parsing path the CLI uses.
+    fn filter(args: &[String]) -> PurgeFilter {
+        let mut argv: Vec<String> =
+            vec!["opencode-dbtool".into(), "session".into(), "purge".into()];
+        argv.extend(args.iter().cloned());
+        match crate::cli::Cli::try_parse_from(argv)
+            .expect("valid purge args")
+            .command
+            .unwrap()
+        {
+            crate::cli::Command::Session(crate::cli::SessionCmd::Purge(a)) => {
+                PurgeFilter::try_from(&a).unwrap()
+            }
+            _ => unreachable!("expected session purge"),
+        }
+    }
+
+    /// Parse `session strip-reasoning` args through clap.
+    fn strip_filter(args: &[String]) -> PurgeFilter {
+        let mut argv: Vec<String> = vec![
+            "opencode-dbtool".into(),
+            "session".into(),
+            "strip-reasoning".into(),
+        ];
+        argv.extend(args.iter().cloned());
+        match crate::cli::Cli::try_parse_from(argv)
+            .expect("valid strip-reasoning args")
+            .command
+            .unwrap()
+        {
+            crate::cli::Command::Session(crate::cli::SessionCmd::StripReasoning(a)) => {
+                PurgeFilter::try_from(&a).unwrap()
+            }
+            _ => unreachable!("expected session strip-reasoning"),
+        }
+    }
+
+    /// Whether clap accepts the given `session purge` arguments.
+    fn purge_args_ok(args: &[String]) -> bool {
+        let mut argv: Vec<String> =
+            vec!["opencode-dbtool".into(), "session".into(), "purge".into()];
+        argv.extend(args.iter().cloned());
+        crate::cli::Cli::try_parse_from(argv).is_ok()
+    }
 
     #[test]
     fn delete_parent_removes_children_recursively() {
@@ -740,19 +651,19 @@ mod tests {
     }
 
     #[test]
-    fn delete_rejects_path() {
+    fn delete_rejects_unknown_reference() {
         let mut con = testdb::create();
         testdb::insert_session(&con, "s1", "/a", None);
 
         let err = cmd_session_delete(
             &mut con,
-            &["--path".to_string(), "/a".to_string()],
+            &["does-not-exist".to_string()],
             false,
             Path::new("/tmp/x.db"),
         )
         .unwrap_err();
         assert_eq!(err.code, 2);
-        assert!(err.message.contains("purge"));
+        assert!(err.message.contains("not found"), "got: {err}");
     }
 
     #[test]
@@ -890,7 +801,7 @@ mod tests {
 
         cmd_session_purge(
             &mut con,
-            &["--path".to_string(), "/a".to_string()],
+            &filter(&["--path".to_string(), "/a".to_string()]),
             false,
             Path::new("/tmp/x.db"),
         )
@@ -904,7 +815,8 @@ mod tests {
         let mut con = testdb::create();
         testdb::insert_session(&con, "s1", "/a", None);
 
-        let err = cmd_session_purge(&mut con, &[], false, Path::new("/tmp/x.db")).unwrap_err();
+        let err =
+            cmd_session_purge(&mut con, &filter(&[]), false, Path::new("/tmp/x.db")).unwrap_err();
         assert_eq!(err.code, 2);
     }
 
@@ -916,7 +828,7 @@ mod tests {
 
         cmd_session_purge(
             &mut con,
-            &["--subagents".to_string()],
+            &filter(&["--subagents".to_string()]),
             false,
             Path::new("/tmp/x.db"),
         )
@@ -932,13 +844,13 @@ mod tests {
     #[test]
     fn purge_older_than_selects_only_old() {
         let mut con = testdb::create();
-        let now = now_ms().unwrap();
+        let now = crate::util::now_ms().unwrap();
         testdb::insert_session_at(&con, "old", "/a", None, 0);
         testdb::insert_session_at(&con, "recent", "/a", None, now);
 
         cmd_session_purge(
             &mut con,
-            &["--older-than".to_string(), "30d".to_string()],
+            &filter(&["--older-than".to_string(), "30d".to_string()]),
             false,
             Path::new("/tmp/x.db"),
         )
@@ -954,7 +866,7 @@ mod tests {
     #[test]
     fn purge_older_than_boundary_is_strict() {
         let mut con = testdb::create();
-        let now = now_ms().unwrap();
+        let now = crate::util::now_ms().unwrap();
         // One hour above/below the cutoff; the re-computed cutoff at
         // purge time may drift by milliseconds, so the exact-boundary
         // semantics are asserted in models::tests instead.
@@ -963,7 +875,7 @@ mod tests {
 
         cmd_session_purge(
             &mut con,
-            &["--older-than".to_string(), "30d".to_string()],
+            &filter(&["--older-than".to_string(), "30d".to_string()]),
             false,
             Path::new("/tmp/x.db"),
         )
@@ -979,18 +891,18 @@ mod tests {
     #[test]
     fn purge_filters_combine_with_and() {
         let mut con = testdb::create();
-        let now = now_ms().unwrap();
+        let now = crate::util::now_ms().unwrap();
         testdb::insert_session_at(&con, "old-root", "/a", None, 0);
         testdb::insert_session_at(&con, "old-child", "/a", Some("old-root"), 0);
         testdb::insert_session_at(&con, "recent-child", "/a", Some("old-root"), now);
 
         cmd_session_purge(
             &mut con,
-            &[
+            &filter(&[
                 "--older-than".to_string(),
                 "30d".to_string(),
                 "--subagents".to_string(),
-            ],
+            ]),
             false,
             Path::new("/tmp/x.db"),
         )
@@ -1014,7 +926,7 @@ mod tests {
 
         cmd_session_purge(
             &mut con,
-            &["--path".to_string(), "/a".to_string()],
+            &filter(&["--path".to_string(), "/a".to_string()]),
             true,
             Path::new("/tmp/x.db"),
         )
@@ -1033,7 +945,7 @@ mod tests {
 
         cmd_session_purge(
             &mut con,
-            &["--larger-than".to_string(), "4".to_string()],
+            &filter(&["--larger-than".to_string(), "4".to_string()]),
             false,
             Path::new("/tmp/x.db"),
         )
@@ -1055,7 +967,7 @@ mod tests {
 
         cmd_session_purge(
             &mut con,
-            &["--keep-latest".to_string(), "2".to_string()],
+            &filter(&["--keep-latest".to_string(), "2".to_string()]),
             false,
             Path::new("/tmp/x.db"),
         )
@@ -1080,7 +992,7 @@ mod tests {
 
         cmd_session_purge(
             &mut con,
-            &["--keep-latest".to_string(), "1".to_string()],
+            &filter(&["--keep-latest".to_string(), "1".to_string()]),
             false,
             Path::new("/tmp/x.db"),
         )
@@ -1098,7 +1010,7 @@ mod tests {
 
         cmd_session_purge(
             &mut con,
-            &["--keep-latest".to_string(), "1".to_string()],
+            &filter(&["--keep-latest".to_string(), "1".to_string()]),
             false,
             Path::new("/tmp/x.db"),
         )
@@ -1119,7 +1031,7 @@ mod tests {
 
         cmd_session_purge(
             &mut con,
-            &["--keep-latest".to_string(), "0".to_string()],
+            &filter(&["--keep-latest".to_string(), "0".to_string()]),
             false,
             Path::new("/tmp/x.db"),
         )
@@ -1135,7 +1047,7 @@ mod tests {
 
         cmd_session_purge(
             &mut con,
-            &["--keep-latest".to_string(), "5".to_string()],
+            &filter(&["--keep-latest".to_string(), "5".to_string()]),
             false,
             Path::new("/tmp/x.db"),
         )
@@ -1153,11 +1065,11 @@ mod tests {
 
         cmd_session_purge(
             &mut con,
-            &[
+            &filter(&[
                 "--subagents".to_string(),
                 "--keep-latest".to_string(),
                 "1".to_string(),
-            ],
+            ]),
             false,
             Path::new("/tmp/x.db"),
         )
@@ -1196,7 +1108,7 @@ mod tests {
 
         cmd_session_strip_reasoning(
             &mut con,
-            &["--keep-latest".to_string(), "1".to_string()],
+            &strip_filter(&["--keep-latest".to_string(), "1".to_string()]),
             false,
             Path::new("/tmp/x.db"),
         )
@@ -1239,7 +1151,8 @@ mod tests {
             r#"{"type":"user","content":"hi"}"#,
         );
 
-        cmd_session_strip_reasoning(&mut con, &[], false, Path::new("/tmp/x.db")).unwrap();
+        cmd_session_strip_reasoning(&mut con, &strip_filter(&[]), false, Path::new("/tmp/x.db"))
+            .unwrap();
 
         let data: String = con
             .query_row(
@@ -1275,7 +1188,8 @@ mod tests {
             r#"{"type":"assistant","content":[{"type":"text","text":"hi","id":"t1"}]}"#,
         );
 
-        cmd_session_strip_reasoning(&mut con, &[], false, Path::new("/tmp/x.db")).unwrap();
+        cmd_session_strip_reasoning(&mut con, &strip_filter(&[]), false, Path::new("/tmp/x.db"))
+            .unwrap();
 
         let data: String = con
             .query_row(
@@ -1362,7 +1276,8 @@ mod tests {
         );
         testdb::insert_event(&con, "s1", "session.next.text.ended", r#"{"text":"hello"}"#);
 
-        cmd_session_strip_reasoning(&mut con, &[], false, Path::new("/tmp/x.db")).unwrap();
+        cmd_session_strip_reasoning(&mut con, &strip_filter(&[]), false, Path::new("/tmp/x.db"))
+            .unwrap();
 
         let remaining: Vec<String> = con
             .prepare("SELECT type FROM event ORDER BY type")
@@ -1386,7 +1301,8 @@ mod tests {
             r#"{"type":"assistant","content":[{"type":"reasoning","text":"x"}]}"#,
         );
 
-        cmd_session_strip_reasoning(&mut con, &[], true, Path::new("/tmp/x.db")).unwrap();
+        cmd_session_strip_reasoning(&mut con, &strip_filter(&[]), true, Path::new("/tmp/x.db"))
+            .unwrap();
 
         assert_eq!(
             reasoning_messages_left(&con, &["s1".to_string()]).unwrap(),
@@ -1416,7 +1332,7 @@ mod tests {
 
         cmd_session_strip_reasoning(
             &mut con,
-            &["--subagents".to_string()],
+            &strip_filter(&["--subagents".to_string()]),
             false,
             Path::new("/tmp/x.db"),
         )
@@ -1442,7 +1358,7 @@ mod tests {
         testdb::insert_session(&con, "medium", "/a", None);
         testdb::insert_session_message(&con, "m3", "medium", "assistant", "xxxxxxxx");
 
-        let all = session_list_value(&con, &[]).unwrap();
+        let all = session_list_value(&con, false, None, None).unwrap();
         let ids: Vec<&str> = all
             .as_array()
             .unwrap()
@@ -1451,7 +1367,7 @@ mod tests {
             .collect();
         assert_eq!(ids.len(), 3);
 
-        let sized = session_list_value(&con, &["--sort".to_string(), "size".to_string()]).unwrap();
+        let sized = session_list_value(&con, true, None, None).unwrap();
         let ids: Vec<&str> = sized
             .as_array()
             .unwrap()
@@ -1460,16 +1376,7 @@ mod tests {
             .collect();
         assert_eq!(ids, vec!["big", "medium", "small"]);
 
-        let limited = session_list_value(
-            &con,
-            &[
-                "--sort".to_string(),
-                "size".to_string(),
-                "--limit".to_string(),
-                "2".to_string(),
-            ],
-        )
-        .unwrap();
+        let limited = session_list_value(&con, true, Some(2), None).unwrap();
         let ids: Vec<&str> = limited
             .as_array()
             .unwrap()
@@ -1478,9 +1385,20 @@ mod tests {
             .collect();
         assert_eq!(ids, vec!["big", "medium"]);
 
-        assert!(session_list_value(&con, &["--sort".to_string(), "nope".to_string()]).is_err());
-        assert!(session_list_value(&con, &["--limit".to_string()]).is_err());
-        assert!(session_list_value(&con, &["--unknown".to_string()]).is_err());
+        // Search matches title or directory (case-insensitive).
+        let searched = session_list_value(&con, false, None, Some("MED")).unwrap();
+        let ids: Vec<&str> = searched
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, vec!["medium"]);
+        assert!(session_list_value(&con, false, None, Some("nope"))
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
@@ -1527,7 +1445,7 @@ mod tests {
 
         cmd_session_purge(
             &mut con,
-            &["--larger-than".to_string(), "4".to_string()],
+            &filter(&["--larger-than".to_string(), "4".to_string()]),
             false,
             Path::new("/tmp/x.db"),
         )
@@ -1542,7 +1460,7 @@ mod tests {
 
     #[test]
     fn parse_purge_args_ok() {
-        let f = parse_purge_args(&[
+        let f = filter(&[
             "--older-than".to_string(),
             "30d".to_string(),
             "--subagents".to_string(),
@@ -1556,8 +1474,7 @@ mod tests {
             "50M".to_string(),
             "--keep-latest".to_string(),
             "10".to_string(),
-        ])
-        .unwrap();
+        ]);
         assert_eq!(f.older_than_raw.as_deref(), Some("30d"));
         assert!(f.cutoff_ms.is_some());
         assert!(f.subagents);
@@ -1588,14 +1505,15 @@ mod tests {
             // Bare flags are rejected; the pair is rejected together.
             if args.len() == 2 && args[0] == "--keep-latest" && args[1] == "0" {
                 // --keep-latest 0 is valid (deletes all).
-                assert!(parse_purge_args(&args).is_ok());
+                assert!(purge_args_ok(&args));
             } else {
-                assert!(parse_purge_args(&args).is_err(), "should reject: {args:?}");
+                assert!(!purge_args_ok(&args), "should reject: {args:?}");
             }
         }
-        assert!(
-            parse_purge_args(&["--keep-latest-per-project".to_string(), "2".to_string()]).is_ok()
-        );
+        assert!(purge_args_ok(&[
+            "--keep-latest-per-project".to_string(),
+            "2".to_string()
+        ]));
     }
 
     #[test]
@@ -1607,7 +1525,7 @@ mod tests {
 
         cmd_session_purge(
             &mut con,
-            &["--path-prefix".to_string(), "/a".to_string()],
+            &filter(&["--path-prefix".to_string(), "/a".to_string()]),
             false,
             Path::new("/tmp/x.db"),
         )
@@ -1629,7 +1547,7 @@ mod tests {
 
         cmd_session_purge(
             &mut con,
-            &["--empty".to_string()],
+            &filter(&["--empty".to_string()]),
             false,
             Path::new("/tmp/x.db"),
         )
@@ -1655,7 +1573,7 @@ mod tests {
 
         cmd_session_purge(
             &mut con,
-            &["--archived".to_string()],
+            &filter(&["--archived".to_string()]),
             false,
             Path::new("/tmp/x.db"),
         )
@@ -1692,7 +1610,7 @@ mod tests {
 
         cmd_session_purge(
             &mut con,
-            &["--keep-latest-per-project".to_string(), "1".to_string()],
+            &filter(&["--keep-latest-per-project".to_string(), "1".to_string()]),
             false,
             Path::new("/tmp/x.db"),
         )
@@ -1727,7 +1645,7 @@ mod tests {
             vec!["ses_1".to_string()],
             vec!["--unknown".to_string()],
         ] {
-            assert!(parse_purge_args(&args).is_err(), "should reject: {args:?}");
+            assert!(!purge_args_ok(&args), "should reject: {args:?}");
         }
     }
 
@@ -1743,24 +1661,10 @@ mod tests {
         let v = serde_json::to_value(crate::models::session_json(&s)).unwrap();
         assert!(v.get("messages").is_none());
 
-        cmd_session_show(&con, &["s1".to_string(), "--messages".to_string()]).unwrap();
-        cmd_session_show(
-            &con,
-            &[
-                "s1".to_string(),
-                "--messages".to_string(),
-                "--limit".to_string(),
-                "1".to_string(),
-            ],
-        )
-        .unwrap();
-        assert!(cmd_session_show(&con, &["s1".to_string(), "--limit".to_string()]).is_err());
-    }
-
-    #[test]
-    fn parse_id_args_ok() {
-        let ids = parse_id_args(&["ses_1".to_string(), "  ses_2  ".to_string()]).unwrap();
-        assert_eq!(ids, vec!["ses_1", "ses_2"]);
-        assert!(parse_id_args(&[]).unwrap().is_empty());
+        // `Some(limit)` includes previews; the default limit is 50.
+        cmd_session_show(&con, "s1", Some(50)).unwrap();
+        cmd_session_show(&con, "s1", Some(1)).unwrap();
+        // A unique prefix resolves to the full id.
+        cmd_session_show(&con, "s", Some(1)).unwrap();
     }
 }

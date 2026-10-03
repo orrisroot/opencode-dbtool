@@ -188,21 +188,152 @@ pub fn child_session_ids(con: &Connection, id: &str) -> Result<Vec<String>> {
     Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
 }
 
-/// Look up session ids by exact id; errors when any id is unknown.
-pub fn resolve_session_ids(con: &Connection, id_args: &[&str]) -> Result<Vec<String>> {
-    let mut resolved: Vec<String> = Vec::new();
-    for id in id_args {
-        let sql = format!("SELECT id FROM \"{SESSION_TABLE}\" WHERE id = ?1");
-        let mut stmt = con.prepare(&sql)?;
-        let rows: Vec<String> = stmt
-            .query_map(params![id], |r| r.get::<_, String>(0))?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        if rows.is_empty() {
-            return Err(AppError::usage(format!("session not found: {id}")));
-        }
-        resolved.push(rows.into_iter().next().unwrap());
+/// Escape `LIKE` wildcards so a user-supplied reference matches literally.
+fn escape_like(s: &str) -> String {
+    s.replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
+}
+
+fn like_prefix(reference: &str) -> String {
+    format!("{}%", escape_like(reference))
+}
+
+fn like_contains(reference: &str) -> String {
+    format!("%{}%", escape_like(reference))
+}
+
+/// Up to six ids whose id matches `pattern` (capped, so ambiguity can be
+/// reported without scanning everything).
+fn ids_like(con: &Connection, table: &str, pattern: &str) -> Result<Vec<String>> {
+    let sql =
+        format!("SELECT id FROM \"{table}\" WHERE id LIKE ?1 ESCAPE '\\' ORDER BY id LIMIT 6");
+    let mut stmt = con.prepare(&sql)?;
+    let rows = stmt.query_map(params![pattern], |r| r.get::<_, String>(0))?;
+    Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+}
+
+fn format_candidates(ids: &[String]) -> String {
+    let shown: Vec<&str> = ids.iter().take(5).map(String::as_str).collect();
+    if ids.len() > 5 {
+        format!("{}, ...", shown.join(", "))
+    } else {
+        shown.join(", ")
     }
-    Ok(resolved)
+}
+
+/// Resolve one session reference to its full id:
+///
+/// 1. exact id;
+/// 2. a unique id prefix (the leading `ses_` may be omitted);
+/// 3. otherwise an error, with substring suggestions when available.
+pub fn resolve_session_id(con: &Connection, reference: &str) -> Result<String> {
+    let reference = reference.trim();
+    let sql = format!("SELECT id FROM \"{SESSION_TABLE}\" WHERE id = ?1");
+    match con.query_row(&sql, params![reference], |r| r.get::<_, String>(0)) {
+        Ok(id) => return Ok(id),
+        Err(rusqlite::Error::QueryReturnedNoRows) => {}
+        Err(e) => return Err(AppError::db(e.to_string())),
+    }
+
+    let mut patterns = vec![like_prefix(reference)];
+    if !reference.starts_with("ses_") {
+        patterns.push(like_prefix(&format!("ses_{reference}")));
+    }
+    for pattern in patterns {
+        let matches = ids_like(con, SESSION_TABLE, &pattern)?;
+        match matches.len() {
+            0 => {}
+            1 => return Ok(matches.into_iter().next().unwrap()),
+            _ => {
+                return Err(AppError::usage(format!(
+                    "session id prefix is ambiguous: {reference} matches multiple sessions: {}",
+                    format_candidates(&matches)
+                )))
+            }
+        }
+    }
+
+    let suggestions = ids_like(con, SESSION_TABLE, &like_contains(reference))?;
+    if suggestions.is_empty() {
+        Err(AppError::usage(format!("session not found: {reference}")))
+    } else {
+        Err(AppError::usage(format!(
+            "session not found: {reference} (did you mean: {})",
+            format_candidates(&suggestions)
+        )))
+    }
+}
+
+/// Look up session ids by reference (exact id, unique prefix, or
+/// `ses_`-optional prefix); errors when any reference is unknown or
+/// ambiguous.
+pub fn resolve_session_ids(con: &Connection, id_args: &[&str]) -> Result<Vec<String>> {
+    id_args
+        .iter()
+        .map(|id| resolve_session_id(con, id))
+        .collect()
+}
+
+/// All projects registered at a worktree (trailing slashes ignored).
+fn projects_at_worktree(con: &Connection, worktree: &str) -> Result<Vec<ProjectRow>> {
+    let sql = "SELECT id, worktree, COALESCE(name,'') FROM project \
+               WHERE RTRIM(worktree, '/') = RTRIM(?1, '/') ORDER BY id";
+    let mut stmt = con.prepare(sql)?;
+    let rows = stmt.query_map(params![worktree], project_row_from_row)?;
+    Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+}
+
+/// Resolve one project reference:
+///
+/// 1. exact id;
+/// 2. a unique id prefix;
+/// 3. an exact worktree path (must match exactly one project);
+/// 4. otherwise an error, with substring suggestions when available.
+pub fn resolve_project(con: &Connection, reference: &str) -> Result<ProjectRow> {
+    let reference = reference.trim();
+    if let Some(p) = lookup_project(con, reference, false)? {
+        return Ok(p);
+    }
+
+    let matches = ids_like(con, "project", &like_prefix(reference))?;
+    match matches.len() {
+        1 => {
+            let id = &matches[0];
+            return lookup_project(con, id, false)?
+                .ok_or_else(|| AppError::db(format!("project disappeared during lookup: {id}")));
+        }
+        n if n > 1 => {
+            return Err(AppError::usage(format!(
+                "project id prefix is ambiguous: {reference} matches multiple projects: {}",
+                format_candidates(&matches)
+            )))
+        }
+        _ => {}
+    }
+
+    let by_worktree = projects_at_worktree(con, reference)?;
+    match by_worktree.len() {
+        1 => return Ok(by_worktree.into_iter().next().unwrap()),
+        n if n > 1 => {
+            let ids: Vec<String> = by_worktree.iter().map(|p| p.id.clone()).collect();
+            return Err(AppError::usage(format!(
+                "project reference is ambiguous: {reference} is the worktree of multiple projects: {} - pass a project id",
+                format_candidates(&ids)
+            )));
+        }
+        _ => {}
+    }
+
+    let suggestions = ids_like(con, "project", &like_contains(reference))?;
+    if suggestions.is_empty() {
+        Err(AppError::usage(format!("project not found: {reference}")))
+    } else {
+        Err(AppError::usage(format!(
+            "project not found: {reference} (did you mean: {})",
+            format_candidates(&suggestions)
+        )))
+    }
 }
 
 /// All sessions with per-session counts and sizes.
@@ -676,5 +807,51 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].id, "m1");
         assert_eq!(rows[1].id, "m2");
+    }
+
+    #[test]
+    fn session_references_resolve_by_prefix() {
+        let con = testdb::create();
+        testdb::insert_session(&con, "ses_abc111", "/a", None);
+        testdb::insert_session(&con, "ses_abc222", "/a", None);
+        testdb::insert_session(&con, "ses_xyz", "/b", None);
+
+        assert_eq!(
+            resolve_session_id(&con, "ses_abc111").unwrap(),
+            "ses_abc111"
+        );
+        assert_eq!(resolve_session_id(&con, "ses_abc1").unwrap(), "ses_abc111");
+        assert_eq!(
+            resolve_session_id(&con, "abc1").unwrap(),
+            "ses_abc111",
+            "ses_ prefix is optional"
+        );
+        let err = resolve_session_id(&con, "ses_abc").unwrap_err();
+        assert_eq!(err.code, 2);
+        assert!(err.message.contains("ambiguous"), "got: {err}");
+        let err = resolve_session_id(&con, "ses_nope").unwrap_err();
+        assert!(err.message.contains("not found"), "got: {err}");
+    }
+
+    #[test]
+    fn project_references_resolve_by_prefix_and_worktree() {
+        let con = testdb::create();
+        testdb::insert_project(&con, "p1", "/a");
+        testdb::insert_project(&con, "p2", "/a");
+        testdb::insert_project(&con, "p3", "/b");
+
+        assert_eq!(resolve_project(&con, "p3").unwrap().id, "p3");
+        assert_eq!(resolve_project(&con, "/b").unwrap().id, "p3");
+        assert_eq!(
+            resolve_project(&con, "/b/").unwrap().id,
+            "p3",
+            "trailing slash ignored"
+        );
+        let err = resolve_project(&con, "/a")
+            .err()
+            .expect("ambiguous worktree");
+        assert!(err.message.contains("multiple projects"), "got: {err}");
+        let err = resolve_project(&con, "p").err().expect("ambiguous prefix");
+        assert!(err.message.contains("ambiguous"), "got: {err}");
     }
 }

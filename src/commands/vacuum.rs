@@ -1,8 +1,10 @@
 //! `vacuum` command: safe VACUUM with backup and journal mode handling.
 
-use crate::db::{file_size, quick_check};
+use crate::cli::VacuumArgs;
+use crate::db::{file_size, quick_check, EnvStatus};
 use crate::error::{AppError, Result};
-use crate::util::{now_ms, parse_count, timestamp_utc};
+use crate::output;
+use crate::util::{now_ms, timestamp_utc};
 use rusqlite::Connection;
 use serde::Serialize;
 use std::path::{Path, PathBuf};
@@ -57,42 +59,88 @@ impl Default for VacuumOpts {
     }
 }
 
-/// Parse `vacuum` flags: `--no-backup`, `--keep-backups <n>`.
-pub fn parse_vacuum_args(args: &[String]) -> Result<VacuumOpts> {
-    let mut opts = VacuumOpts::default();
-    let mut i = 0;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--no-backup" => opts.backup = false,
-            "--keep-backups" => {
-                let n = args
-                    .get(i + 1)
-                    .ok_or_else(|| AppError::usage("--keep-backups requires a count"))?;
-                let c = parse_count(n)?;
-                if c == 0 {
-                    return Err(AppError::usage(
-                        "--keep-backups must be at least 1 (0 would delete the backup just created)",
-                    ));
-                }
-                opts.keep_backups = Some(c);
-                i += 2;
-                continue;
-            }
-            other => return Err(AppError::usage(format!("unknown option: {other}"))),
-        }
-        i += 1;
-    }
-    if opts.keep_backups.is_some() && !opts.backup {
-        return Err(AppError::usage(
-            "--keep-backups requires the default backup (remove `--no-backup`)",
-        ));
-    }
-    Ok(opts)
-}
-
 /// The backup path a run would use right now (for dry-run output).
 pub fn planned_backup_path(db_path: &Path) -> PathBuf {
     backup_path(db_path, &timestamp_utc(now_ms().unwrap_or(0)))
+}
+
+/// JSON shape of the `vacuum` command output.
+#[derive(Serialize)]
+struct VacuumCmdOut {
+    #[serde(flatten)]
+    env: EnvStatus,
+    dry_run: bool,
+    db_bytes_before: u64,
+    free_pages_before: i64,
+    backup: Option<BackupOut>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    db_bytes_after: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    wal_bytes_after: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    free_pages_after: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    integrity: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    backup_cleanup: Option<BackupCleanupOut>,
+}
+
+/// Run `vacuum` from the CLI args (dry-run reports the plan and stops).
+pub fn cmd_vacuum_cli(db_path: &Path, args: &VacuumArgs, dry_run: bool) -> Result<()> {
+    let opts = VacuumOpts {
+        backup: !args.no_backup,
+        keep_backups: args.keep_backups,
+    };
+    let con = crate::db::open_conn(db_path, dry_run)?;
+    output::emit(&vacuum_value(&con, db_path, &opts, dry_run)?)
+}
+
+/// Build (and, when not a dry run, execute) the vacuum output value.
+/// Exposed so `cleanup` can run the final VACUUM on the same connection.
+pub fn vacuum_value(
+    con: &Connection,
+    db_path: &Path,
+    opts: &VacuumOpts,
+    dry_run: bool,
+) -> Result<serde_json::Value> {
+    let integrity = quick_check(con);
+    if integrity != "ok" {
+        return Err(AppError::db(format!(
+            "integrity check not ok ({integrity}) - abort"
+        )));
+    }
+    let freelist: i64 = con.query_row("PRAGMA freelist_count", [], |r| r.get(0))?;
+    let mut out = VacuumCmdOut {
+        env: crate::db::env_status(db_path),
+        dry_run,
+        db_bytes_before: file_size(db_path),
+        free_pages_before: freelist,
+        backup: if opts.backup {
+            Some(BackupOut {
+                path: planned_backup_path(db_path).to_string_lossy().to_string(),
+                bytes: file_size(db_path),
+                integrity: None,
+            })
+        } else {
+            None
+        },
+        db_bytes_after: None,
+        wal_bytes_after: None,
+        free_pages_after: None,
+        integrity: None,
+        backup_cleanup: None,
+    };
+    if dry_run {
+        return Ok(serde_json::to_value(&out)?);
+    }
+    let after = cmd_vacuum(con, db_path, opts)?;
+    out.db_bytes_after = Some(after.db_bytes);
+    out.wal_bytes_after = Some(after.wal_bytes);
+    out.free_pages_after = Some(after.free_pages);
+    out.integrity = Some(after.integrity);
+    out.backup = after.backup;
+    out.backup_cleanup = after.backup_cleanup;
+    Ok(serde_json::to_value(&out)?)
 }
 
 /// Run the safe VACUUM sequence: checkpoint, integrity check, backup
@@ -149,30 +197,6 @@ pub fn cmd_vacuum(con: &Connection, db_path: &Path, opts: &VacuumOpts) -> Result
     Ok(result)
 }
 
-/// Parse `backup` flags: `--keep-backups <n>`.
-pub fn parse_backup_args(args: &[String]) -> Result<Option<i64>> {
-    let mut keep: Option<i64> = None;
-    let mut i = 0;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--keep-backups" => {
-                let n = args
-                    .get(i + 1)
-                    .ok_or_else(|| AppError::usage("--keep-backups requires a count"))?;
-                let c = parse_count(n)?;
-                if c == 0 {
-                    return Err(AppError::usage("--keep-backups must be at least 1"));
-                }
-                keep = Some(c);
-                i += 2;
-                continue;
-            }
-            other => return Err(AppError::usage(format!("unknown option: {other}"))),
-        }
-    }
-    Ok(keep)
-}
-
 /// JSON shape of the `backup` command output.
 #[derive(Serialize)]
 pub struct BackupCmdOut {
@@ -186,9 +210,8 @@ pub struct BackupCmdOut {
 
 /// Create a verified timestamped backup without touching table data:
 /// checkpoint, integrity check, copy + verify, optional backup pruning.
-/// Use it before `purge`/`delete` runs.
-pub fn cmd_backup(db_path: &Path, dry_run: bool, args: &[String]) -> Result<()> {
-    let keep = parse_backup_args(args)?;
+/// Returns the output value (also used by `cleanup`).
+pub fn backup_value(db_path: &Path, dry_run: bool, keep: Option<i64>) -> Result<BackupCmdOut> {
     let con = crate::db::open_conn(db_path, dry_run)?;
     checkpoint(&con);
     if quick_check(&con) != "ok" {
@@ -205,7 +228,7 @@ pub fn cmd_backup(db_path: &Path, dry_run: bool, args: &[String]) -> Result<()> 
         backup_cleanup: None,
     };
     if dry_run {
-        return crate::output::print_json(&serde_json::to_value(&out)?);
+        return Ok(out);
     }
     let info = create_backup(db_path)?;
     out.backup = BackupOut {
@@ -221,7 +244,16 @@ pub fn cmd_backup(db_path: &Path, dry_run: bool, args: &[String]) -> Result<()> 
             removed_bytes,
         });
     }
-    crate::output::print_json(&serde_json::to_value(&out)?)
+    Ok(out)
+}
+
+/// Create a verified timestamped backup without touching table data:
+/// checkpoint, integrity check, copy + verify, optional backup pruning.
+/// Use it before `purge`/`delete` runs.
+pub fn cmd_backup(db_path: &Path, dry_run: bool, keep: Option<i64>) -> Result<()> {
+    output::emit(&serde_json::to_value(backup_value(
+        db_path, dry_run, keep,
+    )?)?)
 }
 
 /// Delete all `*.backup-*` files except the newest `keep` (the filename
@@ -338,35 +370,6 @@ mod tests {
             }
         }
         let _ = std::fs::remove_dir(dir);
-    }
-
-    #[test]
-    fn parse_vacuum_args_ok() {
-        let opts = parse_vacuum_args(&[]).unwrap();
-        assert!(opts.backup);
-        assert_eq!(opts.keep_backups, None);
-        assert!(!parse_vacuum_args(&["--no-backup".into()]).unwrap().backup);
-        assert_eq!(
-            parse_vacuum_args(&["--keep-backups".into(), "2".into()])
-                .unwrap()
-                .keep_backups,
-            Some(2)
-        );
-        // 0 is rejected: it would delete the backup this run creates.
-        assert!(parse_vacuum_args(&["--keep-backups".into(), "0".into()]).is_err());
-    }
-
-    #[test]
-    fn parse_vacuum_args_rejects_unknown() {
-        assert!(parse_vacuum_args(&["--nope".into()]).is_err());
-        assert!(parse_vacuum_args(&["--no-auto-vacuum".into()]).is_err());
-        assert!(parse_vacuum_args(&["--backup".into()]).is_err());
-        // Combining --keep-backups with --no-backup is contradictory.
-        assert!(
-            parse_vacuum_args(&["--no-backup".into(), "--keep-backups".into(), "1".into()])
-                .is_err()
-        );
-        assert!(parse_vacuum_args(&["--keep-backups".into()]).is_err());
     }
 
     #[test]

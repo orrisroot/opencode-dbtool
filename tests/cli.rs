@@ -308,7 +308,7 @@ fn self_update_rejects_unknown_options() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert!(
-        String::from_utf8_lossy(&out.stderr).contains("unknown option"),
+        String::from_utf8_lossy(&out.stderr).contains("unexpected argument"),
         "stderr: {}",
         String::from_utf8_lossy(&out.stderr)
     );
@@ -599,6 +599,214 @@ fn new_purge_filters_work_end_to_end() {
         &dir,
     );
     assert_eq!(out.status.code(), Some(2));
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn session_show_resolves_unique_prefix_and_rejects_ambiguous() {
+    let dir = temp_dir("prefix");
+    create_db(&dir.join("opencode.db"));
+    {
+        let con = Connection::open(dir.join("opencode.db")).unwrap();
+        con.execute(
+            "INSERT INTO session_v2 (id, directory, title, time_updated, cost) \
+             VALUES ('ses_1x', '/work/a', 'other', 0, 0)",
+            [],
+        )
+        .unwrap();
+    }
+
+    // Exact id still wins over the prefix match.
+    let out = run(&["session", "show", "ses_1"], &dir);
+    assert!(out.status.success());
+    assert_eq!(stdout_json(&out)["id"], "ses_1");
+
+    // An ambiguous prefix is a usage error listing the candidates.
+    let out = run(&["session", "show", "ses_"], &dir);
+    assert_eq!(out.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("ambiguous"), "stderr: {stderr}");
+    assert!(stderr.contains("ses_1"), "stderr: {stderr}");
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn project_show_accepts_a_worktree_path() {
+    let dir = temp_dir("project-path");
+    create_db(&dir.join("opencode.db"));
+
+    let out = run(&["project", "show", "/work/a"], &dir);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(stdout_json(&out)["id"], "p1");
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn session_list_search_filters_by_title_and_directory() {
+    let dir = temp_dir("search");
+    create_db(&dir.join("opencode.db"));
+
+    let out = run(&["session", "list", "--search", "HELLO"], &dir);
+    assert!(out.status.success());
+    assert_eq!(stdout_json(&out).as_array().unwrap().len(), 1);
+
+    let out = run(&["session", "list", "--search", "/work"], &dir);
+    assert!(out.status.success());
+    assert_eq!(stdout_json(&out).as_array().unwrap().len(), 1);
+
+    let out = run(&["session", "list", "--search", "nomatch"], &dir);
+    assert!(out.status.success());
+    assert_eq!(stdout_json(&out).as_array().unwrap().len(), 0);
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn format_table_prints_a_human_table() {
+    let dir = temp_dir("table");
+    create_db(&dir.join("opencode.db"));
+
+    let out = run(&["session", "list", "--format", "table"], &dir);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("ses_1"), "stdout: {text}");
+    assert!(text.contains("size_bytes"), "stdout: {text}");
+    assert!(text.contains("title"), "stdout: {text}");
+    assert!(
+        serde_json::from_slice::<Value>(&out.stdout).is_err(),
+        "not JSON"
+    );
+
+    // Explicit json wins over the terminal default.
+    let out = run(&["session", "list", "--format", "json"], &dir);
+    assert!(out.status.success());
+    assert_eq!(stdout_json(&out).as_array().unwrap().len(), 1);
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn cleanup_dry_run_reports_the_plan() {
+    let dir = temp_dir("cleanup");
+    create_db(&dir.join("opencode.db"));
+
+    // Bare cleanup deletes no sessions: only orphans and old files.
+    let out = run(&["cleanup", "--dry-run"], &dir);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v = stdout_json(&out);
+    assert_eq!(v["action"], "cleanup");
+    assert_eq!(v["dry_run"], true);
+    assert_eq!(v["cleaned"], false);
+    assert!(v["purge"].is_null(), "no session filters -> no purge");
+    assert!(v["backup"].is_null(), "no purge -> no backup");
+    assert_eq!(v["fs_older_than"], "7d");
+    assert_eq!(v["vacuum"]["dry_run"], true);
+    assert!(v["blob_orphans"].is_object());
+    assert!(v["snapshots"].is_object());
+
+    // With session filters the plan includes the purge and a backup.
+    let out = run(&["cleanup", "--older-than", "30d", "--dry-run"], &dir);
+    assert!(out.status.success());
+    let v = stdout_json(&out);
+    assert_eq!(v["purge"]["sessions"].as_array().unwrap().len(), 1);
+    assert!(v["backup"]["backup"]["path"].is_string());
+
+    // Real runs still require --yes outside a terminal.
+    let out = run(&["cleanup"], &dir);
+    assert_eq!(out.status.code(), Some(2));
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn cleanup_with_filters_applies_changes() {
+    let dir = temp_dir("cleanup-apply");
+    create_db(&dir.join("opencode.db"));
+    {
+        let con = Connection::open(dir.join("opencode.db")).unwrap();
+        con.execute(
+            "INSERT INTO instruction_blob (hash, value) VALUES ('orphan', 'x')",
+            [],
+        )
+        .unwrap();
+    }
+
+    let out = run(
+        &["cleanup", "--older-than", "30d", "--no-backup", "--yes"],
+        &dir,
+    );
+    // While this test harness itself runs under opencode, the guard may
+    // refuse with exit 1; both outcomes are valid (like other real-run
+    // tests in this file).
+    let code = out.status.code();
+    assert!(
+        code == Some(0) || code == Some(1),
+        "unexpected exit code: {code:?} stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    if code == Some(1) {
+        std::fs::remove_dir_all(&dir).unwrap();
+        return;
+    }
+    let v = stdout_json(&out);
+    assert_eq!(v["cleaned"], true);
+    assert_eq!(v["purge"]["deleted"], true);
+
+    let con = Connection::open(dir.join("opencode.db")).unwrap();
+    let sessions: i64 = con
+        .query_row("SELECT COUNT(*) FROM session_v2", [], |r| r.get(0))
+        .unwrap();
+    let blobs: i64 = con
+        .query_row("SELECT COUNT(*) FROM instruction_blob", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(sessions, 0);
+    assert_eq!(blobs, 0);
+    drop(con);
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn subcommand_help_lists_flags() {
+    let dir = temp_dir("help");
+    create_db(&dir.join("opencode.db"));
+
+    let out = run(&["session", "purge", "--help"], &dir);
+    assert!(out.status.success());
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("--older-than"), "stdout: {text}");
+    assert!(text.contains("--keep-latest-per-project"), "stdout: {text}");
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn completions_emit_a_script() {
+    let dir = temp_dir("completions");
+
+    let out = run(&["completions", "bash"], &dir);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("opencode-dbtool"), "stdout: {text}");
 
     std::fs::remove_dir_all(&dir).unwrap();
 }

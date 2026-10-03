@@ -37,11 +37,6 @@ impl AppError {
     pub fn busy(message: impl Into<String>) -> Self {
         AppError::new(EXIT_RUNNING, message)
     }
-
-    /// Exit with a code but no error line (usage already printed).
-    pub fn silent(code: i32) -> Self {
-        AppError::new(code, "")
-    }
 }
 
 impl std::fmt::Display for AppError {

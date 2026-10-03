@@ -6,7 +6,7 @@
 
 use crate::db::{env_status, EnvStatus};
 use crate::error::{AppError, Result};
-use crate::output::print_json;
+use crate::output;
 use crate::util::{dt, now_ms, parse_age_ms};
 use rusqlite::{params, Connection};
 use serde::Serialize;
@@ -49,23 +49,13 @@ struct KvKeyRow {
     bytes: i64,
 }
 
-pub fn cmd_kv_list(con: &Connection, args: &[String]) -> Result<()> {
+pub fn cmd_kv_list(con: &Connection, older_than: Option<&str>) -> Result<()> {
     // Optional `--older-than <age>` limits the listing to keys not updated
     // since the cutoff (stale caches first).
-    let mut cutoff: Option<i64> = None;
-    let mut i = 0;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--older-than" => {
-                let age = args
-                    .get(i + 1)
-                    .ok_or_else(|| AppError::usage("--older-than requires an age (e.g. 30d)"))?;
-                cutoff = Some(now_ms()? - parse_age_ms(age)?);
-                i += 2;
-            }
-            other => return Err(AppError::usage(format!("unknown option: {other}"))),
-        }
-    }
+    let cutoff = match older_than {
+        Some(age) => Some(now_ms()? - parse_age_ms(age)?),
+        None => None,
+    };
     let mut sql = "SELECT key, COALESCE(length(CAST(value AS BLOB)),0), time_updated \
                    FROM kv"
         .to_string();
@@ -83,7 +73,7 @@ pub fn cmd_kv_list(con: &Connection, args: &[String]) -> Result<()> {
     for r in rows {
         out.push(r?);
     }
-    print_json(&serde_json::to_value(out)?)
+    output::emit_cols(&serde_json::to_value(out)?, &["key", "bytes", "updated"])
 }
 
 fn read_entry(r: &rusqlite::Row) -> rusqlite::Result<KvEntry> {
@@ -94,11 +84,7 @@ fn read_entry(r: &rusqlite::Row) -> rusqlite::Result<KvEntry> {
     })
 }
 
-pub fn cmd_kv_show(con: &Connection, args: &[String]) -> Result<()> {
-    if args.len() != 1 {
-        return Err(AppError::usage("usage: opencode-dbtool kv show <key>"));
-    }
-    let key = args[0].as_str();
+pub fn cmd_kv_show(con: &Connection, key: &str) -> Result<()> {
     let (value, updated): (String, i64) = con
         .query_row(
             "SELECT value, time_updated FROM kv WHERE key = ?1",
@@ -114,7 +100,7 @@ pub fn cmd_kv_show(con: &Connection, args: &[String]) -> Result<()> {
     let bytes = value.len() as i64;
     let truncated = value.chars().count() > SHOW_PREVIEW_CHARS;
     let preview: String = value.chars().take(SHOW_PREVIEW_CHARS).collect();
-    print_json(&serde_json::to_value(KvShow {
+    output::emit(&serde_json::to_value(KvShow {
         key: key.to_string(),
         bytes,
         updated: dt(updated),
@@ -125,17 +111,17 @@ pub fn cmd_kv_show(con: &Connection, args: &[String]) -> Result<()> {
 
 pub fn cmd_kv_delete(
     con: &mut Connection,
-    args: &[String],
+    keys: &[String],
     dry_run: bool,
     db_path: &Path,
 ) -> Result<()> {
-    if args.is_empty() || args.iter().any(|a| a.starts_with("--")) {
+    if keys.is_empty() {
         return Err(AppError::usage(
             "usage: opencode-dbtool kv delete <key> [key...]",
         ));
     }
-    let mut keys = Vec::new();
-    for key in args {
+    let mut rows = Vec::new();
+    for key in keys {
         let bytes: Option<i64> = con
             .query_row(
                 "SELECT COALESCE(length(CAST(value AS BLOB)),0) FROM kv WHERE key = ?1",
@@ -149,22 +135,22 @@ pub fn cmd_kv_delete(
                 other => AppError::db(other.to_string()),
             })?;
         // QueryReturnedNoRows is mapped above; a missing key never yields None.
-        keys.push(KvKeyRow {
+        rows.push(KvKeyRow {
             key: key.clone(),
             bytes: bytes.unwrap_or(0),
         });
     }
-    let total: i64 = keys.iter().map(|k| k.bytes).sum();
+    let total: i64 = rows.iter().map(|k| k.bytes).sum();
     let mut out = KvDeleteOut {
         env: env_status(db_path),
         dry_run,
-        keys,
+        keys: rows,
         total_bytes: total,
         deleted: false,
         note: None,
     };
     if dry_run {
-        return print_json(&serde_json::to_value(&out)?);
+        return output::emit(&serde_json::to_value(&out)?);
     }
     con.execute_batch("PRAGMA foreign_keys = ON;")?;
     let tx = con.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
@@ -177,7 +163,7 @@ pub fn cmd_kv_delete(
     tx.commit()?;
     out.deleted = true;
     out.note = Some("file size is unchanged until `opencode-dbtool vacuum` is run".into());
-    print_json(&serde_json::to_value(&out)?)
+    output::emit(&serde_json::to_value(&out)?)
 }
 
 #[cfg(test)]
@@ -204,9 +190,9 @@ mod tests {
     fn show_truncates_large_values() {
         let con = kv_db();
         // Small value fits.
-        cmd_kv_show(&con, &["a".to_string()]).unwrap();
+        cmd_kv_show(&con, "a").unwrap();
         // Missing key is a usage error.
-        assert!(cmd_kv_show(&con, &["nope".to_string()]).is_err());
+        assert!(cmd_kv_show(&con, "nope").is_err());
     }
 
     #[test]

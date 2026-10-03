@@ -2,8 +2,7 @@
 
 use crate::db::{env_status, file_size, quick_check, EnvStatus, SESSION_TABLE};
 use crate::error::{AppError, Result};
-use crate::output::print_json;
-use crate::util::expect_no_args;
+use crate::output;
 use rusqlite::Connection;
 use serde::Serialize;
 use std::path::Path;
@@ -57,11 +56,10 @@ struct DoctorOut {
     ok: bool,
 }
 
-pub fn cmd_doctor(con: &Connection, db_path: &Path, args: &[String]) -> Result<()> {
-    expect_no_args(args, "doctor")?;
+pub fn cmd_doctor(con: &Connection, db_path: &Path) -> Result<()> {
     let out = doctor_out(con, db_path)?;
     let v = serde_json::to_value(&out)?;
-    print_json(&v)?;
+    output::emit(&v)?;
     if !out.ok {
         return Err(AppError::db("integrity problems found (see JSON output)"));
     }
@@ -208,7 +206,7 @@ mod tests {
     fn healthy_db_reports_ok() {
         let con = testdb::create();
         testdb::insert_session(&con, "s1", "/a", None);
-        cmd_doctor(&con, Path::new("/tmp/x.db"), &[]).unwrap();
+        cmd_doctor(&con, Path::new("/tmp/x.db")).unwrap();
     }
 
     #[test]
@@ -257,7 +255,7 @@ mod tests {
             [],
         )
         .unwrap();
-        cmd_doctor(&con, Path::new("/tmp/x.db"), &[]).unwrap();
+        cmd_doctor(&con, Path::new("/tmp/x.db")).unwrap();
     }
 
     #[test]
@@ -269,7 +267,7 @@ mod tests {
             [],
         )
         .unwrap();
-        assert!(cmd_doctor(&con, Path::new("/tmp/x.db"), &[]).is_err());
+        assert!(cmd_doctor(&con, Path::new("/tmp/x.db")).is_err());
     }
 
     #[test]
@@ -280,6 +278,6 @@ mod tests {
             [],
         )
         .unwrap();
-        assert!(cmd_doctor(&con, Path::new("/tmp/x.db"), &[]).is_err());
+        assert!(cmd_doctor(&con, Path::new("/tmp/x.db")).is_err());
     }
 }

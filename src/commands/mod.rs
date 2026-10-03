@@ -1,5 +1,6 @@
 //! Command implementations, one module per top-level subcommand.
 
+pub mod cleanup;
 pub mod doctor;
 pub mod fsops;
 pub mod kv;
