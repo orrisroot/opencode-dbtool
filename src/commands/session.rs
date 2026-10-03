@@ -17,7 +17,7 @@ use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
-use crate::util::{now_ms, parse_age_ms, SQL_VAR_CHUNK};
+use crate::util::{dt, now_ms, parse_age_ms, SQL_VAR_CHUNK};
 
 /// One session in a delete/purge preview.
 #[derive(Serialize)]
@@ -356,9 +356,13 @@ pub fn cmd_session_show(
     messages: Option<usize>,
     full: bool,
     last: Option<usize>,
+    markdown: bool,
 ) -> Result<()> {
     let reference = reference.trim();
     let id = resolve_session_id(con, reference)?;
+    if markdown {
+        return output::emit_text(&session_markdown(con, &id)?);
+    }
     let s = load_session(con, &id)?
         .ok_or_else(|| AppError::usage(format!("session not found: {reference}")))?;
     let mut v = serde_json::to_value(session_json(&s))?;
@@ -421,9 +425,9 @@ pub fn cmd_session_show(
     output::emit(&v)
 }
 
-/// Extract readable text from a message payload for the conversation view.
-fn message_text(data: &str) -> String {
-    let text = match serde_json::from_str::<serde_json::Value>(data) {
+/// Extract readable text from a message payload (no truncation).
+fn extract_message_text(data: &str) -> String {
+    match serde_json::from_str::<serde_json::Value>(data) {
         Ok(v) => {
             if let Some(arr) = v.get("content").and_then(|c| c.as_array()) {
                 let parts: Vec<&str> = arr
@@ -447,8 +451,12 @@ fn message_text(data: &str) -> String {
             }
         }
         Err(_) => data.to_string(),
-    };
-    let text = text.replace('\n', "\n  ");
+    }
+}
+
+/// Extract readable text from a message payload for the conversation view.
+fn message_text(data: &str) -> String {
+    let text = extract_message_text(data).replace('\n', "\n  ");
     let mut chars = text.chars();
     let preview: String = chars.by_ref().take(500).collect();
     if chars.next().is_some() {
@@ -456,6 +464,30 @@ fn message_text(data: &str) -> String {
     } else {
         preview
     }
+}
+
+/// Render a session conversation as Markdown (all messages, full text).
+pub fn session_markdown(con: &Connection, id: &str) -> Result<String> {
+    let s = load_session(con, id)?
+        .ok_or_else(|| AppError::usage(format!("session not found: {id}")))?;
+    let (total, rows) = crate::repo::list_all_messages(con, id)?;
+    let title = if s.title.trim().is_empty() {
+        "(untitled)"
+    } else {
+        s.title.trim()
+    };
+    let mut text = format!("# {title}\n\n");
+    text.push_str(&format!("- id: `{}`\n", s.id));
+    text.push_str(&format!("- directory: `{}`\n", s.directory));
+    text.push_str(&format!("- updated: {}\n", dt(s.updated)));
+    text.push_str(&format!("- messages: {total}\n\n"));
+    for m in rows {
+        text.push_str(&format!("## {} ({})\n\n", m.msg_type, dt(m.created)));
+        let body = extract_message_text(&m.data);
+        text.push_str(body.trim());
+        text.push_str("\n\n");
+    }
+    Ok(text)
 }
 
 /// Export/import need a running service that owns this exact database.
@@ -478,13 +510,33 @@ fn require_service<'a>(
 }
 
 /// Export a session through the server API; the raw export goes to stdout
-/// unless `--out` names a file.
+/// unless `--out` names a file. With `--markdown` the conversation is
+/// rendered locally and no server is needed.
 pub fn cmd_session_export(
     db_path: &Path,
     reference: &str,
     out: Option<&Path>,
+    markdown: bool,
     service: Option<&ServiceInfo>,
 ) -> Result<()> {
+    if markdown {
+        let con = crate::db::open_conn(db_path, true)?;
+        let id = resolve_session_id(&con, reference)?;
+        let text = session_markdown(&con, &id)?;
+        return match out {
+            Some(path) => {
+                crate::util::write_private(path, text.as_bytes())?;
+                output::emit(&serde_json::json!({
+                    "db": db_path.to_string_lossy(),
+                    "session": id,
+                    "file": path.to_string_lossy(),
+                    "bytes": text.len(),
+                    "format": "markdown",
+                }))
+            }
+            None => output::emit_text(&text),
+        };
+    }
     let svc = require_service(service, db_path)?;
     let id = {
         let con = crate::db::open_conn(db_path, true)?;
@@ -2277,10 +2329,29 @@ mod tests {
         assert!(v.get("messages").is_none());
 
         // `Some(limit)` includes previews; the default limit is 50.
-        cmd_session_show(&con, "s1", Some(50), false, None).unwrap();
-        cmd_session_show(&con, "s1", Some(1), false, None).unwrap();
+        cmd_session_show(&con, "s1", Some(50), false, None, false).unwrap();
+        cmd_session_show(&con, "s1", Some(1), false, None, false).unwrap();
         // A unique prefix resolves to the full id.
-        cmd_session_show(&con, "s", Some(1), false, None).unwrap();
+        cmd_session_show(&con, "s", Some(1), false, None, false).unwrap();
+    }
+
+    #[test]
+    fn markdown_renders_the_full_conversation() {
+        let con = testdb::create();
+        testdb::insert_session(&con, "s1", "/a", None);
+        testdb::insert_session_message(
+            &con,
+            "m1",
+            "s1",
+            "user",
+            r#"{"content":[{"type":"text","text":"hello markdown"}]}"#,
+        );
+        let text = session_markdown(&con, "s1").unwrap();
+        assert!(text.starts_with("# s1"), "text: {text}");
+        assert!(text.contains("- id: `s1`"), "text: {text}");
+        assert!(text.contains("## user ("), "text: {text}");
+        assert!(text.contains("hello markdown"), "text: {text}");
+        assert!(session_markdown(&con, "missing").is_err());
     }
 
     #[test]

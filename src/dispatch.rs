@@ -454,7 +454,9 @@ fn dispatch(
                 let con = db::open_conn(db_path, true)?;
                 let limit = a.limit.or(a.last).unwrap_or(50);
                 let messages = a.messages.then_some(limit);
-                commands::session::cmd_session_show(&con, &a.id, messages, a.full, a.last)
+                commands::session::cmd_session_show(
+                    &con, &a.id, messages, a.full, a.last, a.markdown,
+                )
             }
             SessionCmd::Delete(a) => {
                 let mut con = db::open_conn(db_path, dry_run)?;
@@ -482,9 +484,13 @@ fn dispatch(
                 let mut con = db::open_conn(db_path, dry_run)?;
                 commands::session::cmd_session_strip_reasoning(&mut con, &filters, dry_run, db_path)
             }
-            SessionCmd::Export(a) => {
-                commands::session::cmd_session_export(db_path, &a.id, a.out.as_deref(), service)
-            }
+            SessionCmd::Export(a) => commands::session::cmd_session_export(
+                db_path,
+                &a.id,
+                a.out.as_deref(),
+                a.markdown,
+                service,
+            ),
             SessionCmd::Import(a) => {
                 commands::session::cmd_session_import(db_path, &a.file, service)
             }

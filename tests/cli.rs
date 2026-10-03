@@ -2338,3 +2338,66 @@ fn list_table_output_ends_with_a_summary_footer() {
 
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+#[test]
+fn session_markdown_show_and_export_work_locally() {
+    let dir = temp_dir("markdown");
+    let db = dir.join("opencode.db");
+    create_db(&db);
+    let id = {
+        let con = Connection::open(&db).unwrap();
+        let id: String = con
+            .query_row("SELECT id FROM session_v2 LIMIT 1", [], |r| r.get(0))
+            .unwrap();
+        con.execute(
+            "INSERT INTO session_message (id, session_id, type, data) VALUES ('md1', ?1, 'user', '{\"content\":[{\"type\":\"text\",\"text\":\"hello md\"}]}')",
+            [&id],
+        )
+        .unwrap();
+        id
+    };
+
+    // `--markdown` requires `--messages`.
+    let out = run(&["session", "show", &id, "--markdown"], &dir);
+    assert_eq!(out.status.code(), Some(2));
+
+    let out = run(&["session", "show", &id, "--messages", "--markdown"], &dir);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.starts_with("# "), "output: {text}");
+    assert!(text.contains("hello md"), "output: {text}");
+    assert!(text.contains("## user ("), "output: {text}");
+
+    // Markdown export renders locally, no server required.
+    let out = run(&["session", "export", &id, "--markdown"], &dir);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&out.stdout).contains("hello md"));
+
+    let target = dir.join("session.md");
+    let out = run(
+        &[
+            "session",
+            "export",
+            &id,
+            "--markdown",
+            "--out",
+            target.to_str().unwrap(),
+        ],
+        &dir,
+    );
+    assert!(out.status.success());
+    assert_eq!(stdout_json(&out)["format"], "markdown");
+    assert!(std::fs::read_to_string(&target)
+        .unwrap()
+        .contains("hello md"));
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}

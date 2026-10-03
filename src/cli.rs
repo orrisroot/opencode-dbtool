@@ -278,6 +278,10 @@ pub struct SessionExportArgs {
     /// Write the export to this file instead of stdout
     #[arg(long, value_name = "FILE")]
     pub out: Option<PathBuf>,
+    /// Render the conversation as Markdown from the local database
+    /// (no running server needed)
+    #[arg(long)]
+    pub markdown: bool,
 }
 
 #[derive(Args)]
@@ -331,6 +335,9 @@ pub struct SessionShowArgs {
     /// Include message previews (oldest first)
     #[arg(long)]
     pub messages: bool,
+    /// Render the conversation as Markdown (requires --messages)
+    #[arg(long, requires = "messages", conflicts_with_all = ["limit", "last"])]
+    pub markdown: bool,
     /// Maximum number of message previews (requires --messages)
     #[arg(long, value_name = "N", requires = "messages")]
     pub limit: Option<usize>,
