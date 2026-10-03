@@ -482,8 +482,7 @@ pub fn cmd_session_export(
     let body = svc.export_session(&id)?;
     match out {
         Some(path) => {
-            std::fs::write(path, &body)
-                .map_err(|e| AppError::db(format!("cannot write {}: {e}", path.display())))?;
+            crate::util::write_private(path, body.as_bytes())?;
             output::emit(&serde_json::json!({
                 "db": db_path.to_string_lossy(),
                 "session": id,
@@ -601,8 +600,7 @@ pub fn session_purge_value(
             for id in &selected {
                 let body = svc.export_session(id)?;
                 let path = dir.join(format!("{id}.json"));
-                std::fs::write(&path, &body)
-                    .map_err(|e| AppError::db(format!("cannot write {}: {e}", path.display())))?;
+                crate::util::write_private(&path, body.as_bytes())?;
                 bytes += body.len() as u64;
             }
             Some(ExportSummary {

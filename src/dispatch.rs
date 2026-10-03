@@ -63,7 +63,9 @@ pub fn execute(mut cli: Cli) -> Result<()> {
             // Stop the service only when one is actually registered; with
             // none, fall through to the normal running-instance guard.
             let stop_service = restart && service.is_some() && idle.is_some();
-            check_restart_export(stop_service, command)?;
+            // A dry-run never stops the service, so the contradictory
+            // combination can still be previewed.
+            check_restart_export(stop_service && !cli.dry_run, command)?;
             // When the service is stopped for maintenance, run the direct
             // (offline) path instead of the server API.
             let service_for_run = if stop_service { None } else { service.as_ref() };

@@ -317,6 +317,34 @@ pub fn ensure_free_space(available: u64, needed: u64, what: &str) -> Result<()> 
     Ok(())
 }
 
+/// Write a file that contains session data with owner-only permissions
+/// (the database itself is 0600).
+pub fn write_private(path: &Path, data: &[u8]) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)
+            .map_err(|e| AppError::db(format!("cannot write {}: {e}", path.display())))?;
+        file.write_all(data)
+            .map_err(|e| AppError::db(format!("cannot write {}: {e}", path.display())))?;
+        // `mode` only applies on creation; fix up re-exported files.
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, data)
+            .map_err(|e| AppError::db(format!("cannot write {}: {e}", path.display())))?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -415,6 +443,25 @@ mod tests {
             "got: {err}"
         );
         assert!(err.message.contains("200 B"), "got: {err}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn write_private_creates_owner_only_files() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir =
+            std::env::temp_dir().join(format!("opencode-dbtool-private-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("x.json");
+        // Pre-create with loose permissions to exercise the fix-up path.
+        std::fs::write(&path, b"old").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        write_private(&path, b"secret").unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "secret");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
