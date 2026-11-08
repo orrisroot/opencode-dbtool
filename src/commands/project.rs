@@ -23,6 +23,7 @@ struct SessionDetailOut {
     archived: bool,
     events: i64,
     session_messages: i64,
+    session_parts: i64,
     cost: f64,
 }
 
@@ -116,11 +117,17 @@ pub fn cmd_project_show(con: &Connection, reference: &str) -> Result<()> {
 fn project_detail(con: &Connection, full: ProjectRow) -> Result<serde_json::Value> {
     use crate::db::SESSION_TABLE;
     let mut out = serde_json::to_value(project_json(&full))?;
+    let parts = if crate::db::table_exists(con, "session_part")? {
+        "(SELECT COUNT(*) FROM session_part sp WHERE sp.session_id = s.id)"
+    } else {
+        "0"
+    };
     let sql = format!(
         "SELECT id, COALESCE(title,''), parent_id, time_updated, \
          time_archived IS NOT NULL, \
          (SELECT COUNT(*) FROM event e WHERE e.aggregate_id = s.id), \
          (SELECT COUNT(*) FROM session_message sm WHERE sm.session_id = s.id), \
+         {parts}, \
          s.cost \
          FROM \"{SESSION_TABLE}\" s WHERE s.project_id = ?1 ORDER BY s.time_updated DESC"
     );
@@ -135,7 +142,8 @@ fn project_detail(con: &Connection, full: ProjectRow) -> Result<serde_json::Valu
                 archived: r.get(4)?,
                 events: r.get(5)?,
                 session_messages: r.get(6)?,
-                cost: crate::util::round4(r.get::<_, f64>(7)?),
+                session_parts: r.get(7)?,
+                cost: crate::util::round4(r.get::<_, f64>(8)?),
             })
         })?;
         rows.collect::<std::result::Result<Vec<_>, _>>()?
@@ -220,6 +228,16 @@ fn delete_output(
     if dry_run {
         return output::emit(&serde_json::to_value(&out)?);
     }
+    if projects.is_empty() {
+        // A filter match of zero projects is a normal no-op.
+        out.deleted = true;
+        out.note = Some(
+            "file size is unchanged until `opencode-dbtool vacuum` is run; \
+             run `fs clean-blob-orphans` to release orphan blobs"
+                .into(),
+        );
+        return output::emit(&serde_json::to_value(&out)?);
+    }
 
     let plist: String = (1..=projects.len())
         .map(|i| format!("?{i}"))
@@ -227,10 +245,21 @@ fn delete_output(
         .join(", ");
     let project_ids: Vec<&str> = projects.iter().map(|p| p.id.as_str()).collect();
     con.execute_batch("PRAGMA foreign_keys = ON;")?;
+    let has_jobs = crate::db::table_exists(con, "job")?;
     let tx = con.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     // event tables reference aggregates, not projects, so they must be
-    // deleted explicitly; sessions and their rows follow via ON DELETE
-    // CASCADE on the project row.
+    // deleted explicitly; job has no foreign keys either. Sessions and
+    // their rows follow via ON DELETE CASCADE on the project row. Media
+    // blobs are left for `fs clean-blob-orphans` (also run by `cleanup`).
+    if has_jobs {
+        tx.execute(
+            &format!(
+                "DELETE FROM job WHERE session_id IN (SELECT id FROM \"{SESSION_TABLE}\" WHERE project_id IN ({plist})) \
+                 OR child_session_id IN (SELECT id FROM \"{SESSION_TABLE}\" WHERE project_id IN ({plist}))"
+            ),
+            rusqlite::params_from_iter(&project_ids),
+        )?;
+    }
     tx.execute(
         &format!("DELETE FROM event WHERE aggregate_id IN (SELECT id FROM \"{SESSION_TABLE}\" WHERE project_id IN ({plist}))"),
         rusqlite::params_from_iter(&project_ids),
@@ -263,7 +292,11 @@ fn delete_output(
         ));
     }
     out.deleted = true;
-    out.note = Some("file size is unchanged until `opencode-dbtool vacuum` is run".into());
+    out.note = Some(
+        "file size is unchanged until `opencode-dbtool vacuum` is run; \
+         run `fs clean-blob-orphans` to release orphan blobs"
+            .into(),
+    );
     output::emit(&serde_json::to_value(&out)?)
 }
 
@@ -377,6 +410,28 @@ mod tests {
         cmd_project_purge(&mut con, &path_filter("/a"), true, Path::new("/tmp/x.db")).unwrap();
 
         assert_eq!(testdb::project_count(&con), 1);
+    }
+
+    #[test]
+    fn zero_match_purge_leaves_orphan_media_blobs() {
+        let mut con = testdb::create();
+        testdb::insert_media_blob(&con, "s1", "m1", "orphan", 3, false);
+
+        cmd_project_purge(
+            &mut con,
+            &path_filter("/nonexistent"),
+            false,
+            Path::new("/tmp/x.db"),
+        )
+        .unwrap();
+
+        assert_eq!(testdb::project_count(&con), 0);
+        assert_eq!(
+            con.query_row("SELECT COUNT(*) FROM blob", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            1,
+            "a zero-match purge must not delete unrelated media blobs"
+        );
     }
 
     #[test]

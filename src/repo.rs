@@ -2,22 +2,24 @@
 //! session/project tables lives here, so commands stay SQL-free
 //! and testable against a fake schema.
 //!
-//! V2-only (opencode 2.x): `session_v2`, `session_message`,
-//! `session_inbox`/`session_pending`, `instruction_*`, `worktree`.
+//! V2-only (opencode 2.x): `session_v2`, `session_message`, `session_part`
+//! (newer builds), `session_inbox`, `instruction_*`, `worktree`, plus the
+//! newer `blob`, `schedule`, and `job` tables when present.
 
-use crate::db::SESSION_TABLE;
+use crate::db::{table_exists, SESSION_TABLE};
 use crate::error::{AppError, Result};
 use crate::models::{ProjectRow, SessionMeta, SessionRow};
 use rusqlite::{params, Connection};
+use std::collections::HashMap;
 
 /// Per-session content tables: (table, id column, content columns).
 /// `instruction_state` is one row per session at most; its two value
-/// columns are summed per row.
+/// columns are summed per row. `session_part` is appended separately when
+/// the database has it (newer builds store assistant content there).
 const PER_SESSION_TABLES: &[(&str, &str, &[&str])] = &[
     ("event", "aggregate_id", &["data"]),
     ("session_message", "session_id", &["data"]),
     ("session_inbox", "session_id", &["payload"]),
-    ("session_pending", "session_id", &["data"]),
     ("instruction_entry", "session_id", &["value"]),
     (
         "instruction_state",
@@ -26,13 +28,16 @@ const PER_SESSION_TABLES: &[(&str, &str, &[&str])] = &[
     ),
 ];
 
+const SESSION_PART: (&str, &str, &[&str]) = ("session_part", "session_id", &["data"]);
+
 /// Column list shared by `load_sessions` and `load_session`: session base
 /// columns plus per-table count/byte aggregates.
 ///
-/// Order: id, title, directory, parent_id, time_updated, cost,
+/// Order: id, title, directory, parent_id, time_updated, cost, archived,
 /// event count/bytes, session_message count/bytes, inbox count/bytes,
-/// pending count/bytes, instruction_entry bytes, instruction_state bytes.
-fn session_cols() -> String {
+/// instruction_entry count/bytes, instruction_state count/bytes,
+/// session_part count/bytes, blob bytes (zero when the tables are absent).
+fn session_cols(con: &Connection) -> Result<String> {
     let mut cols = vec![
         "s.id".to_string(),
         "COALESCE(s.title,'')".to_string(),
@@ -54,7 +59,39 @@ fn session_cols() -> String {
             "(SELECT COALESCE(SUM({sum}),0) FROM \"{table}\" t WHERE t.\"{id_col}\" = s.id)"
         ));
     }
-    cols.join(", ")
+    if table_exists(con, SESSION_PART.0)? {
+        let (table, id_col, contents) = SESSION_PART;
+        let per_row: Vec<String> = contents
+            .iter()
+            .map(|c| format!("COALESCE(length(CAST(t.\"{c}\" AS BLOB)),0)"))
+            .collect();
+        cols.push(format!(
+            "(SELECT COUNT(*) FROM \"{table}\" t WHERE t.\"{id_col}\" = s.id)"
+        ));
+        cols.push(format!(
+            "(SELECT COALESCE(SUM({}),0) FROM \"{table}\" t WHERE t.\"{id_col}\" = s.id)",
+            per_row.join("+")
+        ));
+    } else {
+        cols.push("0".to_string());
+        cols.push("0".to_string());
+    }
+    if has_blobs(con)? {
+        cols.push(
+            "(SELECT COALESCE(SUM(b.bytes),0) FROM \
+              (SELECT DISTINCT hash FROM blob_ref WHERE session_id = s.id) r \
+              JOIN blob b ON b.hash = r.hash)"
+                .to_string(),
+        );
+    } else {
+        cols.push("0".to_string());
+    }
+    Ok(cols.join(", "))
+}
+
+/// Whether the newer media blob tables exist.
+fn has_blobs(con: &Connection) -> Result<bool> {
+    Ok(table_exists(con, "blob")? && table_exists(con, "blob_ref")?)
 }
 
 /// Session row columns as read by SQLite.
@@ -72,10 +109,11 @@ struct SessionAgg {
     sm_bytes: i64,
     inbox_msgs: i64,
     inbox_bytes: i64,
-    pending_msgs: i64,
-    pending_bytes: i64,
     instr_entry_bytes: i64,
     instr_state_bytes: i64,
+    part_msgs: i64,
+    part_bytes: i64,
+    blob_bytes: i64,
 }
 
 fn read_session_row(r: &rusqlite::Row) -> rusqlite::Result<SessionAgg> {
@@ -93,10 +131,11 @@ fn read_session_row(r: &rusqlite::Row) -> rusqlite::Result<SessionAgg> {
         sm_bytes: r.get(10)?,
         inbox_msgs: r.get(11)?,
         inbox_bytes: r.get(12)?,
-        pending_msgs: r.get(13)?,
-        pending_bytes: r.get(14)?,
-        instr_entry_bytes: r.get(15)?,
+        instr_entry_bytes: r.get(14)?,
         instr_state_bytes: r.get(16)?,
+        part_msgs: r.get(17)?,
+        part_bytes: r.get(18)?,
+        blob_bytes: r.get(19)?,
     })
 }
 
@@ -114,9 +153,10 @@ fn make_session_row(a: SessionAgg) -> SessionRow {
         sm_bytes: a.sm_bytes,
         inbox_msgs: a.inbox_msgs,
         inbox_bytes: a.inbox_bytes,
-        pending_msgs: a.pending_msgs,
-        pending_bytes: a.pending_bytes,
+        part_msgs: a.part_msgs,
+        part_bytes: a.part_bytes,
         instr_bytes: a.instr_entry_bytes + a.instr_state_bytes,
+        blob_bytes: a.blob_bytes,
         cost: a.cost,
     }
 }
@@ -157,7 +197,7 @@ pub fn session_sizes(
     if ids.is_empty() {
         return Ok(map);
     }
-    for (table, id_col, contents) in PER_SESSION_TABLES {
+    for (table, id_col, contents) in content_tables(con)? {
         let per_row: Vec<String> = contents
             .iter()
             .map(|c| format!("COALESCE(length(CAST(\"{c}\" AS BLOB)),0)"))
@@ -179,7 +219,37 @@ pub fn session_sizes(
             }
         }
     }
+    if has_blobs(con)? {
+        for chunk in ids.chunks(crate::util::SQL_VAR_CHUNK) {
+            let sql = format!(
+                "SELECT r.session_id, COALESCE(SUM(b.bytes),0) FROM \
+                 (SELECT DISTINCT session_id, hash FROM blob_ref WHERE session_id IN ({})) r \
+                 JOIN blob b ON b.hash = r.hash GROUP BY r.session_id",
+                in_clause(chunk)
+            );
+            let mut stmt = con.prepare(&sql)?;
+            let rows = stmt.query_map(rusqlite::params_from_iter(chunk), |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+            })?;
+            for r in rows {
+                let (id, bytes) = r?;
+                *map.entry(id).or_insert(0) += bytes;
+            }
+        }
+    }
     Ok(map)
+}
+
+/// Per-session content tables present in this database, including
+/// `session_part` on newer builds.
+fn content_tables(
+    con: &Connection,
+) -> Result<Vec<(&'static str, &'static str, &'static [&'static str])>> {
+    let mut tables = PER_SESSION_TABLES.to_vec();
+    if table_exists(con, SESSION_PART.0)? {
+        tables.push(SESSION_PART);
+    }
+    Ok(tables)
 }
 
 /// Direct children of a session (recursive subagent sessions).
@@ -340,7 +410,7 @@ pub fn resolve_project(con: &Connection, reference: &str) -> Result<ProjectRow> 
 
 /// All sessions with per-session counts and sizes.
 pub fn load_sessions(con: &Connection) -> Result<Vec<SessionRow>> {
-    let cols = session_cols();
+    let cols = session_cols(con)?;
     let sql =
         format!("SELECT {cols} FROM \"{SESSION_TABLE}\" s ORDER BY s.time_updated DESC, s.id");
     let mut stmt = con.prepare(&sql)?;
@@ -359,7 +429,7 @@ pub fn load_sessions_by_ids(con: &Connection, ids: &[String]) -> Result<Vec<Sess
     if ids.is_empty() {
         return Ok(Vec::new());
     }
-    let cols = session_cols();
+    let cols = session_cols(con)?;
     let mut map: std::collections::HashMap<String, SessionRow> = std::collections::HashMap::new();
     for chunk in ids.chunks(crate::util::SQL_VAR_CHUNK) {
         let sql = format!(
@@ -403,7 +473,7 @@ pub fn message_counts(
 /// A single session by exact id, with the same aggregate columns as
 /// `load_sessions`; `None` when the id is unknown.
 pub fn load_session(con: &Connection, id: &str) -> Result<Option<SessionRow>> {
-    let cols = session_cols();
+    let cols = session_cols(con)?;
     let sql = format!("SELECT {cols} FROM \"{SESSION_TABLE}\" s WHERE s.id = ?1");
     match con.query_row(&sql, params![id], read_session_row) {
         Ok(a) => Ok(Some(make_session_row(a))),
@@ -414,6 +484,27 @@ pub fn load_session(con: &Connection, id: &str) -> Result<Option<SessionRow>> {
 
 /// All projects with aggregated session stats.
 pub fn load_projects(con: &Connection) -> Result<Vec<ProjectRow>> {
+    let (part_msgs, part_bytes) = if table_exists(con, SESSION_PART.0)? {
+        (
+            format!(
+                "(SELECT COUNT(*) FROM session_part t JOIN \"{SESSION_TABLE}\" s ON t.session_id = s.id WHERE s.project_id = p.id)"
+            ),
+            format!(
+                "(SELECT COALESCE(SUM(COALESCE(length(CAST(t.data AS BLOB)),0)),0) FROM session_part t JOIN \"{SESSION_TABLE}\" s ON t.session_id = s.id WHERE s.project_id = p.id)"
+            ),
+        )
+    } else {
+        ("0".to_string(), "0".to_string())
+    };
+    let blob_bytes = if has_blobs(con)? {
+        format!(
+            "(SELECT COALESCE(SUM(b.bytes),0) FROM \
+              (SELECT DISTINCT br.hash FROM blob_ref br JOIN \"{SESSION_TABLE}\" s ON br.session_id = s.id WHERE s.project_id = p.id) r \
+              JOIN blob b ON b.hash = r.hash)"
+        )
+    } else {
+        "0".to_string()
+    };
     let sql = format!(
         "SELECT p.id, p.worktree, COALESCE(p.name,''), \
          (SELECT COUNT(*) FROM \"{SESSION_TABLE}\" s WHERE s.project_id = p.id), \
@@ -422,9 +513,9 @@ pub fn load_projects(con: &Connection) -> Result<Vec<ProjectRow>> {
          (SELECT COUNT(*) FROM event t JOIN \"{SESSION_TABLE}\" s ON t.aggregate_id = s.id WHERE s.project_id = p.id), \
          (SELECT COALESCE(SUM(COALESCE(length(CAST(t.data AS BLOB)),0)),0) FROM event t JOIN \"{SESSION_TABLE}\" s ON t.aggregate_id = s.id WHERE s.project_id = p.id), \
          (SELECT COALESCE(SUM(COALESCE(length(CAST(t.payload AS BLOB)),0)),0) FROM session_inbox t JOIN \"{SESSION_TABLE}\" s ON t.session_id = s.id WHERE s.project_id = p.id), \
-         (SELECT COALESCE(SUM(COALESCE(length(CAST(t.data AS BLOB)),0)),0) FROM session_pending t JOIN \"{SESSION_TABLE}\" s ON t.session_id = s.id WHERE s.project_id = p.id), \
          (SELECT COALESCE(SUM(COALESCE(length(CAST(t.value AS BLOB)),0)),0) FROM instruction_entry t JOIN \"{SESSION_TABLE}\" s ON t.session_id = s.id WHERE s.project_id = p.id) \
           + (SELECT COALESCE(SUM(COALESCE(length(CAST(t.initial_values AS BLOB)),0)+COALESCE(length(CAST(t.current_values AS BLOB)),0)),0) FROM instruction_state t JOIN \"{SESSION_TABLE}\" s ON t.session_id = s.id WHERE s.project_id = p.id), \
+         {part_msgs}, {part_bytes}, {blob_bytes}, \
          (SELECT COALESCE(SUM(cost),0) FROM \"{SESSION_TABLE}\" s WHERE s.project_id = p.id), \
          (SELECT COALESCE(MAX(time_updated),0) FROM \"{SESSION_TABLE}\" s WHERE s.project_id = p.id) \
          FROM project p ORDER BY p.worktree"
@@ -441,10 +532,12 @@ pub fn load_projects(con: &Connection) -> Result<Vec<ProjectRow>> {
             events: r.get(6)?,
             event_bytes: r.get(7)?,
             inbox_bytes: r.get(8)?,
-            pending_bytes: r.get(9)?,
-            instr_bytes: r.get(10)?,
-            cost: r.get(11)?,
-            updated: r.get(12)?,
+            instr_bytes: r.get(9)?,
+            part_msgs: r.get(10)?,
+            part_bytes: r.get(11)?,
+            blob_bytes: r.get(12)?,
+            cost: r.get(13)?,
+            updated: r.get(14)?,
         })
     })?;
     Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
@@ -472,8 +565,10 @@ fn project_row_from_row(r: &rusqlite::Row) -> rusqlite::Result<ProjectRow> {
         events: 0,
         event_bytes: 0,
         inbox_bytes: 0,
-        pending_bytes: 0,
         instr_bytes: 0,
+        part_msgs: 0,
+        part_bytes: 0,
+        blob_bytes: 0,
         cost: 0.0,
         updated: 0,
     })
@@ -501,9 +596,13 @@ fn in_clause(ids: &[String]) -> String {
     vec!["?"; ids.len()].join(",")
 }
 
-/// Durable reasoning event types (`session.next.reasoning.delta` is
-/// live-only and never persisted).
-const REASONING_EVENT_TYPES: [&str; 2] = [
+/// Durable reasoning event types: current opencode builds use
+/// `session.reasoning.*`; older 2.x builds used `session.next.reasoning.*`.
+/// Both are stripped so a migrated database does not keep legacy copies.
+/// `*.delta` is live-only and never persisted.
+const REASONING_EVENT_TYPES: [&str; 4] = [
+    "session.reasoning.started",
+    "session.reasoning.ended",
     "session.next.reasoning.started",
     "session.next.reasoning.ended",
 ];
@@ -525,61 +624,132 @@ fn reasoning_event_params(ids: &[String]) -> Vec<rusqlite::types::Value> {
 /// Per-session reasoning event counts and bytes for the given ids.
 /// Sessions without matching events are omitted.
 pub fn reasoning_event_counts(con: &Connection, ids: &[String]) -> Result<Vec<(String, i64, i64)>> {
-    if ids.is_empty() {
+    let mut out = Vec::new();
+    for chunk in ids.chunks(crate::util::SQL_VAR_CHUNK) {
+        let sql = format!(
+            "SELECT aggregate_id, COUNT(*), COALESCE(SUM(length(CAST(data AS BLOB))),0) \
+             FROM event WHERE aggregate_id IN ({}) AND type IN ({}) \
+             GROUP BY aggregate_id",
+            in_clause(chunk),
+            vec!["?"; REASONING_EVENT_TYPES.len()].join(",")
+        );
+        let mut stmt = con.prepare(&sql)?;
+        let rows = stmt.query_map(
+            rusqlite::params_from_iter(reasoning_event_params(chunk)),
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, i64>(2)?,
+                ))
+            },
+        )?;
+        for row in rows {
+            out.push(row?);
+        }
+    }
+    Ok(out)
+}
+
+/// Delete reasoning events for the given ids; returns rows removed.
+pub fn strip_reasoning_events(con: &Connection, ids: &[String]) -> Result<usize> {
+    let mut removed = 0;
+    for chunk in ids.chunks(crate::util::SQL_VAR_CHUNK) {
+        let sql = format!(
+            "DELETE FROM event WHERE aggregate_id IN ({}) AND type IN ({})",
+            in_clause(chunk),
+            vec!["?"; REASONING_EVENT_TYPES.len()].join(",")
+        );
+        removed += con.execute(
+            &sql,
+            rusqlite::params_from_iter(reasoning_event_params(chunk)),
+        )?;
+    }
+    Ok(removed)
+}
+
+/// Reasoning events remaining for the given ids (post-strip verification).
+pub fn reasoning_events_left(con: &Connection, ids: &[String]) -> Result<i64> {
+    let mut left = 0;
+    for chunk in ids.chunks(crate::util::SQL_VAR_CHUNK) {
+        let sql = format!(
+            "SELECT COUNT(*) FROM event WHERE aggregate_id IN ({}) AND type IN ({})",
+            in_clause(chunk),
+            vec!["?"; REASONING_EVENT_TYPES.len()].join(",")
+        );
+        left += con.query_row(
+            &sql,
+            rusqlite::params_from_iter(reasoning_event_params(chunk)),
+            |r| r.get::<_, i64>(0),
+        )?;
+    }
+    Ok(left)
+}
+
+/// Per-session reasoning `session_part` counts and bytes for the given ids.
+/// Sessions without reasoning parts are omitted. Empty when the database
+/// predates `session_part` (all content is inline on the message there).
+pub fn reasoning_part_counts(con: &Connection, ids: &[String]) -> Result<Vec<(String, i64, i64)>> {
+    if ids.is_empty() || !table_exists(con, SESSION_PART.0)? {
         return Ok(Vec::new());
     }
-    let sql = format!(
-        "SELECT aggregate_id, COUNT(*), COALESCE(SUM(length(CAST(data AS BLOB))),0) \
-         FROM event WHERE aggregate_id IN ({}) AND type IN ({}) \
-         GROUP BY aggregate_id",
-        in_clause(ids),
-        vec!["?"; REASONING_EVENT_TYPES.len()].join(",")
-    );
-    let mut stmt = con.prepare(&sql)?;
-    let rows = stmt.query_map(
-        rusqlite::params_from_iter(reasoning_event_params(ids)),
-        |r| {
+    let mut out = Vec::new();
+    for chunk in ids.chunks(crate::util::SQL_VAR_CHUNK) {
+        let sql = format!(
+            "SELECT session_id, COUNT(*), COALESCE(SUM(length(CAST(data AS BLOB))),0) \
+             FROM session_part WHERE session_id IN ({}) AND type = 'reasoning' \
+             GROUP BY session_id",
+            in_clause(chunk)
+        );
+        let mut stmt = con.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(chunk), |r| {
             Ok((
                 r.get::<_, String>(0)?,
                 r.get::<_, i64>(1)?,
                 r.get::<_, i64>(2)?,
             ))
-        },
-    )?;
-    Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+        })?;
+        for row in rows {
+            out.push(row?);
+        }
+    }
+    Ok(out)
 }
 
-/// Delete reasoning events for the given ids; returns rows removed.
-pub fn strip_reasoning_events(con: &Connection, ids: &[String]) -> Result<usize> {
-    if ids.is_empty() {
+/// Delete reasoning `session_part` rows for the given sessions; returns
+/// rows removed.
+pub fn strip_reasoning_parts(con: &Connection, ids: &[String]) -> Result<usize> {
+    if ids.is_empty() || !table_exists(con, SESSION_PART.0)? {
         return Ok(0);
     }
-    let sql = format!(
-        "DELETE FROM event WHERE aggregate_id IN ({}) AND type IN ({})",
-        in_clause(ids),
-        vec!["?"; REASONING_EVENT_TYPES.len()].join(",")
-    );
-    Ok(con.execute(
-        &sql,
-        rusqlite::params_from_iter(reasoning_event_params(ids)),
-    )?)
+    let mut removed = 0;
+    for chunk in ids.chunks(crate::util::SQL_VAR_CHUNK) {
+        let sql = format!(
+            "DELETE FROM session_part WHERE session_id IN ({}) AND type = 'reasoning'",
+            in_clause(chunk)
+        );
+        removed += con.execute(&sql, rusqlite::params_from_iter(chunk))?;
+    }
+    Ok(removed)
 }
 
-/// Reasoning events remaining for the given ids (post-strip verification).
-pub fn reasoning_events_left(con: &Connection, ids: &[String]) -> Result<i64> {
-    if ids.is_empty() {
+/// Reasoning `session_part` rows remaining for the given ids (post-strip
+/// verification).
+pub fn reasoning_parts_left(con: &Connection, ids: &[String]) -> Result<i64> {
+    if ids.is_empty() || !table_exists(con, SESSION_PART.0)? {
         return Ok(0);
     }
-    let sql = format!(
-        "SELECT COUNT(*) FROM event WHERE aggregate_id IN ({}) AND type IN ({})",
-        in_clause(ids),
-        vec!["?"; REASONING_EVENT_TYPES.len()].join(",")
-    );
-    Ok(con.query_row(
-        &sql,
-        rusqlite::params_from_iter(reasoning_event_params(ids)),
-        |r| r.get(0),
-    )?)
+    let mut left = 0;
+    for chunk in ids.chunks(crate::util::SQL_VAR_CHUNK) {
+        let sql = format!(
+            "SELECT COUNT(*) FROM session_part WHERE session_id IN ({}) AND type = 'reasoning'",
+            in_clause(chunk)
+        );
+        left += con.query_row(&sql, rusqlite::params_from_iter(chunk), |r| {
+            r.get::<_, i64>(0)
+        })?;
+    }
+    Ok(left)
 }
 
 /// Assistant `session_message` rows (id, session_id, data) for the
@@ -588,23 +758,26 @@ pub fn assistant_messages(
     con: &Connection,
     ids: &[String],
 ) -> Result<Vec<(String, String, String)>> {
-    if ids.is_empty() {
-        return Ok(Vec::new());
+    let mut out = Vec::new();
+    for chunk in ids.chunks(crate::util::SQL_VAR_CHUNK) {
+        let sql = format!(
+            "SELECT id, session_id, data FROM session_message \
+             WHERE session_id IN ({}) AND type = 'assistant' ORDER BY session_id, seq",
+            in_clause(chunk)
+        );
+        let mut stmt = con.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(chunk), |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        })?;
+        for row in rows {
+            out.push(row?);
+        }
     }
-    let sql = format!(
-        "SELECT id, session_id, data FROM session_message \
-         WHERE session_id IN ({}) AND type = 'assistant' ORDER BY session_id, seq",
-        in_clause(ids)
-    );
-    let mut stmt = con.prepare(&sql)?;
-    let rows = stmt.query_map(rusqlite::params_from_iter(ids), |r| {
-        Ok((
-            r.get::<_, String>(0)?,
-            r.get::<_, String>(1)?,
-            r.get::<_, String>(2)?,
-        ))
-    })?;
-    Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    Ok(out)
 }
 
 /// Rewrite a session_message row's data payload.
@@ -619,27 +792,55 @@ pub fn rewrite_message(con: &Connection, id: &str, data: &str) -> Result<()> {
 /// Assistant messages still containing reasoning content (post-strip
 /// verification).
 pub fn reasoning_messages_left(con: &Connection, ids: &[String]) -> Result<i64> {
-    if ids.is_empty() {
-        return Ok(0);
+    let mut left = 0;
+    for chunk in ids.chunks(crate::util::SQL_VAR_CHUNK) {
+        let sql = format!(
+            "SELECT COUNT(*) FROM session_message WHERE session_id IN ({}) \
+             AND type = 'assistant' \
+             AND (EXISTS (SELECT 1 FROM json_each( \
+                            CASE WHEN json_valid(data) AND json_type(data, '$.content') = 'array' \
+                                 THEN data ELSE '[]' END, '$.content') \
+                         WHERE json_extract(value, '$.type') = 'reasoning') \
+                  OR (NOT json_valid(data) AND data LIKE '%\"type\":\"reasoning\"%'))",
+            in_clause(chunk)
+        );
+        left += con.query_row(&sql, rusqlite::params_from_iter(chunk), |r| {
+            r.get::<_, i64>(0)
+        })?;
     }
-    let sql = format!(
-        "SELECT COUNT(*) FROM session_message WHERE session_id IN ({}) \
-         AND type = 'assistant' \
-         AND (EXISTS (SELECT 1 FROM json_each( \
-                        CASE WHEN json_valid(data) AND json_type(data, '$.content') = 'array' \
-                             THEN data ELSE '[]' END, '$.content') \
-                     WHERE json_extract(value, '$.type') = 'reasoning') \
-              OR (NOT json_valid(data) AND data LIKE '%\"type\":\"reasoning\"%'))",
-        in_clause(ids)
-    );
-    Ok(con.query_row(&sql, rusqlite::params_from_iter(ids), |r| r.get(0))?)
+    Ok(left)
+}
+
+/// Which content-addressed blob table an orphan came from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BlobKind {
+    /// `instruction_blob`: referenced by `instruction_state` JSON by hash.
+    Instruction,
+    /// `blob`: media referenced by `blob_ref`.
+    Media,
+}
+
+impl BlobKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            BlobKind::Instruction => "instruction",
+            BlobKind::Media => "media",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OrphanBlob {
+    pub hash: String,
+    pub bytes: i64,
+    pub kind: BlobKind,
 }
 
 /// `instruction_blob` rows whose hash is referenced by no
 /// `instruction_state` row (the blobs leak when sessions are deleted:
 /// states cascade but the content-addressed blobs have no FK).
 /// Ordered by hash for stable output.
-pub fn blob_orphans(con: &Connection) -> Result<Vec<(String, i64)>> {
+fn instruction_blob_orphans(con: &Connection) -> Result<Vec<(String, i64)>> {
     let hashes: Vec<String> = {
         let mut stmt = con.prepare("SELECT hash FROM instruction_blob ORDER BY hash")?;
         let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
@@ -665,7 +866,45 @@ pub fn blob_orphans(con: &Connection) -> Result<Vec<(String, i64)>> {
     Ok(out)
 }
 
-/// Delete all orphan `instruction_blob` rows; returns (rows, bytes).
+/// `blob` rows referenced by no `blob_ref`. opencode releases these when a
+/// session or message is deleted; a direct SQL delete by this tool leaves
+/// them behind for this cleanup.
+fn media_blob_orphans(con: &Connection) -> Result<Vec<(String, i64)>> {
+    if !table_exists(con, "blob")? || !table_exists(con, "blob_ref")? {
+        return Ok(Vec::new());
+    }
+    let mut stmt = con.prepare(
+        "SELECT hash, COALESCE(bytes, length(data), 0) FROM blob \
+         WHERE hash NOT IN (SELECT hash FROM blob_ref) ORDER BY hash",
+    )?;
+    let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
+    Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+}
+
+/// Orphans from both content-addressed blob tables (instruction and
+/// media), ordered by kind then hash.
+pub fn blob_orphans(con: &Connection) -> Result<Vec<OrphanBlob>> {
+    let mut out: Vec<OrphanBlob> = instruction_blob_orphans(con)?
+        .into_iter()
+        .map(|(hash, bytes)| OrphanBlob {
+            hash,
+            bytes,
+            kind: BlobKind::Instruction,
+        })
+        .collect();
+    out.extend(
+        media_blob_orphans(con)?
+            .into_iter()
+            .map(|(hash, bytes)| OrphanBlob {
+                hash,
+                bytes,
+                kind: BlobKind::Media,
+            }),
+    );
+    Ok(out)
+}
+
+/// Delete every orphan blob row; returns (rows, bytes).
 pub fn delete_blob_orphans(con: &mut Connection) -> Result<(usize, u64)> {
     let orphans = blob_orphans(con)?;
     if orphans.is_empty() {
@@ -675,26 +914,74 @@ pub fn delete_blob_orphans(con: &mut Connection) -> Result<(usize, u64)> {
     let tx = con.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     let mut rows = 0;
     let mut bytes = 0u64;
-    for (hash, b) in &orphans {
+    for orphan in &orphans {
         // Re-check inside the transaction: a concurrent opencode could
-        // have stored a state referencing this blob after the scan.
-        let refs: i64 = tx.query_row(
-            "SELECT COUNT(*) FROM instruction_state \
-             WHERE initial_values LIKE '%'||?1||'%' OR current_values LIKE '%'||?1||'%'",
-            params![hash],
-            |r| r.get(0),
-        )?;
+        // have stored a reference after the scan.
+        let refs: i64 = match orphan.kind {
+            BlobKind::Instruction => tx.query_row(
+                "SELECT COUNT(*) FROM instruction_state \
+                 WHERE initial_values LIKE '%'||?1||'%' OR current_values LIKE '%'||?1||'%'",
+                params![orphan.hash],
+                |r| r.get(0),
+            )?,
+            BlobKind::Media => tx.query_row(
+                "SELECT COUNT(*) FROM blob_ref WHERE hash = ?1",
+                params![orphan.hash],
+                |r| r.get(0),
+            )?,
+        };
         if refs > 0 {
             continue;
         }
+        let table = match orphan.kind {
+            BlobKind::Instruction => "instruction_blob",
+            BlobKind::Media => "blob",
+        };
         rows += tx.execute(
-            "DELETE FROM instruction_blob WHERE hash = ?1",
-            params![hash],
+            &format!("DELETE FROM \"{table}\" WHERE hash = ?1"),
+            params![orphan.hash],
         )?;
-        bytes += *b as u64;
+        bytes += orphan.bytes as u64;
     }
     tx.commit()?;
     Ok((rows, bytes))
+}
+
+/// `job` rows whose session (or child session) no longer exists. The table
+/// has no foreign keys, so direct SQL deletes can leave rows behind.
+pub fn job_orphans(con: &Connection) -> Result<Vec<String>> {
+    if !table_exists(con, "job")? {
+        return Ok(Vec::new());
+    }
+    let mut stmt = con.prepare(&format!(
+        "SELECT notification_id FROM job \
+         WHERE session_id NOT IN (SELECT id FROM \"{SESSION_TABLE}\") \
+            OR (child_session_id IS NOT NULL AND child_session_id != '' \
+                AND child_session_id NOT IN (SELECT id FROM \"{SESSION_TABLE}\")) \
+         ORDER BY notification_id"
+    ))?;
+    let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+    Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+}
+
+/// Delete orphan `job` rows; returns rows removed.
+pub fn delete_orphan_jobs(con: &mut Connection) -> Result<usize> {
+    if !table_exists(con, "job")? {
+        return Ok(0);
+    }
+    con.execute_batch("PRAGMA foreign_keys = ON;")?;
+    let tx = con.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let rows = tx.execute(
+        &format!(
+            "DELETE FROM job \
+             WHERE session_id NOT IN (SELECT id FROM \"{SESSION_TABLE}\") \
+                OR (child_session_id IS NOT NULL AND child_session_id != '' \
+                    AND child_session_id NOT IN (SELECT id FROM \"{SESSION_TABLE}\"))"
+        ),
+        [],
+    )?;
+    tx.commit()?;
+    Ok(rows)
 }
 
 /// Delete `event`/`event_sequence` rows whose aggregate is neither a
@@ -771,14 +1058,89 @@ pub fn clear_missing_workspaces(con: &Connection) -> Result<usize> {
     )?)
 }
 
-/// One `session_message` row for content previews.
+/// One `session_part` row stored for an assistant message.
+pub struct ListedPart {
+    pub bytes: i64,
+    pub data: String,
+}
+
+/// One `session_message` row for content previews, with its
+/// `session_part` rows (newer builds) attached.
 pub struct ListedMessage {
     pub id: String,
     pub msg_type: String,
     pub seq: i64,
     pub created: i64,
+    /// Stored bytes: the message envelope plus every attached part.
     pub bytes: i64,
     pub data: String,
+    pub parts: Vec<ListedPart>,
+}
+
+impl ListedMessage {
+    /// The message payload with `session_part` rows folded into
+    /// `content`, parts first and any legacy inline content after them
+    /// (the same order opencode reads them in).
+    pub fn merged_data(&self) -> String {
+        if self.parts.is_empty() {
+            return self.data.clone();
+        }
+        let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&self.data) else {
+            return self.data.clone();
+        };
+        let Some(obj) = value.as_object_mut() else {
+            return self.data.clone();
+        };
+        let mut content: Vec<serde_json::Value> = self
+            .parts
+            .iter()
+            .filter_map(|p| serde_json::from_str(&p.data).ok())
+            .collect();
+        if let Some(inline) = obj.get("content").and_then(|c| c.as_array()) {
+            content.extend(inline.iter().cloned());
+        }
+        obj.insert("content".to_string(), serde_json::Value::Array(content));
+        serde_json::to_string(&value).unwrap_or_else(|_| self.data.clone())
+    }
+}
+
+/// Attach the `session_part` rows belonging to `rows` (one query per
+/// chunk). Databases without the table leave the messages untouched.
+fn attach_parts(con: &Connection, rows: &mut [ListedMessage]) -> Result<()> {
+    if rows.is_empty() || !table_exists(con, SESSION_PART.0)? {
+        return Ok(());
+    }
+    let ids: Vec<String> = rows.iter().map(|r| r.id.clone()).collect();
+    let mut parts: HashMap<String, Vec<ListedPart>> = HashMap::new();
+    for chunk in ids.chunks(crate::util::SQL_VAR_CHUNK) {
+        let sql = format!(
+            "SELECT message_id, COALESCE(length(CAST(data AS BLOB)),0), data \
+             FROM session_part WHERE message_id IN ({}) \
+             ORDER BY message_id, ordinal",
+            in_clause(chunk)
+        );
+        let mut stmt = con.prepare(&sql)?;
+        let found = stmt.query_map(rusqlite::params_from_iter(chunk), |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                ListedPart {
+                    bytes: r.get(1)?,
+                    data: r.get(2)?,
+                },
+            ))
+        })?;
+        for row in found {
+            let (message_id, part) = row?;
+            parts.entry(message_id).or_default().push(part);
+        }
+    }
+    for row in rows {
+        if let Some(found) = parts.remove(&row.id) {
+            row.bytes += found.iter().map(|p| p.bytes).sum::<i64>();
+            row.parts = found;
+        }
+    }
+    Ok(())
 }
 
 /// Total `session_message` count plus the oldest `limit` rows (conversation
@@ -805,9 +1167,12 @@ pub fn list_messages(
             created: r.get(3)?,
             bytes: r.get(4)?,
             data: r.get(5)?,
+            parts: Vec::new(),
         })
     })?;
-    Ok((total, rows.collect::<std::result::Result<Vec<_>, _>>()?))
+    let mut rows = rows.collect::<std::result::Result<Vec<_>, _>>()?;
+    attach_parts(con, &mut rows)?;
+    Ok((total, rows))
 }
 
 /// Total `session_message` count plus every row (conversation order).
@@ -829,9 +1194,12 @@ pub fn list_all_messages(con: &Connection, session_id: &str) -> Result<(i64, Vec
             created: r.get(3)?,
             bytes: r.get(4)?,
             data: r.get(5)?,
+            parts: Vec::new(),
         })
     })?;
-    Ok((total, rows.collect::<std::result::Result<Vec<_>, _>>()?))
+    let mut rows = rows.collect::<std::result::Result<Vec<_>, _>>()?;
+    attach_parts(con, &mut rows)?;
+    Ok((total, rows))
 }
 
 /// Total `session_message` count plus the newest `limit` rows (oldest
@@ -860,26 +1228,182 @@ pub fn list_messages_tail(
             created: r.get(3)?,
             bytes: r.get(4)?,
             data: r.get(5)?,
+            parts: Vec::new(),
         })
     })?;
-    Ok((total, rows.collect::<std::result::Result<Vec<_>, _>>()?))
+    let mut rows = rows.collect::<std::result::Result<Vec<_>, _>>()?;
+    attach_parts(con, &mut rows)?;
+    Ok((total, rows))
+}
+
+/// One session matching a content search.
+pub struct SearchHit {
+    pub session_id: String,
+    pub matches: i64,
+    pub updated: i64,
+}
+
+/// One matching message or part row.
+pub struct SearchSnippet {
+    pub message_id: String,
+    pub msg_type: String,
+    /// `message` for `session_message`, `part` for `session_part`.
+    pub source: &'static str,
+    pub created: i64,
+    pub data: String,
+}
+
+/// Sessions whose message content (including `session_part` rows) matches
+/// `pattern`, newest activity first.
+pub fn search_hits(
+    con: &Connection,
+    pattern: &str,
+    cutoff: Option<i64>,
+    limit: usize,
+) -> Result<Vec<SearchHit>> {
+    let parts = table_exists(con, SESSION_PART.0)?;
+    let union = if parts {
+        format!(
+            "SELECT sm.session_id AS session_id, s.time_updated AS updated \
+             FROM session_message sm JOIN \"{SESSION_TABLE}\" s ON s.id = sm.session_id \
+             WHERE sm.data LIKE ?1 ESCAPE '\\' AND (?2 IS NULL OR s.time_updated >= ?2) \
+             UNION ALL \
+             SELECT sp.session_id AS session_id, s.time_updated AS updated \
+             FROM session_part sp JOIN \"{SESSION_TABLE}\" s ON s.id = sp.session_id \
+             WHERE sp.data LIKE ?1 ESCAPE '\\' AND (?2 IS NULL OR s.time_updated >= ?2)"
+        )
+    } else {
+        format!(
+            "SELECT sm.session_id AS session_id, s.time_updated AS updated \
+             FROM session_message sm JOIN \"{SESSION_TABLE}\" s ON s.id = sm.session_id \
+             WHERE sm.data LIKE ?1 ESCAPE '\\' AND (?2 IS NULL OR s.time_updated >= ?2)"
+        )
+    };
+    let sql = format!(
+        "SELECT session_id, COUNT(*), MAX(updated) FROM ({union}) \
+         GROUP BY session_id ORDER BY MAX(updated) DESC LIMIT ?3"
+    );
+    let mut stmt = con.prepare(&sql)?;
+    let rows = stmt.query_map(params![pattern, cutoff, limit as i64], |r| {
+        Ok(SearchHit {
+            session_id: r.get(0)?,
+            matches: r.get(1)?,
+            updated: r.get(2)?,
+        })
+    })?;
+    Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+}
+
+/// Matching rows for one session (message envelopes and parts), newest
+/// first, at most `limit` rows.
+pub fn search_snippets(
+    con: &Connection,
+    session_id: &str,
+    pattern: &str,
+    limit: usize,
+) -> Result<Vec<SearchSnippet>> {
+    let mut out = Vec::new();
+    {
+        let mut stmt = con.prepare(
+            "SELECT id, type, time_created, data FROM session_message \
+             WHERE session_id = ?1 AND data LIKE ?2 ESCAPE '\\' \
+             ORDER BY seq, id LIMIT ?3",
+        )?;
+        let rows = stmt.query_map(params![session_id, pattern, limit as i64], |r| {
+            Ok(SearchSnippet {
+                message_id: r.get(0)?,
+                msg_type: r.get(1)?,
+                source: "message",
+                created: r.get(2)?,
+                data: r.get(3)?,
+            })
+        })?;
+        out.extend(rows.collect::<std::result::Result<Vec<_>, _>>()?);
+    }
+    if table_exists(con, SESSION_PART.0)? {
+        let mut stmt = con.prepare(
+            "SELECT message_id, type, time_created, data FROM session_part \
+             WHERE session_id = ?1 AND data LIKE ?2 ESCAPE '\\' \
+             ORDER BY time_created, message_id, ordinal LIMIT ?3",
+        )?;
+        let rows = stmt.query_map(params![session_id, pattern, limit as i64], |r| {
+            Ok(SearchSnippet {
+                message_id: r.get(0)?,
+                msg_type: r.get(1)?,
+                source: "part",
+                created: r.get(2)?,
+                data: r.get(3)?,
+            })
+        })?;
+        out.extend(rows.collect::<std::result::Result<Vec<_>, _>>()?);
+    }
+    out.sort_by(|a, b| {
+        a.created
+            .cmp(&b.created)
+            .then_with(|| a.message_id.cmp(&b.message_id))
+            .then_with(|| a.source.cmp(b.source))
+    });
+    out.truncate(limit);
+    Ok(out)
 }
 
 /// Per-table row counts for a project delete preview, including the
-/// project row itself and every cascade-eligible table.
+/// project row itself and every cascade-eligible table. Tables missing
+/// from older databases report 0 so the output shape stays stable.
 pub fn project_impact(con: &Connection, project_id: &str) -> Result<Vec<(String, i64)>> {
-    let sql = format!(
-        "SELECT 'session_v2', COUNT(*) FROM \"{SESSION_TABLE}\" WHERE project_id = ?1 \
-         UNION ALL SELECT 'session_message', (SELECT COUNT(*) FROM session_message t JOIN \"{SESSION_TABLE}\" s ON t.session_id = s.id WHERE s.project_id = ?1) \
-         UNION ALL SELECT 'session_inbox', (SELECT COUNT(*) FROM session_inbox t JOIN \"{SESSION_TABLE}\" s ON t.session_id = s.id WHERE s.project_id = ?1) \
-         UNION ALL SELECT 'session_pending', (SELECT COUNT(*) FROM session_pending t JOIN \"{SESSION_TABLE}\" s ON t.session_id = s.id WHERE s.project_id = ?1) \
-         UNION ALL SELECT 'instruction_entry', (SELECT COUNT(*) FROM instruction_entry t JOIN \"{SESSION_TABLE}\" s ON t.session_id = s.id WHERE s.project_id = ?1) \
-         UNION ALL SELECT 'instruction_state', (SELECT COUNT(*) FROM instruction_state t JOIN \"{SESSION_TABLE}\" s ON t.session_id = s.id WHERE s.project_id = ?1) \
-         UNION ALL SELECT 'permission', COUNT(*) FROM permission WHERE project_id = ?1 \
-         UNION ALL SELECT 'worktree', COUNT(*) FROM worktree WHERE project_id = ?1 \
-         UNION ALL SELECT 'event', (SELECT COUNT(*) FROM event e WHERE e.aggregate_id IN (SELECT id FROM \"{SESSION_TABLE}\" WHERE project_id = ?1)) \
-         UNION ALL SELECT 'event_sequence', (SELECT COUNT(*) FROM event_sequence es WHERE es.aggregate_id IN (SELECT id FROM \"{SESSION_TABLE}\" WHERE project_id = ?1))"
+    let session = SESSION_TABLE;
+    let mut terms: Vec<String> = Vec::new();
+    terms.push(
+        "SELECT 'session_v2', (SELECT COUNT(*) FROM \"session_v2\" WHERE project_id = ?1)"
+            .to_string(),
     );
+    for table in [
+        "session_message",
+        "session_part",
+        "session_inbox",
+        "instruction_entry",
+        "instruction_state",
+        "schedule",
+        "blob_ref",
+    ] {
+        if table_exists(con, table)? {
+            terms.push(format!(
+                "SELECT '{table}', (SELECT COUNT(*) FROM \"{table}\" t JOIN \"{session}\" s ON t.session_id = s.id WHERE s.project_id = ?1)"
+            ));
+        } else {
+            terms.push(format!("SELECT '{table}', 0"));
+        }
+    }
+    for (table, col) in [
+        ("permission", "project_id"),
+        ("project_directory", "project_id"),
+        ("worktree", "project_id"),
+    ] {
+        if table_exists(con, table)? {
+            terms.push(format!(
+                "SELECT '{table}', (SELECT COUNT(*) FROM \"{table}\" WHERE \"{col}\" = ?1)"
+            ));
+        } else {
+            terms.push(format!("SELECT '{table}', 0"));
+        }
+    }
+    for table in ["event", "event_sequence"] {
+        if table_exists(con, table)? {
+            terms.push(format!(
+                "SELECT '{table}', (SELECT COUNT(*) FROM \"{table}\" t WHERE t.aggregate_id IN (SELECT id FROM \"{session}\" WHERE project_id = ?1))"
+            ));
+        } else {
+            terms.push(format!("SELECT '{table}', 0"));
+        }
+    }
+    if table_exists(con, "job")? {
+        terms.push(format!(
+            "SELECT 'job', (SELECT COUNT(*) FROM job t WHERE t.session_id IN (SELECT id FROM \"{session}\" WHERE project_id = ?1) OR t.child_session_id IN (SELECT id FROM \"{session}\" WHERE project_id = ?1))"
+        ));
+    } else {
+        terms.push("SELECT 'job', 0".to_string());
+    }
+    let sql = terms.join(" UNION ALL ");
     let mut stmt = con.prepare(&sql)?;
     let rows = stmt.query_map(params![project_id], |r| {
         Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
@@ -900,17 +1424,34 @@ mod tests {
         let con = testdb::create();
         testdb::insert_session(&con, "s1", "/a", None);
         testdb::insert_session_message(&con, "m1", "s1", "assistant", r#"{"x":1}"#);
+        testdb::insert_part(&con, "m1", "s1", 0, "text", "part");
         testdb::insert_inbox(&con, "i1", "s1", "hello-payload");
+        testdb::insert_media_blob(&con, "s1", "m1", "media", 6, true);
+        con.execute(
+            "INSERT INTO instruction_state (session_id, initial_values, current_values) \
+             VALUES ('s1', '{\"k\":1}', '{}')",
+            [],
+        )
+        .unwrap();
         let sessions = load_sessions(&con).unwrap();
         assert_eq!(sessions.len(), 1);
         let s = &sessions[0];
         assert_eq!(s.sm_msgs, 1);
         assert!(s.sm_bytes > 0);
         assert_eq!(s.inbox_msgs, 1);
+        assert_eq!(s.part_msgs, 1);
+        assert_eq!(s.part_bytes, 4);
+        assert_eq!(s.instr_bytes, 9);
+        assert_eq!(s.blob_bytes, 6);
         assert!(s.size_bytes() > 0);
         assert_eq!(
             s.size_bytes(),
-            s.sm_bytes + s.inbox_bytes + s.event_bytes + s.pending_bytes + s.instr_bytes,
+            s.sm_bytes
+                + s.inbox_bytes
+                + s.event_bytes
+                + s.part_bytes
+                + s.instr_bytes
+                + s.blob_bytes,
             "size sums V2 content"
         );
     }
@@ -921,8 +1462,10 @@ mod tests {
         testdb::insert_session(&con, "s1", "/a", None);
         testdb::insert_session_message(&con, "m1", "s1", "assistant", "12345");
         testdb::insert_inbox(&con, "i1", "s1", "abc");
+        testdb::insert_part(&con, "m1", "s1", 0, "text", "xy");
+        testdb::insert_media_blob(&con, "s1", "m1", "media", 4, true);
         let sizes = session_sizes(&con, &["s1".to_string()]).unwrap();
-        assert_eq!(sizes.get("s1").copied().unwrap_or(0), 8);
+        assert_eq!(sizes.get("s1").copied().unwrap_or(0), 14);
     }
 
     #[test]
@@ -967,7 +1510,72 @@ mod tests {
         .unwrap();
 
         let orphans = blob_orphans(&con).unwrap();
-        assert_eq!(orphans, vec![("zzz".to_string(), 7)]);
+        assert_eq!(
+            orphans,
+            vec![OrphanBlob {
+                hash: "zzz".to_string(),
+                bytes: 7,
+                kind: BlobKind::Instruction,
+            }]
+        );
+
+        con.execute(
+            "INSERT INTO blob (hash, mime, bytes, data, time_created) \
+             VALUES ('media-orphan', 'image/png', 4, x'00000000', 0)",
+            [],
+        )
+        .unwrap();
+        let orphans = blob_orphans(&con).unwrap();
+        assert_eq!(orphans.len(), 2);
+        assert_eq!(orphans[1].kind, BlobKind::Media);
+        assert_eq!(orphans[1].bytes, 4);
+    }
+
+    #[test]
+    fn parts_merge_before_inline_content() {
+        let con = testdb::create();
+        testdb::insert_session(&con, "s1", "/a", None);
+        testdb::insert_session_message(
+            &con,
+            "m1",
+            "s1",
+            "assistant",
+            r#"{"type":"assistant","content":[{"type":"text","text":"inline"}]}"#,
+        );
+        testdb::insert_part(
+            &con,
+            "m1",
+            "s1",
+            0,
+            "reasoning",
+            r#"{"type":"reasoning","text":"a"}"#,
+        );
+        testdb::insert_part(&con, "m1", "s1", 1, "text", r#"{"type":"text","text":"b"}"#);
+        let (_, rows) = list_messages(&con, "s1", 10).unwrap();
+        assert_eq!(rows[0].parts.len(), 2);
+        let merged: serde_json::Value =
+            serde_json::from_str(&rows[0].merged_data()).expect("valid JSON");
+        let content = merged["content"].as_array().unwrap();
+        assert_eq!(content.len(), 3);
+        assert_eq!(content[0]["text"], "a");
+        assert_eq!(content[1]["text"], "b");
+        assert_eq!(content[2]["text"], "inline");
+    }
+
+    #[test]
+    fn job_orphans_and_gc_follow_session_deletes() {
+        let mut con = testdb::create();
+        testdb::insert_session(&con, "s1", "/a", None);
+        testdb::insert_session(&con, "c1", "/a", Some("s1"));
+        testdb::insert_job(&con, "j1", "s1", Some("c1"));
+        testdb::insert_job(&con, "j2", "s1", None);
+        assert!(job_orphans(&con).unwrap().is_empty());
+
+        con.execute("DELETE FROM session_v2 WHERE id IN ('s1','c1')", [])
+            .unwrap();
+        assert_eq!(job_orphans(&con).unwrap(), vec!["j1", "j2"]);
+        assert_eq!(delete_orphan_jobs(&mut con).unwrap(), 2);
+        assert!(job_orphans(&con).unwrap().is_empty());
     }
 
     #[test]

@@ -120,7 +120,7 @@ pub enum Command {
     Db(DbCmd),
     /// Create a verified timestamped backup of the database
     Backup(BackupArgs),
-    /// Filesystem storage cleanup (snapshots, shell, blobs, log)
+    /// Filesystem storage cleanup (snapshots, shell, tool output, blobs, log)
     #[command(subcommand)]
     Fs(FsCmd),
     /// Inspect the running opencode service
@@ -150,7 +150,7 @@ pub enum Command {
     after_help = "Examples:\n  opencode-dbtool stats\n  opencode-dbtool stats --detail --format json"
 )]
 pub struct StatsArgs {
-    /// Add message-type breakdown, 30-day activity, and subagent shares
+    /// Add 30-day activity and subagent shares
     #[arg(long)]
     pub detail: bool,
 }
@@ -160,7 +160,7 @@ pub struct StatsArgs {
     after_help = "Examples:\n  opencode-dbtool doctor\n  opencode-dbtool doctor --fix --dry-run"
 )]
 pub struct DoctorArgs {
-    /// Repair what can be repaired: orphan blobs/events and dangling
+    /// Repair what can be repaired: orphan blobs/jobs/events and dangling
     /// parent/fork/workspace references
     #[arg(long)]
     pub fix: bool,
@@ -721,7 +721,10 @@ pub enum FsCmd {
     /// Delete old shell output files
     #[command(name = "clean-shell")]
     Shell(FsShellArgs),
-    /// Delete instruction blobs referenced by no state
+    /// Delete truncated tool-output files (tool-output/)
+    #[command(name = "clean-tool-output")]
+    ToolOutput(FsShellArgs),
+    /// Delete orphan instruction/media blob rows
     #[command(name = "clean-blob-orphans")]
     BlobOrphans,
     /// Truncate or prune log/opencode.log
@@ -785,7 +788,7 @@ pub struct DeleteIdsArgs {
 pub struct CleanupArgs {
     #[command(flatten)]
     pub purge: SessionPurgeArgs,
-    /// Age cutoff for shell/log cleanup
+    /// Age cutoff for shell/tool-output/log cleanup
     #[arg(long = "fs-older-than", value_name = "AGE", value_parser = age_value)]
     pub fs_older_than: Option<String>,
     /// Skip the pre-cleanup database backup

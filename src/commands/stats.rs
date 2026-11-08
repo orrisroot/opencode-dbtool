@@ -1,10 +1,12 @@
-//! `stats` command: table sizes and totals (V2-only). `--detail` adds
-//! message-type breakdowns, creation activity, and subagent shares.
+//! `stats` command: table sizes and totals (V2-only), plus message/part
+//! type breakdowns. `--detail` adds creation activity and subagent shares.
 
 use crate::db::{env_status, file_size, EnvStatus};
 use crate::error::Result;
 use crate::output;
-use crate::util::{dir_size, log_dir, now_ms, quote_ident, repos_dir, shell_dir, snapshot_dir};
+use crate::util::{
+    dir_size, log_dir, now_ms, quote_ident, repos_dir, shell_dir, snapshot_dir, tool_output_dir,
+};
 use rusqlite::{params, Connection};
 use serde::Serialize;
 use std::path::Path;
@@ -13,6 +15,7 @@ use std::path::Path;
 struct StorageSizes {
     snapshot_bytes: u64,
     shell_bytes: u64,
+    tool_output_bytes: u64,
     repos_bytes: u64,
     log_bytes: u64,
 }
@@ -56,6 +59,9 @@ struct StatsOut {
     /// `session_message` rows grouped by `type`, largest first (requires
     /// serde_json's `preserve_order`).
     message_types: serde_json::Map<String, serde_json::Value>,
+    /// `session_part` rows (assistant content on newer builds) grouped by
+    /// `type`, largest first. Empty when the table is absent.
+    part_types: serde_json::Map<String, serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     activity: Option<Activity>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -83,6 +89,7 @@ fn stats_out(con: &Connection, data_dir: &Path, db_path: &Path, detail: bool) ->
     let page_size: i64 = con.query_row("PRAGMA page_size", [], |r| r.get(0))?;
 
     let message_types = message_types(con)?;
+    let part_types = part_types(con)?;
 
     let mut tables: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
     let mut table_sizes: Vec<(String, i64)> = Vec::new();
@@ -124,10 +131,12 @@ fn stats_out(con: &Connection, data_dir: &Path, db_path: &Path, detail: bool) ->
         storage: StorageSizes {
             snapshot_bytes: dir_size(&snapshot_dir(data_dir)),
             shell_bytes: dir_size(&shell_dir(data_dir)),
+            tool_output_bytes: dir_size(&tool_output_dir(data_dir)),
             repos_bytes: dir_size(&repos_dir(data_dir)),
             log_bytes: dir_size(&log_dir(data_dir)),
         },
         message_types,
+        part_types,
         activity: if detail { Some(activity(con)?) } else { None },
         subagent: if detail { Some(subagent(con)?) } else { None },
     })
@@ -150,6 +159,13 @@ fn content_columns(con: &Connection, table: &str) -> Result<Vec<String>> {
         "commands",
         "binding",
         "extra",
+        // job / schedule fields (newer builds)
+        "output",
+        "error",
+        "recovery",
+        "action",
+        "state",
+        "last_outcome",
     ];
     let mut out = Vec::new();
     for c in CANDIDATES {
@@ -196,6 +212,30 @@ fn message_types(con: &Connection) -> Result<serde_json::Map<String, serde_json:
         ))
     })?;
     let mut types = serde_json::Map::new();
+    for r in rows {
+        let (t, count, bytes) = r?;
+        types.insert(t, serde_json::json!({ "count": count, "bytes": bytes }));
+    }
+    Ok(types)
+}
+
+/// Per-`session_part.type` row counts and data bytes, largest first.
+fn part_types(con: &Connection) -> Result<serde_json::Map<String, serde_json::Value>> {
+    let mut types = serde_json::Map::new();
+    if !crate::db::table_exists(con, "session_part")? {
+        return Ok(types);
+    }
+    let mut stmt = con.prepare(
+        "SELECT type, COUNT(*), COALESCE(SUM(length(CAST(data AS BLOB))),0) \
+         FROM session_part GROUP BY 1 ORDER BY 3 DESC",
+    )?;
+    let rows = stmt.query_map([], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, i64>(1)?,
+            r.get::<_, i64>(2)?,
+        ))
+    })?;
     for r in rows {
         let (t, count, bytes) = r?;
         types.insert(t, serde_json::json!({ "count": count, "bytes": bytes }));
@@ -290,7 +330,12 @@ mod tests {
         assert_eq!(v["message_types"]["assistant"]["count"], 1);
         assert_eq!(v["message_types"]["assistant"]["bytes"], msg.len() as i64);
         assert!(v["total_data_bytes"].as_i64().unwrap() >= msg.len() as i64);
-        assert!(v.get("part_types").is_none(), "part_types removed");
+        assert!(v["part_types"].as_object().unwrap().is_empty());
+
+        testdb::insert_part(&con, "m1", "s1", 0, "text", "part");
+        let v = stats_value(&con, Path::new("/tmp"), Path::new("/tmp/x.db"), false).unwrap();
+        assert_eq!(v["part_types"]["text"]["count"], 1);
+        assert_eq!(v["part_types"]["text"]["bytes"], 4);
     }
 
     #[test]
@@ -302,12 +347,15 @@ mod tests {
         fs::write(dir.join("snapshot/p/o"), vec![0u8; 5]).unwrap();
         fs::create_dir_all(dir.join("log")).unwrap();
         fs::write(dir.join("log/opencode.log"), vec![0u8; 7]).unwrap();
+        fs::create_dir_all(dir.join("tool-output")).unwrap();
+        fs::write(dir.join("tool-output/tool_x"), vec![0u8; 3]).unwrap();
 
         let out = stats_value(&con, &dir, &db_path, false).unwrap();
         assert_eq!(out["storage"]["snapshot_bytes"], 5);
         assert_eq!(out["storage"]["log_bytes"], 7);
+        assert_eq!(out["storage"]["tool_output_bytes"], 3);
         assert!(out["storage"].get("session_diff_bytes").is_none());
-        assert!(out["storage"].get("tool_output_bytes").is_none());
+        assert!(out["storage"].get("tool_output_bytes").is_some());
 
         drop(con);
         fs::remove_dir_all(&dir).unwrap();

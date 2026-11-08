@@ -53,6 +53,8 @@ struct Orphans {
     sessions_missing_workspace: Vec<DanglingRef>,
     orphaned_event_sequences: Vec<String>,
     orphan_instruction_blobs: Vec<BlobOrphan>,
+    orphan_media_blobs: Vec<BlobOrphan>,
+    orphaned_jobs: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -77,6 +79,8 @@ struct DoctorOut {
 struct FixReport {
     dry_run: bool,
     blobs_deleted: usize,
+    media_blobs_deleted: usize,
+    jobs_deleted: usize,
     event_rows_deleted: i64,
     event_sequences_deleted: usize,
     parents_cleared: usize,
@@ -101,6 +105,8 @@ pub fn cmd_doctor(
             out.fix = Some(FixReport {
                 dry_run: true,
                 blobs_deleted: out.orphans.orphan_instruction_blobs.len(),
+                media_blobs_deleted: out.orphans.orphan_media_blobs.len(),
+                jobs_deleted: out.orphans.orphaned_jobs.len(),
                 event_rows_deleted: crate::repo::orphan_event_row_count(con)?,
                 event_sequences_deleted: out.orphans.orphaned_event_sequences.len(),
                 parents_cleared: out.orphans.sessions_missing_parent.len(),
@@ -130,14 +136,27 @@ pub fn cmd_doctor(
 /// Apply every conservative repair `doctor` knows about. Integrity/FK
 /// failures are never touched.
 fn apply_fixes(con: &mut Connection) -> Result<FixReport> {
-    let (blobs, _bytes) = crate::repo::delete_blob_orphans(con)?;
+    let kinds = crate::repo::blob_orphans(con)?.into_iter().fold(
+        (0usize, 0usize),
+        |(instruction, media), blob| {
+            if blob.kind == crate::repo::BlobKind::Instruction {
+                (instruction + 1, media)
+            } else {
+                (instruction, media + 1)
+            }
+        },
+    );
+    let (_blobs, _bytes) = crate::repo::delete_blob_orphans(con)?;
+    let jobs = crate::repo::delete_orphan_jobs(con)?;
     let (event_rows, sequences) = crate::repo::delete_orphan_event_sequences(con)?;
     let parents = crate::repo::clear_missing_parents(con)?;
     let forks = crate::repo::clear_dangling_forks(con)?;
     let workspaces = crate::repo::clear_missing_workspaces(con)?;
     Ok(FixReport {
         dry_run: false,
-        blobs_deleted: blobs,
+        blobs_deleted: kinds.0,
+        media_blobs_deleted: kinds.1,
+        jobs_deleted: jobs,
         event_rows_deleted: event_rows as i64,
         event_sequences_deleted: sequences,
         parents_cleared: parents,
@@ -238,30 +257,52 @@ fn doctor_out(
         rows.collect::<std::result::Result<Vec<_>, _>>()?
     };
     // V2 content rows whose session is gone. FK covers them, but explicit
-    // counts help when FKs were off.
+    // counts help when FKs were off. Newer tables are only checked when
+    // the database has them.
     let mut v2_orphans: i64 = 0;
     for (table, id_col) in [
         ("session_message", "session_id"),
+        ("session_part", "session_id"),
         ("session_inbox", "session_id"),
-        ("session_pending", "session_id"),
         ("instruction_entry", "session_id"),
         ("instruction_state", "session_id"),
+        ("schedule", "session_id"),
+        ("blob_ref", "session_id"),
     ] {
+        if !crate::db::table_exists(con, table)? {
+            continue;
+        }
         let sql = format!(
             "SELECT COUNT(*) FROM \"{table}\" t WHERE t.\"{id_col}\" NOT IN (SELECT id FROM \"{SESSION_TABLE}\")"
         );
         let n: i64 = con.query_row(&sql, [], |r| r.get(0))?;
         v2_orphans += n;
     }
+    let (instruction_blobs, media_blobs): (Vec<BlobOrphan>, Vec<BlobOrphan>) =
+        crate::repo::blob_orphans(con)?.into_iter().fold(
+            (Vec::new(), Vec::new()),
+            |(mut instruction, mut media), b| {
+                let entry = BlobOrphan {
+                    hash: b.hash,
+                    bytes: b.bytes,
+                };
+                if b.kind == crate::repo::BlobKind::Instruction {
+                    instruction.push(entry);
+                } else {
+                    media.push(entry);
+                }
+                (instruction, media)
+            },
+        );
+    let orphaned_jobs = crate::repo::job_orphans(con)?;
     let orphans = Orphans {
         sessions_missing_parent,
         sessions_dangling_fork,
         sessions_missing_workspace,
         orphaned_event_sequences,
-        orphan_instruction_blobs: crate::repo::blob_orphans(con)?
-            .into_iter()
-            .map(|(hash, bytes)| BlobOrphan { hash, bytes })
-            .collect(),
+        orphan_instruction_blobs: instruction_blobs,
+        orphan_media_blobs: media_blobs,
+        orphaned_jobs,
     };
 
     let ok = quick == "ok"
@@ -272,6 +313,8 @@ fn doctor_out(
         && orphans.sessions_missing_workspace.is_empty()
         && orphans.orphaned_event_sequences.is_empty()
         && orphans.orphan_instruction_blobs.is_empty()
+        && orphans.orphan_media_blobs.is_empty()
+        && orphans.orphaned_jobs.is_empty()
         && v2_orphans == 0;
 
     // Advisory backup freshness: a warning never changes `ok`.
@@ -352,7 +395,9 @@ mod tests {
                 "sessions_dangling_fork": [],
                 "sessions_missing_workspace": [],
                 "orphaned_event_sequences": [],
-                "orphan_instruction_blobs": []
+                "orphan_instruction_blobs": [],
+                "orphan_media_blobs": [],
+                "orphaned_jobs": []
             },
             "free_bytes": 0,
             "backups": { "count": 0 },

@@ -3,7 +3,7 @@
 //!
 //! Steps (in order): optional pre-run backup, session purge (only when
 //! session filters are given), orphan blob cleanup, orphan snapshot
-//! cleanup, old shell output cleanup, log pruning, and a final VACUUM.
+//! cleanup, old shell/tool-output cleanup, log pruning, and a final VACUUM.
 //! Without session filters nothing is purged, so a bare `cleanup` only
 //! removes orphans and old files.
 
@@ -32,6 +32,8 @@ struct CleanupSummary {
     snapshot_bytes: u64,
     shell_files: usize,
     shell_bytes: u64,
+    tool_output_files: usize,
+    tool_output_bytes: u64,
     log_bytes_before: u64,
     log_bytes_after: u64,
     /// `ran`, `planned` (dry-run), `skipped` (service running), or
@@ -63,6 +65,7 @@ struct CleanupOut {
     blob_orphans: serde_json::Value,
     snapshots: serde_json::Value,
     shell: serde_json::Value,
+    tool_output: serde_json::Value,
     log: serde_json::Value,
     /// Final VACUUM result (omitted with `--no-vacuum`).
     vacuum: Option<serde_json::Value>,
@@ -144,9 +147,16 @@ pub fn cmd_cleanup(
         db_path,
     )?);
 
-    // 5. Old shell outputs and log lines.
+    // 5. Old shell/tool outputs and log lines.
     progress(quiet, dry_run, "removing old shell outputs");
     let shell = without_env(commands::fsops::shell_cleanup_value(
+        Some(fs_age),
+        dry_run,
+        data_dir,
+        db_path,
+    )?);
+    progress(quiet, dry_run, "removing old tool output");
+    let tool_output = without_env(commands::fsops::tool_output_cleanup_value(
         Some(fs_age),
         dry_run,
         data_dir,
@@ -254,6 +264,8 @@ pub fn cmd_cleanup(
         snapshot_bytes: json_u64(&snapshots, "total_bytes"),
         shell_files: json_u64(&shell, "total_files") as usize,
         shell_bytes: json_u64(&shell, "total_bytes"),
+        tool_output_files: json_u64(&tool_output, "total_files") as usize,
+        tool_output_bytes: json_u64(&tool_output, "total_bytes"),
         log_bytes_before: json_u64(&log, "bytes"),
         log_bytes_after: json_u64(&log, "remaining_bytes"),
         vacuum: vacuum_status.to_string(),
@@ -282,6 +294,7 @@ pub fn cmd_cleanup(
         blob_orphans,
         snapshots,
         shell,
+        tool_output,
         log,
         vacuum,
         verify: verify_result,
@@ -339,6 +352,14 @@ fn summary_table(out: &CleanupOut) -> String {
     lines.push((
         "shell files",
         format!("{} ({})", s.shell_files, human_bytes(s.shell_bytes as i64)),
+    ));
+    lines.push((
+        "tool output",
+        format!(
+            "{} ({})",
+            s.tool_output_files,
+            human_bytes(s.tool_output_bytes as i64)
+        ),
     ));
     lines.push((
         "log",

@@ -4,18 +4,25 @@ Maintenance tool for the [opencode](https://opencode.ai) 2.x SQLite database
 (`~/.local/share/opencode/opencode.db`): inspect sizes and integrity, and delete
 projects/sessions to reclaim space.
 
-Written in Rust. Output is a human-readable table on a terminal and JSON when
-piped (`--format table|json` to force either). Destructive commands preview
-their impact and ask `Proceed? [y/N]` on a terminal; `--dry-run` and `--yes`
-keep them scriptable. Supports Linux, macOS, and Windows.
+Written in Rust. Output is a human-readable table on a terminal, JSON when
+piped, and CSV with `--format csv`. `--format table|json|csv` forces a format;
+`--fields` selects table/CSV columns. Destructive commands preview their
+impact and ask `Proceed? [y/N]` on a terminal; `--dry-run` and `--yes` keep
+them scriptable. Supports Linux, macOS, and Windows.
 
 ## Compatibility
 
-Requires the opencode 2.x database schema (`session_v2`,
-`session_message`, `session_inbox`/`session_pending`, `instruction_*`,
-`worktree`, `event`, ...). V1 databases are not supported and fail with
-exit code 3; open the DB once with opencode 2.x so its migrations run,
-then retry.
+Requires the opencode 2.x database schema (`session_v2`, `session_message`,
+`session_inbox`, `instruction_*`, `worktree`, `event`, ...). V1 databases
+are not supported and fail with exit code 3; open the DB once with
+opencode 2.x so its migrations run, then retry.
+
+Current releases are verified against the opencode 2.2 schema and use the
+newer tables when present: `session_part` (assistant content on builds
+with part rows), `blob`/`blob_ref` (media), `schedule`, and `job`.
+Databases opened by older 2.x builds that lack them still work; their
+sizes report zero for the missing storage. Session output reports
+`parts`/`session_parts` for the newer content rows.
 
 ## Install
 
@@ -33,39 +40,53 @@ cargo build --release   # -> target/release/opencode-dbtool
 
 | command | description |
 | --- | --- |
-| `stats [--detail]` | DB overview: table sizes, totals, storage usage, reclaimable space (`--detail` adds analysis) |
-| `doctor` | integrity + consistency checks |
-| `project list [--path <dir>] [--sort size\|updated\|sessions]` | project overview (counts, sizes); `--path` filters to a directory (repeatable) |
+| `stats [--detail]` | DB overview: table sizes, totals, storage usage, reclaimable space (`--detail` adds activity/subagent analysis) |
+| `doctor [--fix] [--max-backup-age <age>]` | integrity + consistency checks; `--fix` repairs supported orphans |
+| `report [--costs] [--since <age>] [--project <ref>]` | read-only reclaim and cost suggestions |
+| `project list [--path <dir>...] [--sort size\|updated\|sessions]` | project overview (counts, sizes); `--path` filters to a directory (repeatable) |
 | `project show <id>` | project detail (sessions, breakdown) |
 | `project delete <id>...` | delete project(s) + all related data |
 | `project purge [--older-than <age>] [--path <dir>...] [--empty]` | delete projects matching all filters |
-| `session list [--sort size\|cost\|updated\|messages] [--limit <n>] [--search <text>] [--min-size <size>]` | per-session breakdown (full ids) |
-| `session show <id> [--messages [--limit <n>] [--full]]` | session detail, optionally with message previews |
+| `session list [--sort size\|cost\|updated\|messages] [--limit <n>] [--search <text>] [--min-size <size>] [--older-than <age>] [--project <ref>] [--parent <ref>]` | per-session breakdown (full ids) |
+| `session show <id> [--messages [--limit <n>\|--last <n>] [--full] [--markdown [--include-tools]]]` | session detail, optionally with message previews |
+| `session search <text> [--limit <n>] [--snippets <n>] [--since <age>]` | search message/part content across sessions |
 | `session delete <id>...` | delete session(s) + cascade |
 | `session purge [filters]` | delete sessions matching all filters |
 | `session strip-reasoning [filters]` | delete only the reasoning content of matching sessions |
-| `kv list [--older-than <age>]` | list global kv entries with sizes (large caches first) |
+| `session export <id> [--out <file>] [--markdown [--include-tools]]` | export one session (JSON or Markdown) |
+| `session export --out-dir <dir> [--older-than <age>] [--project <ref>] [--limit <n>] [--markdown [--include-tools]]` | batch-export sessions |
+| `session import <file>` | import a session through the running server |
+| `kv list [--older-than <age>] [--search <text>]` | list global kv entries with sizes (large caches first) |
 | `kv show <key> [--raw]` | show a kv value (truncated; `--raw` prints it verbatim) |
 | `kv delete <key>...` | delete kv entries (caches regenerate on demand) |
+| `kv purge [--older-than <age>] [--larger-than <size>]` | delete kv entries matching filters |
+| `db checkpoint [--truncate]` | checkpoint the WAL; `--truncate` shrinks the file (online) |
+| `db path` | show the resolved database path and key pragmas |
+| `db optimize` | refresh SQLite query-planner statistics (online) |
+| `db query <sql> [--limit <n>]` | run a read-only SELECT/WITH/EXPLAIN query |
 | `backup [--keep-backups <n>]` | online verified backup (safe while opencode runs) |
-| `backup list [--verify]` | list timestamped backups, newest first |
-| `backup restore <file>` | restore a backup over the current database (safety copy first) |
+| `backup list [--verify] [--sort date\|size]` | list timestamped backups |
+| `backup restore <file>\|--latest` | restore a backup over the current database (safety copy first) |
+| `backup prune [--keep <n>\|--older-than <age>]` | delete old backups without creating one |
 | `service status` | diagnose the running opencode service (API, DB match) |
 | `fs clean-snapshots [--project <id>...] [--orphans-only]` | delete snapshot storage, optionally scoped |
 | `fs clean-shell [--older-than <age>]` | delete shell output files, optionally only old ones |
-| `fs clean-blob-orphans` | delete instruction blobs referenced by no state |
+| `fs clean-tool-output [--older-than <age>]` | delete truncated tool-output files, optionally only old ones |
+| `fs clean-blob-orphans` | delete instruction/media blobs referenced by nothing |
 | `fs clean-log [--older-than <age>]` | truncate log/opencode.log, or prune only old lines |
-| `vacuum [--no-backup] [--keep-backups <n>] [--online]` | run VACUUM (backup + verify by default; `--online` attempts it while opencode runs) |
-| `db checkpoint [--truncate]` | checkpoint the WAL; `--truncate` shrinks the file (online) |
-| `cleanup [filters] [--fs-older-than <age>] [--no-backup] [--no-vacuum] [--keep-backups <n>]` | backup → optional purge → orphan/file cleanup → VACUUM, in one run |
+| `fs clean-repos [--older-than <age>]` | delete cached git repositories, optionally only old ones |
+| `vacuum [--no-backup] [--keep-backups <n>] [--online] [--into <file>]` | run VACUUM (backup + verify by default; `--online` attempts it while opencode runs; `--into` writes a compacted copy) |
+| `cleanup [filters] [--fs-older-than <age>] [--no-backup] [--no-vacuum] [--keep-backups <n>] [--vacuum-online] [--verify]` | backup → optional purge → orphan/file cleanup → VACUUM, in one run |
+| `config show` | show effective settings and their source |
+| `config path` | print resolved config, data, state, and database paths |
 | `completions <shell>` | print a shell completion script (bash, zsh, fish, ...) |
 | `self-update [--dry-run\|--yes]` | check for / install the latest GitHub release binary |
 
-All commands accept `--format <table\|json>` (default: table on a terminal,
-JSON when piped), `--quiet` (suppress progress on stderr), `--absolute`
-(absolute instead of relative timestamps in tables), and `--no-color`.
-`--dry-run` and `--yes` may be passed anywhere on the command line. Every
-subcommand has its own `--help`.
+All commands accept the global flags listed under [Flags](#flags), including
+`--format`, `--fields`, `--quiet`, `--absolute`, `--color`/`--no-color`,
+`--no-pager`, `--wait-lock`, `--config`, `--dry-run`, `--yes`,
+`--no-input`, and `--restart-service`. Every subcommand has its own
+`--help`.
 
 Filters for `session purge` / `session strip-reasoning` are
 `--older-than <age>`, `--subagents`, `--archived`, `--empty`,
@@ -84,14 +105,14 @@ match; a trailing slash is ignored on both sides of the comparison.
 
 ### Common fields
 
-Commands that print a single result object (`stats`, `doctor`, `project
-delete`, `project purge`, `session delete`, `session purge`, `session
-strip-reasoning`, `kv delete`, `backup`, `fs clean-snapshots`,
-`fs clean-shell`, `fs clean-blob-orphans`, `fs clean-log`, `vacuum`,
-`cleanup`, `db checkpoint`)
-start with an environment block;
-`project/session list` print a bare array and `project/session show` a bare
-object:
+Commands that print a single result object (for example `stats`, `doctor`,
+`report`, deletes/purges, `backup`, `fs clean-*`, `vacuum`, `cleanup`, and
+`db checkpoint/path/optimize/query`) start with an environment block.
+`project/session list`, `session search`, `backup list`, and `kv list` print
+a bare array; `project/session show` and `kv show` print a bare object.
+`session export` prints the transfer payload (or a summary when writing
+files with `--out`/`--out-dir`), and `session import` prints the server
+response:
 
 ```json
 { "opencode_running": false, "pids": [], "db": "/path/to/opencode.db" }
@@ -108,14 +129,17 @@ stdout is not a terminal (scripts, pipes) and with `--format json`. On a
 terminal the same values render as a table — list commands show one row per
 item, single results show aligned `key: value` lines, and byte fields
 (`bytes`, `*_bytes`) are formatted for humans (`8.4 MB`). `--format table`
-forces the table even when piped. The interactive prompt and errors go to
-stderr, so stdout stays machine-readable.
+forces the table even when piped; `--format csv` prints comma-separated rows.
+`--fields id,title,size_bytes` selects and orders table/CSV columns, and
+`--no-pager` disables the automatic pager. The interactive prompt and errors
+go to stderr, so stdout stays machine-readable.
 
 ### Interactive confirmation
 
 Destructive commands (`session`/`project delete` and `purge`,
-`strip-reasoning`, `kv delete`, `backup`, `fs clean-*`, `vacuum`, `cleanup`,
-`self-update`) work in three modes:
+`strip-reasoning`, `session import`, `kv delete`/`purge`,
+`backup`/`restore`/`prune`, `doctor --fix`, `fs clean-*`, `vacuum`,
+`cleanup`, `self-update`) work in three modes:
 
 - `--dry-run`: print the preview and change nothing (safe while opencode
   runs).
@@ -139,25 +163,34 @@ tool adapts:
 - **`db checkpoint [--truncate]`** moves committed WAL frames into the
   database file and can shrink the WAL while opencode runs (best effort:
   `busy: 1` means active readers held it back).
-- **`fs clean-shell --older-than`**, **`fs clean-snapshots --orphans-only`**,
-  and **`fs clean-blob-orphans`** are safe online.
+- **`fs clean-shell --older-than`**, **`fs clean-tool-output --older-than`**,
+  **`fs clean-snapshots --orphans-only`**, and **`fs clean-blob-orphans`**
+  are safe online.
+- **`report`, `session search`, `db path`, `db optimize`, and `db query`**
+  read the database without modifying it.
+- **`backup prune`** only removes backup files, and **`vacuum --into`**
+  writes a separate compacted copy, so both are safe online.
+- **`session export`** reads through the server API (or the local database
+  for `--markdown`); **`session import`** uses the server API.
 - **`vacuum --online`** attempts a VACUUM while opencode runs with a long
   busy timeout; the server may block writes for the duration, and the
   command fails cleanly if it cannot win the lock.
 - **`--restart-service`** (global flag) stops the registered service
   through its own `opencode service stop`, runs the command, and starts it
   again afterwards — even if the command fails. Use it for the commands
-  that still need exclusive access (`project delete/purge`, `session
-  strip-reasoning`, `kv delete`, `fs clean-log`, full `fs
+  that still need exclusive access (`doctor --fix`, `project
+  delete/purge`, `session strip-reasoning`, `backup restore`, `kv
+  delete`/`purge`, `fs clean-log`, `fs clean-repos`, full `fs
   clean-snapshots`/`clean-shell`, `vacuum`, and `cleanup` including its
   VACUUM). With no registered service the flag falls back to the normal
   running-instance guard, so it is safe to pass unconditionally. A running
   TUI may need to be restarted if the service comes back on a different
   port.
-- `project delete/purge`, `session strip-reasoning`, `kv delete`,
-  `fs clean-log`, `fs clean-snapshots` without `--orphans-only`, and
-  `fs clean-shell` without `--older-than` still require stopping opencode
-  (exit 1) unless `--restart-service` is passed.
+- `doctor --fix`, `project delete/purge`, `session strip-reasoning`,
+  `backup restore`, `kv delete`/`purge`, `fs clean-log`, `fs clean-repos`,
+  `fs clean-snapshots` without `--orphans-only`, and `fs clean-shell`
+  without `--older-than` still require stopping opencode (exit 1) unless
+  `--restart-service` is passed.
 
 To stop and restart the service manually:
 
@@ -195,7 +228,7 @@ deletes unexpectedly fall back to the guard or when filing a bug report.
   "registered": true,
   "pid": 5406,
   "url": "http://127.0.0.1:49374",
-  "version": "2.0.22",
+  "version": "2.2.6",
   "db_matches": true,
   "api_ok": true
 }
@@ -205,8 +238,8 @@ deletes unexpectedly fall back to the guard or when filing a bug report.
 
 Database overview: file and WAL sizes, per-table row counts, total data
 volume, reclaimable space, the sizes of opencode's filesystem storage,
-and the breakdown of `session_message` rows by type. Start here to see
-where space is going.
+and the breakdown of `session_message`/`session_part` rows by type. Start
+here to see where space is going.
 
 ```json
 {
@@ -214,11 +247,12 @@ where space is going.
   "wal_bytes": 0,
   "free_pages": 120,
   "reclaimable_bytes": 491520,
-  "tables": { "session_v2": 6, "session_message": 640, "event": 90210, "...": 0 },
-  "table_bytes": { "session_message": 900000, "event": 400000, "...": 0 },
+  "tables": { "session_v2": 6, "session_message": 640, "session_part": 1200, "event": 90210, "...": 0 },
+  "table_bytes": { "session_message": 900000, "session_part": 700000, "event": 400000, "...": 0 },
   "total_data_bytes": 12345678,
-  "storage": { "snapshot_bytes": 736000, "shell_bytes": 39681, "repos_bytes": 0, "log_bytes": 2441760 },
-  "message_types": { "assistant": { "count": 400, "bytes": 900000 }, "user": { "count": 240, "bytes": 10240 } }
+  "storage": { "snapshot_bytes": 736000, "shell_bytes": 39681, "tool_output_bytes": 24000, "repos_bytes": 0, "log_bytes": 2441760 },
+  "message_types": { "assistant": { "count": 400, "bytes": 900000 }, "user": { "count": 240, "bytes": 10240 } },
+  "part_types": { "text": { "count": 900, "bytes": 600000 }, "reasoning": { "count": 300, "bytes": 90000 } }
 }
 ```
 
@@ -230,9 +264,10 @@ where space is going.
 | `reclaimable_bytes` | `free_pages` * `page_size`: the bytes a VACUUM would give back |
 | `tables` | row count per table |
 | `table_bytes` | content bytes per table, largest first |
-| `total_data_bytes` | sum of content columns across all tables (`data`, `payload`, `value`, `initial_values`/`current_values`, ...) |
-| `storage` | sizes of the filesystem storage beside the database: `snapshot_bytes` (`snapshot/`), `shell_bytes` (`shell/`), `repos_bytes` (`repos/`), `log_bytes` (`log/`); missing directories count as 0 |
+| `total_data_bytes` | sum of content columns across all tables (`data`, `payload`, `value`, `output`, `initial_values`/`current_values`, ...) |
+| `storage` | sizes of the filesystem storage beside the database: `snapshot_bytes` (`snapshot/`), `shell_bytes` (`shell/`), `tool_output_bytes` (`tool-output/`), `repos_bytes` (`repos/`), `log_bytes` (`log/`); missing directories count as 0 |
 | `message_types` | `session_message` rows grouped by `type` (largest first) |
+| `part_types` | `session_part` rows grouped by `type` (largest first; empty on databases without the table) |
 
 `stats --detail` adds:
 
@@ -254,7 +289,10 @@ relative to all sessions.
 ### `doctor`
 
 Integrity and consistency checks. Run it when something looks wrong, or
-before `vacuum`, to confirm the database is healthy.
+before `vacuum`, to confirm the database is healthy. `--fix` applies the
+supported repairs (orphan blobs/jobs/events and dangling references) in one pass;
+combine it with `--dry-run` to preview. `--max-backup-age <age>` adds an
+advisory warning when the newest backup is missing or older than the age.
 
 ```json
 {
@@ -268,7 +306,9 @@ before `vacuum`, to confirm the database is healthy.
     "sessions_dangling_fork": [],
     "sessions_missing_workspace": [],
     "orphaned_event_sequences": [],
-    "orphan_instruction_blobs": []
+    "orphan_instruction_blobs": [],
+    "orphan_media_blobs": [],
+    "orphaned_jobs": []
   },
   "ok": true
 }
@@ -283,11 +323,39 @@ before `vacuum`, to confirm the database is healthy.
 | `orphans.sessions_missing_workspace` | a session whose `workspace_id` has no `workspace` row (no FK covers it) |
 | `orphans.orphaned_event_sequences` | `event_sequence` rows whose aggregate is in neither sessions nor projects |
 | `orphans.orphan_instruction_blobs` | `instruction_blob` rows referenced by no state (leaked by session/project deletes; reclaim with `fs clean-blob-orphans`) |
+| `orphans.orphan_media_blobs` | `blob` rows referenced by no `blob_ref` (left by a direct delete or interrupted run; reclaim with `fs clean-blob-orphans`) |
+| `orphans.orphaned_jobs` | `job` rows whose session or child session is gone (the table has no foreign keys) |
 
 `orphans` collects references that no FK constraint covers, plus
-`session_message`/`inbox`/`pending`/`instruction_*` rows whose session is
-gone (folded into `ok: false`). `ok: false` (exit code 3) when
-integrity/fk/orphan checks fail.
+`session_message`/`session_part`/`inbox`/`instruction_*`/`schedule`/
+`blob_ref` rows whose session is gone (folded into `ok: false`). `doctor
+--fix` removes orphan blobs and jobs and clears dangling references.
+`ok: false` (exit code 3) when integrity/fk/orphan checks fail.
+
+### `report`
+
+Read-only overview of reclaimable space, old/large sessions, large kv
+caches, backups, and suggested commands. `--costs` adds cost totals by
+project and by day; `--since <age>` and `--project <ref>` limit all
+session-derived sections to that scope. The command never deletes anything.
+
+```json
+{
+  "db_bytes": 8388608,
+  "wal_bytes": 0,
+  "reclaimable_bytes": 491520,
+  "old_sessions": { "days": 90, "count": 2, "bytes": 1200000 },
+  "largest_sessions": [ { "id": "ses_...", "title": "...", "bytes": 500000 } ],
+  "kv_candidates": [ { "key": "models-dev:catalog", "bytes": 2000000 } ],
+  "backups": { "count": 3, "total_bytes": 25165824 },
+  "suggestions": [ { "action": "VACUUM can reclaim 480.0 KB", "command": "opencode-dbtool vacuum --online --yes" } ],
+  "scope": { "since": "30d", "project": "p1" },
+  "costs": { "total": 1.23, "by_project": [], "by_day": [] }
+}
+```
+
+`scope` and `costs` are present only when requested. On a terminal the
+output is a compact summary table.
 
 ### `project list` / `project show`
 
@@ -309,11 +377,18 @@ them likewise.
   "sessions": 6,
   "events": 90210,
   "session_messages": 640,
+  "session_parts": 1200,
+  "blob_bytes": 0,
   "size_bytes": 12345678,
   "cost": 1.2345,
   "updated": "2026-01-01T00:00:00Z"
 }
 ```
+
+`size_bytes` includes session content, `session_part` rows, and distinct
+media blob bytes referenced by the project's sessions. `project show`'s
+`session_list` entries report `events`, `session_messages`, `session_parts`,
+`archived`, and `cost`.
 
 ### `project delete`
 
@@ -332,7 +407,8 @@ session and all related data. Preview the impact with `--dry-run` first.
 ```
 
 `rows` holds per-table row counts across all targeted projects. On success,
-`deleted: true` plus a note that the file size only shrinks after `vacuum`.
+`deleted: true` plus a note that the file size only shrinks after `vacuum`
+and that `fs clean-blob-orphans` releases orphan blobs.
 
 ### `project purge`
 
@@ -350,20 +426,32 @@ A filter match of zero projects is normal (exit 0).
 
 ### `session list` / `session show`
 
-Per-session breakdown: event/`session_message`/`inbox`/`pending` counts,
-data size, archived flag, and cost. Use it with `--sort size` and `--limit`
-to find the biggest sessions before purging. `--sort` accepts `size`,
-`cost`, `updated`, and `messages`; `--min-size <size>` keeps only sessions
-at least that large. `--search <text>` keeps only sessions whose title or
-directory contains the text (case-insensitive). `session list` prints an
-array; `session show <ref>` prints one object (add `--messages
-[--limit <n>]` for oldest-first message previews with per-message bytes,
-plus `total_messages`; `--full` keeps whole messages instead of 300-char
-previews). Without `--sort`/`--limit`, `session list` is ordered by
-`time_updated` descending. `size_bytes` sums
-session_message+inbox+pending+instructions+event bytes. In tables,
+Per-session breakdown: event/`session_message`/`session_part`/`inbox`
+counts, data size, archived flag, and cost. Use it with `--sort size` and
+`--limit` to find the biggest sessions before purging. `--sort` accepts
+`size`, `cost`, `updated`, and `messages`; `--min-size <size>` keeps only
+sessions at least that large; `--older-than <age>` keeps sessions updated
+before the cutoff; `--project <ref>` and `--parent <ref>` restrict the
+list to a project or to direct children of a parent session. `--search
+<text>` keeps only sessions whose title or directory contains the text
+(case-insensitive). `session list` prints an array; `session show <ref>`
+prints one object. With `--messages`, previews are oldest first and limited
+to 50 by default; `--limit <n>` caps the number shown, `--last <n>` selects
+the newest window, `--full` keeps whole messages instead of 300-char
+previews, and `--last`
+cannot be combined with `--limit`. `--markdown` (requires `--messages`)
+renders the conversation from the local database (no server needed);
+`--include-tools` (requires `--markdown`) adds tool calls and other non-text
+parts to the Markdown. Without `--sort`/`--limit`,
+`session list` is ordered by `time_updated` descending. `size_bytes` sums
+event+session_message+session_part+inbox+instructions+media blob bytes
+(shared blobs count for each session that references them). In tables,
 `updated`/`time` columns show relative ages (`15m ago`); `--absolute`
 prints ISO timestamps.
+
+`session show --messages` folds `session_part` rows (newer builds) into
+the message `content` preview, parts first and legacy inline content
+after them, matching how opencode reads a conversation.
 
 `<ref>` may be the full id, a unique id prefix, or the id without its `ses_`
 prefix (`session show ses_effb2a71` and `session show effb2a71` both work
@@ -380,7 +468,8 @@ when unambiguous).
   "events": 15035,
   "session_messages": 210,
   "inbox": 0,
-  "pending": 1,
+  "parts": 240,
+  "blob_bytes": 0,
   "size_bytes": 2100000,
   "cost": 0.42
 }
@@ -388,6 +477,57 @@ when unambiguous).
 
 `parent_id` is the parent session id for subagent sessions, `null` for
 top-level sessions. It also appears in `project show`'s `session_list`.
+
+### `session search`
+
+Search message and `session_part` content without an index; expect a full
+scan on large databases. `--limit <n>` caps the number of sessions
+(default 20), `--snippets <n>` caps snippets per session (default 3), and
+`--since <age>` limits results to recently updated sessions. The output is a
+bare array:
+
+```json
+[
+  {
+    "id": "ses_...",
+    "title": "...",
+    "directory": "/home/user/work/...",
+    "updated": "2026-01-01T00:00:00Z",
+    "matches": 2,
+    "snippets": [
+      {
+        "message_id": "msg_...",
+        "type": "text",
+        "source": "part",
+        "time": "2026-01-01T00:00:00Z",
+        "snippet": "...matching text..."
+      }
+    ]
+  }
+]
+```
+
+`source` is `message` for `session_message` rows and `part` for
+`session_part` rows.
+
+### `session export` / `session import`
+
+`session export <id>` fetches a session transfer payload from the running
+server and prints it (or writes it with `--out <file>`). `--markdown` renders
+from the local database instead and needs no server; `--include-tools` adds
+non-text parts to the Markdown. Batch export uses `--out-dir <dir>` and can
+select sessions with `--older-than <age>`, `--project <ref>`, and `--limit
+<n>`; `--markdown` writes `.md` files instead of JSON, and `--include-tools`
+adds non-text parts to each Markdown file. Import uses the
+server API (`session import <file>`) and accepts both the current transfer
+payload and older `{"data": ...}` wrappers.
+
+```sh
+opencode-dbtool session export ses_123 --out session.json
+opencode-dbtool session export ses_123 --markdown --include-tools
+opencode-dbtool session export --out-dir exports --older-than 90d --limit 20
+opencode-dbtool session import session.json
+```
 
 ### `session delete`
 
@@ -407,8 +547,9 @@ purge` and `project delete` behave the same.
 ```
 
 On success, `deleted: true` plus a note that the file size only shrinks
-after `vacuum`. When the opencode server is running against the same
-database, the deletes go through its API and the note says so.
+after `vacuum` and that `fs clean-blob-orphans` releases orphan blobs.
+When the opencode server is running against the same database, the
+deletes go through its API and the note says so.
 
 ### `session purge`
 
@@ -445,6 +586,9 @@ expanded recursively (same semantics as `session delete`). A child session
 that does not match the filters itself is only deleted when an ancestor was
 selected.
 
+`--export-dir <dir>` exports every matching session through the running
+server before deleting it; it cannot be combined with `--restart-service`.
+
 A filter match of zero sessions is normal (exit 0), not an error:
 
 ```json
@@ -465,12 +609,13 @@ filters as `purge` (same output shape plus `action: "strip-reasoning"`).
 Filters are optional: without any, every session is stripped. Conversation
 text, tool results, messages, and sessions themselves are untouched.
 
-Reasoning lives in two places, both of which are stripped:
+Reasoning lives in three places, all of which are stripped:
 
 | location | handled how |
 | --- | --- |
-| durable `event` rows (`session.next.reasoning.started` / `.ended`) | rows deleted (`.ended` holds the full text; `.delta` is live-only and never persisted) |
+| durable `event` rows (`session.reasoning.started` / `.ended`, plus the legacy `session.next.reasoning.*`) | rows deleted (`.ended` holds the full text; `.delta` is live-only and never persisted) |
 | `session_message` assistant `content[]` | `type: "reasoning"` elements removed from the JSON, rows rewritten only when changed |
+| `session_part` rows (newer builds) | `type = 'reasoning'` rows deleted |
 
 Deleting the events also prevents reasoning from being re-projected from
 the event log. Token and cost aggregates (`tokens.reasoning`, `cost`) are
@@ -489,19 +634,23 @@ deleted).
   "sessions": [
     { "id": "ses_...",
       "reasoning_events": 4, "reasoning_event_bytes": 80000,
+      "reasoning_parts": 4, "reasoning_part_bytes": 70000,
       "messages_rewritten": 2, "rewritten_bytes": 5000 }
   ],
   "total_sessions": 1,
   "total_reasoning_events": 4,
   "total_reasoning_event_bytes": 80000,
+  "total_reasoning_parts": 4,
+  "total_reasoning_part_bytes": 70000,
   "total_messages_rewritten": 2,
   "total_rewritten_bytes": 5000,
   "stripped": false
 }
 ```
 
-After a real run the tool verifies no reasoning events or message content
-remain for the selected sessions and reports an error (exit 2) otherwise.
+After a real run the tool verifies no reasoning events, message content, or
+`session_part` rows remain for the selected sessions and reports an error
+(exit 2) otherwise.
 
 ### `fs clean-snapshots`
 
@@ -509,8 +658,9 @@ Delete snapshot storage (git object packs used for undo/redo), optionally
 scoped: `--project <id>` (repeatable) limits deletion to those projects,
 `--orphans-only` deletes only directories whose project no longer exists
 (e.g. left behind by `project delete`, which removes rows but not files).
-Without filters everything is deleted. It destroys revert history, so it is
-**refused while opencode runs** (exit 1).
+Without filters everything is deleted. Full deletion destroys revert history
+and is **refused while opencode runs** (exit 1); `--orphans-only` is safe
+online.
 
 ```json
 {
@@ -529,7 +679,8 @@ Without filters everything is deleted. It destroys revert history, so it is
 Delete shell output files (`shell/<project>/sh_*.out`). With
 `--older-than <age>` only outputs not modified since the cutoff are
 removed; without it everything goes. Empty project directories are pruned
-afterwards. Guarded while opencode runs (live runs append to these files).
+afterwards. The `--older-than` form is safe online; a full deletion is
+guarded while opencode runs because live runs append to these files.
 
 ```json
 {
@@ -542,19 +693,44 @@ afterwards. Guarded while opencode runs (live runs append to these files).
 }
 ```
 
-### `fs clean-blob-orphans`
+### `fs clean-tool-output`
 
-Delete `instruction_blob` rows referenced by no `instruction_state`
-(content-addressed blobs leak when sessions/projects are deleted, since the
-states cascade but the blobs have no FK). Run it after `purge`/`delete`
-runs. Guarded while opencode runs. `doctor` reports the same orphans.
+Delete truncated tool-output files (`tool-output/tool_*`). With
+`--older-than <age>` only files not modified since the cutoff are
+removed; without it everything goes. Safe while opencode runs (opencode
+retains these files for 7 days and prunes them itself).
 
 ```json
 {
   "dry_run": true,
-  "orphans": [ { "hash": "d43ac7...", "bytes": 1234 } ],
-  "total_blobs": 1,
-  "total_bytes": 1234,
+  "dir": "/path/tool-output",
+  "files": [ { "file": "tool_1a2b3c4d5e6f", "bytes": 51200 } ],
+  "total_files": 3,
+  "total_bytes": 153600,
+  "deleted": false
+}
+```
+
+### `fs clean-blob-orphans`
+
+Delete content-addressed blobs referenced by nothing: `instruction_blob`
+rows referenced by no `instruction_state`, and `blob` media rows
+referenced by no `blob_ref`. Instruction blobs leak when rows are deleted
+directly (the states cascade but the shared blobs have no owning FK);
+media blobs are left behind by direct deletes (and an interrupted run).
+Run it after `purge`/`delete` runs. Safe online: each delete re-checks
+references inside its transaction, so a concurrent opencode write is
+never collected.
+
+```json
+{
+  "dry_run": true,
+  "orphans": [
+    { "hash": "d43ac7...", "bytes": 1234, "kind": "instruction" },
+    { "hash": "9a12ef...", "bytes": 204800, "kind": "media" }
+  ],
+  "total_blobs": 2,
+  "total_bytes": 206034,
   "deleted": false
 }
 ```
@@ -580,6 +756,23 @@ both modes are **refused while opencode runs** (exit 1), like
 }
 ```
 
+### `fs clean-repos`
+
+Delete cached git repositories under `repos/` (entries are directories with a
+`.git` directory). `--older-than <age>` keeps entries whose newest file is
+newer than the cutoff. It is refused while opencode runs.
+
+```json
+{
+  "dry_run": true,
+  "dir": "/path/repos",
+  "entries": [ { "path": "github.com/owner/repo@main", "bytes": 1048576 } ],
+  "total_entries": 1,
+  "total_bytes": 1048576,
+  "deleted": false
+}
+```
+
 ### `backup`
 
 Create a verified timestamped backup (`opencode.db.backup-<UTC>`) without
@@ -595,28 +788,35 @@ optional `--keep-backups <n>` pruning. Safe while opencode runs.
 }
 ```
 
-`backup list [--verify]` lists the timestamped backups (newest first) with
-size and creation time; `--verify` runs an integrity check on each.
-`backup restore <file>` verifies the source, takes a safety backup of the
-current database (best effort, so a corrupt current database can still be
-recovered), removes stale WAL/SHM files, replaces the database, and
-verifies the result. It needs exclusive access (or `--restart-service`)
-and `--dry-run` reports the plan without touching anything.
+`backup list [--verify] [--sort date|size]` lists the timestamped backups
+(newest first by default) with size and creation time; `--verify` runs an
+integrity check on each. `backup restore <file>` (or `--latest`) verifies the
+source, takes a safety backup of the current database (best effort, so a
+corrupt current database can still be recovered), removes stale WAL/SHM
+files, replaces the database, and verifies the result. It needs exclusive
+access (or `--restart-service`) and `--dry-run` reports the plan without
+touching anything. `backup prune` removes old backups without creating a new
+one and requires `--keep <n>` or `--older-than <age>`.
 
 ```sh
-opencode-dbtool backup list
+opencode-dbtool backup list --verify
+opencode-dbtool backup list --sort size
+opencode-dbtool backup prune --keep 3 --dry-run
+opencode-dbtool backup restore --latest --yes
 opencode-dbtool backup restore opencode.db.backup-20260830T120000Z --yes
 ```
 
-### `kv list` / `kv show` / `kv delete`
+### `kv list` / `kv show` / `kv delete` / `kv purge`
 
 Inspect the global `kv` table, which can dominate database size (e.g. the
-multi-megabyte `models-dev:catalog` cache). `kv list [--older-than <age>]`
-prints `{key, bytes, updated}` largest first; `kv show <key>` prints the
-value truncated to 2000 chars plus `truncated` (`--raw` prints it verbatim
-with no wrapper or truncation); `kv delete <key>...` removes keys (caches
-regenerate on demand) and is guarded while opencode runs. Preview with
-`--dry-run` first.
+multi-megabyte `models-dev:catalog` cache). `kv list [--older-than <age>]
+[--search <text>]` prints `{key, bytes, updated}` largest first; `kv show
+<key>` prints the value truncated to 2000 chars plus `truncated` (`--raw`
+prints it verbatim with no wrapper or truncation); `kv delete <key>...`
+removes keys (caches regenerate on demand) and is guarded while opencode
+runs. `kv purge` requires `--older-than <age>` and/or `--larger-than
+<size>`, then removes every matching key in one pass. Preview all three
+with `--dry-run` first.
 
 ### `vacuum`
 
@@ -653,11 +853,15 @@ opencode runs (exit 1).
 }
 ```
 
+`--into <file>` writes the compacted database to a separate file instead of
+vacuuming in place; it is safe while opencode runs and cannot be combined
+with `--no-backup`, `--keep-backups`, or `--online`.
+
 With `--keep-backups <n>` (at least 1), a `backup_cleanup` block is
 added on a real run (dry-run reports nothing since no backup is touched):
 
 ```json
-"backup_cleanup": { "kept": 3, "removed_files": 7, "removed_bytes": 52428800 }
+{ "backup_cleanup": { "kept": 3, "removed_files": 7, "removed_bytes": 52428800 } }
 ```
 
 ### `db checkpoint`
@@ -679,6 +883,23 @@ the lock state instead of failing:
 }
 ```
 
+### `db path` / `db optimize` / `db query`
+
+- `db path` prints the resolved database path plus `journal_mode`,
+  `page_size`, `auto_vacuum`, `busy_timeout`, `user_version`, and `wal_bytes`.
+- `db optimize` runs `PRAGMA optimize` to refresh query-planner statistics;
+  it is safe while opencode runs.
+- `db query <sql> [--limit <n>]` prepares a single read-only `SELECT`,
+  `WITH`, or `EXPLAIN` statement and returns `columns`, `rows`, `row_count`,
+  `limit`, and `truncated`. `--limit 0` means no limit.
+
+```sh
+opencode-dbtool db path
+opencode-dbtool db optimize
+opencode-dbtool db query "SELECT id, cost FROM session_v2 ORDER BY cost DESC LIMIT 5"
+opencode-dbtool db query "SELECT COUNT(*) AS n FROM kv" --format table
+```
+
 ### `cleanup`
 
 One-shot maintenance: runs the common cleanup steps in a single guarded
@@ -689,19 +910,21 @@ command and reports each step's result. Steps, in order:
 2. `session purge` with the given filters — **without session filters no
    sessions are deleted**, so a bare `cleanup` only removes orphans and old
    files;
-3. `fs clean-blob-orphans`;
+3. `fs clean-blob-orphans` (instruction and media blobs);
 4. `fs clean-snapshots --orphans-only`;
-5. `fs clean-shell --older-than <age>` (default `7d`, change with
-   `--fs-older-than`);
+5. `fs clean-shell --older-than <age>` and `fs clean-tool-output
+   --older-than <age>` (default `7d`, change with `--fs-older-than`);
 6. `fs clean-log --older-than <age>` (same cutoff);
 7. `vacuum` (skipped with `--no-vacuum`; no second backup is taken because
    step 1 already backed up the pre-change database). **While opencode
    runs, the final VACUUM is skipped** with a note, because it needs the
-   write lock; run `opencode-dbtool vacuum --online` afterwards, or stop
-   the service. The purge step is routed through the server API, so a
-   `cleanup` with session filters is safe online.
-   `cleanup --restart-service` stops the service first instead: the purge
-   then uses the direct database path and the final VACUUM runs too.
+   write lock unless `--vacuum-online` is passed; run
+   `opencode-dbtool vacuum --online` afterwards or stop the service. The
+   purge step is routed through the server API, so a `cleanup` with session
+   filters is safe online. `cleanup --restart-service` stops the service
+   first instead: the purge then uses the direct database path and the final
+   VACUUM runs too. `--verify` runs `doctor` after a real run and embeds its
+   result as `verify`/`summary.verify_ok`.
 
 All `session purge` filters are accepted directly. `--keep-backups <n>`
 prunes older backups after the pre-run backup. The output embeds each step's
@@ -740,15 +963,15 @@ environment when set, avoiding the unauthenticated GitHub API rate limit.
 ```json
 {
   "command": "self-update",
-  "current_version": "0.3.0",
-  "latest_version": "0.3.0",
+  "current_version": "0.4.0",
+  "latest_version": "0.4.0",
   "target": "x86_64-unknown-linux-musl",
   "update_available": true,
   "updated": false,
   "dry_run": true,
   "status": "update-available",
   "path": "/home/user/.cargo/bin/opencode-dbtool",
-  "release_url": "https://github.com/orrisroot/opencode-dbtool/releases/tag/v0.3.0"
+  "release_url": "https://github.com/orrisroot/opencode-dbtool/releases/tag/v0.4.0"
 }
 ```
 
@@ -761,21 +984,38 @@ the static musl build on Linux; an unsupported local platform fails with
 exit code 2, while a release missing this platform's asset, network/API
 failures, and download problems surface as exit code 3.
 
+### `config show` / `config path`
+
+`config show` prints the effective settings (after merging the config file and
+command-line flags) plus `config_file`, `config_file_exists`, and `source`
+(`file` or `defaults`). `config path` prints the resolved config, data, and
+state directories, the selected database, `db_exists`, and the relevant
+environment variables present in the process.
+
+```sh
+opencode-dbtool config show
+opencode-dbtool config path
+```
+
 ## Configuration
 
 Optional defaults can live in `config.toml`:
 
 ```toml
 # $XDG_CONFIG_HOME/opencode-dbtool/config.toml
-format = "table"          # or "json"
+format = "table"          # or "json" / "csv"
 quiet = false
 restart_service = true    # as if --restart-service were always passed
 no_input = false
-fs_older_than = "14d"     # cleanup's shell/log cutoff
+fs_older_than = "14d"     # cleanup's shell/tool-output/log cutoff
 
 [purge]                   # defaults for session purge / strip-reasoning / cleanup
 older_than = "30d"
 subagents = true
+archived = false
+empty = false
+# larger_than = "50M"
+# keep_latest = 10
 keep_latest_per_project = 5
 # path = ["/home/user/work/a"]
 # path_prefix = ["/home/user/work"]
@@ -791,16 +1031,24 @@ standard location is ignored.
 | flag | meaning |
 | --- | --- |
 | `--dry-run`, `-n` | print actions without changing anything (safe while opencode runs) and show a `to apply:` hint |
-| `--yes`, `-y` | confirm a destructive command. On a terminal, omitting `--yes`/`--dry-run` shows the preview and asks `Proceed? [y/N]` instead; off a terminal `--yes` is required for every real run of `delete`, `purge`, `strip-reasoning`, `kv delete`, `backup`/`restore`, `fs clean-*`, `vacuum`, `cleanup`, and `self-update` |
+| `--yes`, `-y` | confirm a destructive command. On a terminal, omitting `--yes`/`--dry-run` shows the preview and asks `Proceed? [y/N]` instead; off a terminal `--yes` is required for every real run of `delete`, `purge`, `strip-reasoning`, `session import`, `kv delete`/`purge`, `backup`/`restore`/`prune`, `doctor --fix`, `fs clean-*`, `vacuum`, `cleanup`, and `self-update` |
 | `--no-input` | never prompt: destructive commands then require `--yes`, even on a terminal (useful for CI with a pseudo-TTY) |
-| `--format <table\|json>` | output format (default: table on a terminal, JSON when piped) |
+| `--format <table\|json\|csv>` | output format (default: table on a terminal, JSON when piped) |
+| `--fields <fields>` | table/CSV columns to print, comma-separated (for example `id,title,size_bytes`) |
 | `--quiet` | suppress progress and confirmation messages on stderr |
 | `--absolute` | absolute ISO timestamps in tables instead of relative ages |
 | `--no-color` | disable ANSI colors in tables (also honors `NO_COLOR`) |
+| `--color <auto\|always\|never>` | force or disable ANSI colors; `always` also works when piping |
+| `--no-pager` | disable the automatic pager on a terminal |
 | `--config <file>` | load defaults from this config file |
+| `--wait-lock <age>` | wait up to this long for the cross-process maintenance lock instead of failing immediately |
 | `--no-backup` | `vacuum`/`cleanup`: skip the timestamped backup (dangerous) |
 | `--online` | `vacuum` only: attempt VACUUM while opencode runs (may block the server briefly) |
 | `--restart-service` | stop the registered opencode service for the run and restart it afterwards (for commands that need exclusive access) |
+
+Command-specific flags include `doctor --fix`/`--max-backup-age`,
+`vacuum --into`, `cleanup --fs-older-than`/`--no-vacuum`/`--vacuum-online`/
+`--verify`, and the filters documented with each command.
 
 Destructive commands refuse to run without `--yes`, `--dry-run`, or an
 interactive terminal (exit code 2): use `--dry-run` to preview the impact
@@ -811,9 +1059,19 @@ before confirming.
 ```sh
 # Where is the space going, and what can be reclaimed?
 opencode-dbtool stats --detail
+opencode-dbtool report
 
-# Biggest sessions first
+# Biggest sessions first, and search their content
 opencode-dbtool session list --sort size --limit 10
+opencode-dbtool session search "TODO" --since 30d
+
+# Export a session for sharing, or import one sent to you
+opencode-dbtool session export ses_123 --markdown --include-tools
+opencode-dbtool session import session.json
+
+# Show the effective configuration and resolved paths
+opencode-dbtool config show
+opencode-dbtool config path
 
 # Is the online machinery healthy?
 opencode-dbtool service status
@@ -897,31 +1155,37 @@ block's `db` field. The path resolves in this order:
    to pick one. Backup files (`*.backup-*`) and WAL/SHM siblings never
    count as candidates.
 
-The filesystem storage (`snapshot/`, `log/`) always follows the data dir,
-never the database file's location — matching opencode, which keeps these
-directories in the data dir even when `OPENCODE_DB` points elsewhere.
+The filesystem storage (`snapshot/`, `shell/`, `tool-output/`, `repos/`,
+`log/`) always follows the data dir, never the database file's location —
+matching opencode, which keeps these directories in the data dir even when
+`OPENCODE_DB` points elsewhere.
 
 ## Concurrency
 
 opencode runs SQLite in WAL mode, and this tool opens the database with a
 matching busy timeout, so concurrent reads never wedge.
 
-- `stats`, `doctor`, `project list/show`, `session list/show`, `kv list/show`
-  are safe while opencode runs.
+- `stats`, `doctor`, `report`, `project list/show`, `session list/show`,
+  `session search`, `session export` (API or local Markdown), `kv
+  list/show`, `db path`, and `config show/path` read-only commands are safe
+  while opencode runs. `db optimize` and `backup prune` are also safe.
 - Running instances are detected by process name, executable path, and
-  command line (`opencode`, `opencode-server`) via the
+  command line (`opencode`, `opencode-server`, `opencode2`) via the
   [sysinfo](https://crates.io/crates/sysinfo) crate, which works on
   Linux, macOS, and Windows. Command-line matching only accepts
   invocations (e.g. `/usr/bin/opencode`), not references to opencode's
   data files.
-- Safe online: `backup`, `db checkpoint`, `fs clean-shell --older-than`,
-  `fs clean-snapshots --orphans-only`, `fs clean-blob-orphans`, and
-  `session delete`/`purge` (also the purge step of `cleanup`) when the
-  running server's API is available — see "Online maintenance" above.
-- Still refused while opencode runs (exit 1): `project delete/purge`,
-  `session strip-reasoning`, `kv delete`, `fs clean-log`, `fs
+- Safe online: `backup`, `backup prune`, `db checkpoint`, `db optimize`,
+  `vacuum --into`, `fs clean-shell --older-than`, `fs clean-tool-output
+  --older-than`, `fs clean-snapshots --orphans-only`,
+  `fs clean-blob-orphans`, `session import` (server API), and `session
+  delete`/`purge` (also the purge step of `cleanup`) when the running
+  server's API is available — see "Online maintenance" above.
+- Still refused while opencode runs (exit 1): `doctor --fix`, `project
+  delete/purge`, `session strip-reasoning`, `backup restore`, `kv
+  delete`/`purge`, `fs clean-log`, `fs clean-repos`, `fs
   clean-snapshots` without `--orphans-only`, `fs clean-shell` without
-  `--older-than`, and `vacuum` without `--online`.
+  `--older-than`, and `vacuum` without `--online` or `--into`.
   Deleting a session a running instance is using directly is not safe: the
   row is not resurrected, later writes fail FK checks, and the TUI keeps
   showing the cached session until refreshed. If detection itself fails,
@@ -937,16 +1201,22 @@ Deletes run in a single immediate transaction with `PRAGMA foreign_keys=ON`:
 
 - `event` / `event_sequence` rows for the target are deleted explicitly (they
   reference aggregates, not sessions).
+- `job` rows for the target session or its child sessions are deleted
+  explicitly: the table has no foreign keys.
+- Direct deletes leave orphan `instruction_blob`/`blob` rows for
+  `fs clean-blob-orphans` (also run by `cleanup`). The server API path
+  releases media blobs itself.
 - The `session_v2` / `project` row is deleted; `session_message`,
-  `session_inbox`, `session_pending`, `instruction_*` follow via
-  `ON DELETE CASCADE`.
+  `session_part`, `session_inbox`, `schedule`, `blob_ref`, `instruction_*`
+  and the other project-scoped tables follow via `ON DELETE CASCADE`.
 - After commit the tool verifies the rows are gone and reports an error
   (exit 2) if not.
 
 When a matching opencode server is running (same database file), `session
 delete`/`purge` use `DELETE /api/session/<id>` instead, deepest children
-first. The server removes the same rows (including `event`/`event_sequence`)
-and keeps its caches consistent; the tool verifies the result the same way.
+first. The server removes the same rows (including `event`/`event_sequence`,
+`job`, and released media blobs) and keeps its caches consistent; the tool
+verifies the result the same way.
 
 Child sessions (subagent sessions) carry a `parent_id` pointing at their
 parent. Deleting a parent session also deletes its children recursively
@@ -955,8 +1225,70 @@ like any other target. `doctor`'s `sessions_missing_parent` still detects
 children whose parent is missing for other reasons.
 
 `strip-reasoning` runs in its own immediate transaction (foreign keys on)
-that deletes matching reasoning `event` rows and rewrites `session_message`
-rows, then verifies the result.
+that deletes matching reasoning `event` and `session_part` rows, rewrites
+`session_message` rows when needed, then verifies the result.
+
+## Changelog
+
+### [0.4.0] - 2026-11-08
+
+#### Added
+
+- Resident-service maintenance: `service status`, API-routed session deletes, and the global `--restart-service` flag.
+- Backup management: `backup list --verify/--sort`, `backup restore`, `backup prune`, and `vacuum --into`.
+- Diagnostics and planning: `doctor --fix`, `doctor --max-backup-age`, `report` with costs and scoped filters, `db path`, `db optimize`, and `db query`.
+- Workflow controls: one-shot `cleanup` with summaries, `cleanup --verify`, `cleanup --vacuum-online`, `config show`/`config path`, and `--wait-lock`.
+- Session tools: `session search`, JSON/Markdown/batch `session export`, `session import`, and project/parent filters for session listings.
+- Output controls: CSV output, `--fields`, `--color`, `--no-pager`, and shell completions.
+- Storage tools: `kv purge`, `kv list --search`, `fs clean-repos`, and `fs clean-tool-output`.
+- opencode 2.2 schema support for `session_part`, `blob`/`blob_ref`, `schedule`, and `job`, including part types, media blob sizes, tool-output storage, and reasoning stripping of current events and parts.
+
+#### Changed
+
+- Reworked the CLI for interactive and scriptable use; `--dry-run` previews include a copyable apply command.
+- Session sizes and project sizes include `session_part` and referenced media blob bytes.
+- Session JSON reports `parts` and `blob_bytes`; project JSON reports `session_parts` and `blob_bytes`.
+- Direct deletes leave orphan blob rows for `fs clean-blob-orphans` (also run by `cleanup`); the server API path releases media blobs itself.
+- Expanded docs and added scheduling templates under `contrib/`.
+
+#### Removed
+
+- The session `pending` field and use of the removed `session_pending` table.
+
+#### Fixed
+
+- Hardened backup restore, made backup names unique within a second, and added maintenance locking and disk-space checks.
+- Addressed review findings across search, costs, cleanup, restart handling, and output formats.
+- Zero-match session/project purges no longer delete unrelated orphan media blobs; direct deletes leave blob cleanup to `fs clean-blob-orphans`.
+- Fixed formatting and lint failures in CI.
+
+### [0.2.0] - 2026-10-03
+
+#### Added
+
+- opencode 2.x database schema support (`session_v2`, `event`, instruction, and workspace tables).
+- `OPENCODE_DB` and channel-database resolution.
+- Detection of the `opencode2` beta executable.
+
+#### Removed
+
+- opencode 1.x database support.
+
+### [0.1.1] - 2026-09-05
+
+#### Added
+
+- `self-update` from GitHub releases.
+
+#### Fixed
+
+- Correctness, performance, and safety hardening, including database connection cleanup.
+
+### [0.1.0] - 2026-09-01
+
+#### Added
+
+- Initial release: database statistics and integrity checks, project/session deletion and retention filters, reasoning stripping, verified backups and VACUUM, and filesystem cleanup.
 
 ## License
 

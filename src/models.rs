@@ -18,15 +18,24 @@ pub struct SessionRow {
     pub sm_bytes: i64,
     pub inbox_msgs: i64,
     pub inbox_bytes: i64,
-    pub pending_msgs: i64,
-    pub pending_bytes: i64,
+    /// `session_part` rows (assistant content on newer builds).
+    pub part_msgs: i64,
+    pub part_bytes: i64,
     pub instr_bytes: i64,
+    /// Bytes of media blobs referenced by this session (shared blobs count
+    /// for every session that references them).
+    pub blob_bytes: i64,
     pub cost: f64,
 }
 
 impl SessionRow {
     pub fn size_bytes(&self) -> i64 {
-        self.event_bytes + self.sm_bytes + self.inbox_bytes + self.pending_bytes + self.instr_bytes
+        self.event_bytes
+            + self.sm_bytes
+            + self.inbox_bytes
+            + self.part_bytes
+            + self.instr_bytes
+            + self.blob_bytes
     }
 }
 
@@ -42,7 +51,8 @@ pub struct SessionOut {
     pub events: i64,
     pub session_messages: i64,
     pub inbox: i64,
-    pub pending: i64,
+    pub parts: i64,
+    pub blob_bytes: i64,
     pub size_bytes: i64,
     pub cost: f64,
 }
@@ -58,7 +68,8 @@ pub fn session_json(s: &SessionRow) -> SessionOut {
         events: s.events,
         session_messages: s.sm_msgs,
         inbox: s.inbox_msgs,
-        pending: s.pending_msgs,
+        parts: s.part_msgs,
+        blob_bytes: s.blob_bytes,
         size_bytes: s.size_bytes(),
         cost: round4(s.cost),
     }
@@ -234,14 +245,17 @@ pub struct ProjectRow {
     pub events: i64,
     pub event_bytes: i64,
     pub inbox_bytes: i64,
-    pub pending_bytes: i64,
     pub instr_bytes: i64,
+    pub part_msgs: i64,
+    pub part_bytes: i64,
+    /// Distinct media blob bytes referenced by the project's sessions.
+    pub blob_bytes: i64,
     pub cost: f64,
     pub updated: i64,
 }
 
 pub fn project_total_bytes(p: &ProjectRow) -> i64 {
-    p.sm_bytes + p.event_bytes + p.inbox_bytes + p.pending_bytes + p.instr_bytes
+    p.sm_bytes + p.event_bytes + p.inbox_bytes + p.instr_bytes + p.part_bytes + p.blob_bytes
 }
 
 /// JSON shape of a project in `project list` / `project show`.
@@ -253,6 +267,8 @@ pub struct ProjectOut {
     pub sessions: i64,
     pub events: i64,
     pub session_messages: i64,
+    pub session_parts: i64,
+    pub blob_bytes: i64,
     pub size_bytes: i64,
     pub cost: f64,
     pub updated: String,
@@ -266,6 +282,8 @@ pub fn project_json(p: &ProjectRow) -> ProjectOut {
         sessions: p.sessions,
         events: p.events,
         session_messages: p.sm_msgs,
+        session_parts: p.part_msgs,
+        blob_bytes: p.blob_bytes,
         size_bytes: project_total_bytes(p),
         cost: round4(p.cost),
         updated: dt(p.updated),
@@ -361,17 +379,18 @@ mod tests {
             sm_bytes: 40,
             inbox_msgs: 1,
             inbox_bytes: 10,
-            pending_msgs: 2,
-            pending_bytes: 20,
+            part_msgs: 2,
+            part_bytes: 20,
             instr_bytes: 5,
+            blob_bytes: 6,
             cost: 0.004594,
         };
         let v = serde_json::to_value(session_json(&s)).unwrap();
         let expected = serde_json::json!({
             "id": "ses_1", "title": "t", "directory": "/a", "parent_id": null,
             "updated": "2006-01-02T15:04:05Z", "archived": true, "events": 3,
-            "session_messages": 4, "inbox": 1, "pending": 2,
-            "size_bytes": 105, "cost": 0.0046
+            "session_messages": 4, "inbox": 1, "parts": 2,
+            "blob_bytes": 6, "size_bytes": 111, "cost": 0.0046
         });
         assert_eq!(v, expected, "session JSON contract changed");
     }
@@ -388,16 +407,19 @@ mod tests {
             events: 3,
             event_bytes: 30,
             inbox_bytes: 10,
-            pending_bytes: 20,
             instr_bytes: 5,
+            part_msgs: 2,
+            part_bytes: 20,
+            blob_bytes: 6,
             cost: 0.004594,
             updated: 1136214245000,
         };
         let v = serde_json::to_value(project_json(&p)).unwrap();
         let expected = serde_json::json!({
             "id": "p1", "worktree": "/w", "name": "n", "sessions": 1,
-            "events": 3, "session_messages": 4, "size_bytes": 105,
-            "cost": 0.0046, "updated": "2006-01-02T15:04:05Z"
+            "events": 3, "session_messages": 4, "session_parts": 2,
+            "blob_bytes": 6, "size_bytes": 111, "cost": 0.0046,
+            "updated": "2006-01-02T15:04:05Z"
         });
         assert_eq!(v, expected, "project JSON contract changed");
     }
@@ -416,9 +438,10 @@ mod tests {
             sm_bytes: 0,
             inbox_msgs: 0,
             inbox_bytes: 0,
-            pending_msgs: 0,
-            pending_bytes: 0,
+            part_msgs: 0,
+            part_bytes: 0,
             instr_bytes: 0,
+            blob_bytes: 0,
             cost: 0.0,
         }
     }

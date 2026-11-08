@@ -2,6 +2,8 @@
 //!
 //! - `clean-snapshots` deletes the git snapshot storage (undo/redo
 //!   history); it has no database relationship.
+//! - `clean-shell` / `clean-tool-output` delete per-project shell outputs
+//!   and truncated tool output.
 //! - `clean-log` truncates the append-only `log/opencode.log`.
 
 use crate::db::{env_status, EnvStatus};
@@ -62,6 +64,8 @@ struct ShellOut {
 struct BlobEntry {
     hash: String,
     bytes: i64,
+    /// `instruction` (`instruction_blob`) or `media` (`blob`).
+    kind: &'static str,
 }
 
 #[derive(Serialize)]
@@ -436,7 +440,7 @@ pub fn shell_cleanup_value(
     let dir = shell_dir(data_dir);
     let mut files: Vec<ShellEntry> = Vec::new();
     let mut total_bytes: u64 = 0;
-    collect_shell_files(&dir, &dir, cutoff, &mut files, &mut total_bytes);
+    collect_shell_files(&dir, &dir, cutoff, None, &mut files, &mut total_bytes);
     files.sort_by(|a, b| a.file.cmp(&b.file));
 
     let mut out = ShellOut {
@@ -474,6 +478,7 @@ fn collect_shell_files(
     base: &Path,
     dir: &Path,
     cutoff: Option<i64>,
+    name_prefix: Option<&str>,
     files: &mut Vec<ShellEntry>,
     total_bytes: &mut u64,
 ) {
@@ -485,8 +490,13 @@ fn collect_shell_files(
         let p = e.path();
         if let Ok(ft) = e.file_type() {
             if ft.is_dir() {
-                collect_shell_files(base, &p, cutoff, files, total_bytes);
+                collect_shell_files(base, &p, cutoff, name_prefix, files, total_bytes);
             } else if ft.is_file() {
+                if let Some(prefix) = name_prefix {
+                    if !e.file_name().to_string_lossy().starts_with(prefix) {
+                        continue;
+                    }
+                }
                 if let Some(cutoff) = cutoff {
                     match file_mtime_ms(&p) {
                         Some(mtime) if mtime < cutoff => {}
@@ -517,11 +527,79 @@ fn remove_empty_dirs(dir: &Path) {
     }
 }
 
-/// Delete orphan `instruction_blob` rows (hashes referenced by no
-/// `instruction_state`). Blobs leak when sessions/projects are deleted;
-/// run this after purges. Guarded while opencode runs: a concurrent run
-/// could store a state referencing a blob mid-cleanup (re-checked inside
-/// the transaction, but the guard keeps it simple and safe).
+/// Delete truncated tool-output files (`tool-output/tool_*`). With
+/// `--older-than` only files not modified since the cutoff are removed.
+/// opencode itself retains these for 7 days, so this is safe online.
+pub fn cmd_fs_clean_tool_output(
+    older_than: Option<&str>,
+    dry_run: bool,
+    data_dir: &Path,
+    db_path: &Path,
+) -> Result<()> {
+    output::emit(&tool_output_cleanup_value(
+        older_than, dry_run, data_dir, db_path,
+    )?)
+}
+
+/// Delete tool-output files and return the output value (also used by
+/// `cleanup`).
+pub fn tool_output_cleanup_value(
+    older_than: Option<&str>,
+    dry_run: bool,
+    data_dir: &Path,
+    db_path: &Path,
+) -> Result<serde_json::Value> {
+    let cutoff = match older_than {
+        Some(age) => Some(now_ms()? - parse_age_ms(age)?),
+        None => None,
+    };
+    let older_than_raw = older_than.map(str::to_string);
+    let dir = crate::util::tool_output_dir(data_dir);
+    let mut files: Vec<ShellEntry> = Vec::new();
+    let mut total_bytes: u64 = 0;
+    collect_shell_files(
+        &dir,
+        &dir,
+        cutoff,
+        Some("tool_"),
+        &mut files,
+        &mut total_bytes,
+    );
+    files.sort_by(|a, b| a.file.cmp(&b.file));
+
+    let mut out = ShellOut {
+        env: env_status(db_path),
+        dry_run,
+        dir: dir.to_string_lossy().to_string(),
+        older_than: older_than_raw,
+        files,
+        total_files: 0,
+        total_bytes,
+        deleted: true,
+    };
+    out.total_files = out.files.len();
+    if dry_run {
+        out.deleted = false;
+        return Ok(serde_json::to_value(&out)?);
+    }
+    for (removed, f) in out.files.iter().enumerate() {
+        if let Err(e) = std::fs::remove_file(dir.join(&f.file)) {
+            return Err(crate::error::AppError::db(format!(
+                "cannot remove {}: {e} ({removed} of {} file(s) already removed; re-run to converge)",
+                f.file,
+                out.files.len(),
+            )));
+        }
+    }
+    remove_empty_dirs(&dir);
+    Ok(serde_json::to_value(&out)?)
+}
+
+/// Delete orphan instruction/media blobs (rows referenced by nothing).
+/// Blobs leak when sessions/projects are deleted directly or a run is
+/// interrupted; run this after purges. Safe online: each delete re-checks
+/// references inside its transaction, so a concurrent opencode write is
+/// never collected.
 pub fn cmd_fs_clean_blob_orphans(
     con: &mut Connection,
     dry_run: bool,
@@ -538,15 +616,16 @@ pub fn blob_orphans_value(
     db_path: &Path,
 ) -> Result<serde_json::Value> {
     let orphans = crate::repo::blob_orphans(con)?;
-    let total_bytes: u64 = orphans.iter().map(|(_, b)| *b as u64).sum();
+    let total_bytes: u64 = orphans.iter().map(|b| b.bytes as u64).sum();
     let mut out = BlobOrphansOut {
         env: env_status(db_path),
         dry_run,
         orphans: orphans
             .iter()
-            .map(|(h, b)| BlobEntry {
-                hash: h.clone(),
-                bytes: *b,
+            .map(|b| BlobEntry {
+                hash: b.hash.clone(),
+                bytes: b.bytes,
+                kind: b.kind.as_str(),
             })
             .collect(),
         total_blobs: orphans.len(),
@@ -563,7 +642,11 @@ pub fn blob_orphans_value(
     // added an unreferenced blob between scan and delete, which stays).
     out.orphans = crate::repo::blob_orphans(con)?
         .into_iter()
-        .map(|(hash, bytes)| BlobEntry { hash, bytes })
+        .map(|b| BlobEntry {
+            hash: b.hash,
+            bytes: b.bytes,
+            kind: b.kind.as_str(),
+        })
         .collect();
     out.deleted = true;
     Ok(serde_json::to_value(&out)?)
@@ -784,6 +867,47 @@ mod tests {
         let db_path = dir.join("opencode.db");
 
         cmd_fs_clean_log(None, false, &dir, &db_path).unwrap();
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn clean_blob_orphans_removes_instruction_and_media_rows() {
+        let dir = temp_data_dir("blobs");
+        let db_path = dir.join("opencode.db");
+        let mut con = testdb::create_at(&db_path);
+        testdb::insert_session(&con, "s1", "/a", None);
+        con.execute(
+            "INSERT INTO instruction_blob (hash, value) VALUES ('instr', 'orphan')",
+            [],
+        )
+        .unwrap();
+        testdb::insert_media_blob(&con, "s1", "m1", "media", 4, false);
+
+        let v = blob_orphans_value(&mut con, true, &db_path).unwrap();
+        assert_eq!(v["total_blobs"], 2);
+        let kinds: Vec<&str> = v["orphans"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|b| b["kind"].as_str().unwrap())
+            .collect();
+        assert!(kinds.contains(&"instruction"));
+        assert!(kinds.contains(&"media"));
+
+        blob_orphans_value(&mut con, false, &db_path).unwrap();
+        assert_eq!(
+            con.query_row("SELECT COUNT(*) FROM instruction_blob", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            con.query_row("SELECT COUNT(*) FROM blob", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+
+        drop(con);
         fs::remove_dir_all(&dir).unwrap();
     }
 

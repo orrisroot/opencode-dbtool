@@ -8,8 +8,9 @@ use crate::models::{session_json, PurgeFilter, PurgeFilterJson, SessionOut};
 use crate::output;
 use crate::repo::{
     assistant_messages, child_session_ids, load_session, load_session_meta, reasoning_event_counts,
-    reasoning_events_left, reasoning_messages_left, resolve_session_id, resolve_session_ids,
-    rewrite_message, session_sizes, strip_reasoning_events,
+    reasoning_events_left, reasoning_messages_left, reasoning_part_counts, reasoning_parts_left,
+    resolve_session_id, resolve_session_ids, rewrite_message, search_hits, search_snippets,
+    session_sizes, strip_reasoning_events, strip_reasoning_parts,
 };
 use crate::service::ServiceInfo;
 use rusqlite::Connection;
@@ -83,6 +84,10 @@ struct StripSession {
     id: String,
     reasoning_events: i64,
     reasoning_event_bytes: i64,
+    /// Reasoning `session_part` rows removed (newer builds store assistant
+    /// content, including reasoning, outside the message envelope).
+    reasoning_parts: i64,
+    reasoning_part_bytes: i64,
     messages_rewritten: i64,
     rewritten_bytes: i64,
 }
@@ -98,6 +103,8 @@ struct StripOut {
     total_sessions: usize,
     total_reasoning_events: i64,
     total_reasoning_event_bytes: i64,
+    total_reasoning_parts: i64,
+    total_reasoning_part_bytes: i64,
     total_messages_rewritten: i64,
     total_rewritten_bytes: i64,
     stripped: bool,
@@ -136,6 +143,7 @@ pub fn cmd_session_list(con: &Connection, opts: &ListOptions) -> Result<()> {
             "directory",
             "updated",
             "session_messages",
+            "parts",
             "size_bytes",
             "cost",
         ],
@@ -253,56 +261,33 @@ pub fn session_search_value(
     cutoff: Option<i64>,
 ) -> Result<serde_json::Value> {
     let pattern = format!("%{}%", crate::repo::escape_like(text));
-    let hits: Vec<(String, i64, i64)> = {
-        let sql = format!(
-            "SELECT sm.session_id, COUNT(*), MAX(s.time_updated) \
-             FROM session_message sm JOIN \"{SESSION_TABLE}\" s ON s.id = sm.session_id \
-             WHERE sm.data LIKE ?1 ESCAPE '\\' AND (?2 IS NULL OR s.time_updated >= ?2) \
-             GROUP BY sm.session_id ORDER BY MAX(s.time_updated) DESC LIMIT ?3"
-        );
-        let mut stmt = con.prepare(&sql)?;
-        let rows = stmt.query_map(rusqlite::params![pattern, cutoff, limit as i64], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, i64>(1)?,
-                r.get::<_, i64>(2)?,
-            ))
-        })?;
-        rows.collect::<std::result::Result<Vec<_>, _>>()?
-    };
+    let hits = search_hits(con, &pattern, cutoff, limit)?;
 
     let mut out = Vec::new();
-    for (id, matches, updated) in hits {
+    for hit in hits {
         let (title, directory): (String, String) = con.query_row(
             &format!("SELECT COALESCE(title,''), directory FROM \"{SESSION_TABLE}\" WHERE id = ?1"),
-            rusqlite::params![id],
+            rusqlite::params![hit.session_id],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )?;
         let mut snips = Vec::new();
         if snippets > 0 {
-            let sql = "SELECT id, type, time_created, data FROM session_message \
-                       WHERE session_id = ?1 AND data LIKE ?2 ESCAPE '\\' \
-                       ORDER BY seq, id LIMIT ?3";
-            let mut stmt = con.prepare(sql)?;
-            let rows = stmt.query_map(rusqlite::params![id, pattern, snippets as i64], |r| {
-                let data: String = r.get(3)?;
-                Ok(serde_json::json!({
-                    "message_id": r.get::<_, String>(0)?,
-                    "type": r.get::<_, String>(1)?,
-                    "time": crate::util::dt(r.get::<_, i64>(2)?),
-                    "snippet": snippet(&data, text),
-                }))
-            })?;
-            for row in rows {
-                snips.push(row?);
+            for row in search_snippets(con, &hit.session_id, &pattern, snippets)? {
+                snips.push(serde_json::json!({
+                    "message_id": row.message_id,
+                    "type": row.msg_type,
+                    "source": row.source,
+                    "time": crate::util::dt(row.created),
+                    "snippet": snippet(&row.data, text),
+                }));
             }
         }
         out.push(serde_json::json!({
-            "id": id,
+            "id": hit.session_id,
             "title": title,
             "directory": directory,
-            "updated": crate::util::dt(updated),
-            "matches": matches,
+            "updated": crate::util::dt(hit.updated),
+            "matches": hit.matches,
             "snippets": snips,
         }));
     }
@@ -376,10 +361,11 @@ pub fn cmd_session_show(
         let msgs: Vec<serde_json::Value> = rows
             .iter()
             .map(|m| {
+                let data = m.merged_data();
                 let preview: String = if full {
-                    m.data.clone()
+                    data.clone()
                 } else {
-                    m.data.chars().take(300).collect()
+                    data.chars().take(300).collect()
                 };
                 serde_json::json!({
                     "id": m.id,
@@ -388,7 +374,7 @@ pub fn cmd_session_show(
                     "time": crate::util::dt(m.created),
                     "bytes": m.bytes,
                     "preview": preview,
-                    "truncated": m.data != preview,
+                    "truncated": data != preview,
                 })
             })
             .collect();
@@ -438,12 +424,18 @@ fn extract_message_text(data: &str) -> String {
                     .collect();
                 if !parts.is_empty() {
                     parts.join("\n")
+                } else if let Some(text) = v.get("text").and_then(|t| t.as_str()) {
+                    // Current user/synthetic/system messages keep their
+                    // text at the top level.
+                    text.to_string()
                 } else {
                     v.get("content")
                         .and_then(|c| c.as_str())
                         .map(str::to_string)
                         .unwrap_or_else(|| data.to_string())
                 }
+            } else if let Some(text) = v.get("text").and_then(|t| t.as_str()) {
+                text.to_string()
             } else {
                 v.get("content")
                     .and_then(|c| c.as_str())
@@ -527,7 +519,7 @@ pub fn session_markdown(con: &Connection, id: &str, include_tools: bool) -> Resu
     text.push_str(&format!("- messages: {total}\n\n"));
     for m in rows {
         text.push_str(&format!("## {} ({})\n\n", m.msg_type, dt(m.created)));
-        text.push_str(&message_markdown(&m.data, include_tools));
+        text.push_str(&message_markdown(&m.merged_data(), include_tools));
         text.push_str("\n\n");
     }
     Ok(text)
@@ -789,7 +781,7 @@ fn delete_note(via_api: bool) -> String {
     if via_api {
         "deleted through the running opencode server".to_string()
     } else {
-        "file size is unchanged until `opencode-dbtool vacuum` is run".to_string()
+        "file size is unchanged until `opencode-dbtool vacuum` is run; run `fs clean-blob-orphans` to release orphan blobs".to_string()
     }
 }
 
@@ -881,11 +873,11 @@ pub fn session_purge_value(
 /// Delete reasoning content of the sessions selected by filters (optional
 /// filters: none = every session). Conversation text is untouched.
 ///
-/// Reasoning lives in durable `event` rows
-/// (`session.next.reasoning.started` / `.ended`; the full text lives in
-/// `.ended`) and in `session_message` assistant `content[]`. Removing the
-/// events also prevents reasoning from being re-projected from the event
-/// log. Token/cost aggregates are kept.
+/// Reasoning lives in durable `event` rows (`session.reasoning.*` and the
+/// legacy `session.next.reasoning.*`), in `session_message` assistant
+/// `content[]`, and, on newer builds, in reasoning `session_part` rows.
+/// Removing the events also prevents reasoning from being re-projected
+/// from the event log. Token/cost aggregates are kept.
 pub fn cmd_session_strip_reasoning(
     con: &mut Connection,
     filters: &PurgeFilter,
@@ -900,6 +892,12 @@ pub fn cmd_session_strip_reasoning(
         std::collections::HashMap::new();
     for (id, n, bytes) in reasoning_event_counts(con, &selected)? {
         event_map.insert(id, (n, bytes));
+    }
+    // Reasoning session_part rows, per session.
+    let mut part_map: std::collections::HashMap<String, (i64, i64)> =
+        std::collections::HashMap::new();
+    for (id, n, bytes) in reasoning_part_counts(con, &selected)? {
+        part_map.insert(id, (n, bytes));
     }
     // session_message reasoning (requires parsing the JSON).
     let mut message_map: std::collections::HashMap<String, (i64, i64)> =
@@ -917,7 +915,7 @@ pub fn cmd_session_strip_reasoning(
     }
 
     let mut all_ids: Vec<String> = event_map.keys().cloned().collect();
-    for id in message_map.keys() {
+    for id in part_map.keys().chain(message_map.keys()) {
         if !all_ids.contains(id) {
             all_ids.push(id.clone());
         }
@@ -927,19 +925,26 @@ pub fn cmd_session_strip_reasoning(
     let mut sessions_arr: Vec<StripSession> = Vec::new();
     let mut total_events: i64 = 0;
     let mut total_event_bytes: i64 = 0;
+    let mut total_parts: i64 = 0;
+    let mut total_part_bytes: i64 = 0;
     let mut total_messages: i64 = 0;
     let mut total_rewritten_bytes: i64 = 0;
     for id in &all_ids {
         let (events, event_bytes) = event_map.get(id).copied().unwrap_or((0, 0));
+        let (parts, part_bytes) = part_map.get(id).copied().unwrap_or((0, 0));
         let (messages, rewritten_bytes) = message_map.get(id).copied().unwrap_or((0, 0));
         total_events += events;
         total_event_bytes += event_bytes;
+        total_parts += parts;
+        total_part_bytes += part_bytes;
         total_messages += messages;
         total_rewritten_bytes += rewritten_bytes;
         sessions_arr.push(StripSession {
             id: id.clone(),
             reasoning_events: events,
             reasoning_event_bytes: event_bytes,
+            reasoning_parts: parts,
+            reasoning_part_bytes: part_bytes,
             messages_rewritten: messages,
             rewritten_bytes,
         });
@@ -953,6 +958,8 @@ pub fn cmd_session_strip_reasoning(
         total_sessions: 0,
         total_reasoning_events: total_events,
         total_reasoning_event_bytes: total_event_bytes,
+        total_reasoning_parts: total_parts,
+        total_reasoning_part_bytes: total_part_bytes,
         total_messages_rewritten: total_messages,
         total_rewritten_bytes,
         stripped: false,
@@ -966,6 +973,7 @@ pub fn cmd_session_strip_reasoning(
     con.execute_batch("PRAGMA foreign_keys = ON;")?;
     let tx = con.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     strip_reasoning_events(&tx, &selected)?;
+    strip_reasoning_parts(&tx, &selected)?;
     for (id, _session_id, new_data) in &rewrites {
         rewrite_message(&tx, id, new_data)?;
     }
@@ -975,6 +983,12 @@ pub fn cmd_session_strip_reasoning(
     if events_left != 0 {
         return Err(AppError::usage(format!(
             "reasoning events still remain after strip: {events_left}"
+        )));
+    }
+    let parts_left = reasoning_parts_left(con, &selected)?;
+    if parts_left != 0 {
+        return Err(AppError::usage(format!(
+            "reasoning parts still remain after strip: {parts_left}"
         )));
     }
     let messages_left = reasoning_messages_left(con, &selected)?;
@@ -1089,15 +1103,25 @@ fn expand_children(con: &Connection, ids: &mut Vec<String>) -> Result<()> {
 /// Tables counted in a session delete preview, in stable output order.
 /// `event_sequence` rows reference aggregates (not sessions) and are deleted
 /// explicitly alongside `event` rows, so they are counted separately here to
-/// keep the dry-run total exact.
-const PREVIEW_TABLES: [(&str, &str); 7] = [
-    ("session_message", "session_id"),
-    ("session_inbox", "session_id"),
-    ("session_pending", "session_id"),
-    ("instruction_entry", "session_id"),
-    ("instruction_state", "session_id"),
-    ("event", "aggregate_id"),
-    ("event_sequence", "aggregate_id"),
+/// keep the dry-run total exact. `job` has no foreign keys and is deleted
+/// explicitly.
+enum PreviewKey {
+    Session(&'static str),
+    Aggregate(&'static str),
+    Job,
+}
+
+const PREVIEW_TABLES: [(&str, PreviewKey); 10] = [
+    ("session_message", PreviewKey::Session("session_id")),
+    ("session_part", PreviewKey::Session("session_id")),
+    ("session_inbox", PreviewKey::Session("session_id")),
+    ("instruction_entry", PreviewKey::Session("session_id")),
+    ("instruction_state", PreviewKey::Session("session_id")),
+    ("schedule", PreviewKey::Session("session_id")),
+    ("blob_ref", PreviewKey::Session("session_id")),
+    ("event", PreviewKey::Aggregate("aggregate_id")),
+    ("event_sequence", PreviewKey::Aggregate("aggregate_id")),
+    ("job", PreviewKey::Job),
 ];
 
 /// Per-session preview rows (id + per-table counts + total) and the
@@ -1106,8 +1130,15 @@ const PREVIEW_TABLES: [(&str, &str); 7] = [
 /// instead of per-session queries; every table key is present, zero
 /// counts included.
 fn preview_impact(con: &Connection, ids: &[String]) -> Result<(i64, Vec<DeleteSessionRow>)> {
-    let mut per_session = HashMap::<String, Vec<(&str, i64)>>::new();
-    for (table, id_col) in PREVIEW_TABLES {
+    let mut per_session = HashMap::<String, HashMap<&'static str, i64>>::new();
+    for (table, key) in &PREVIEW_TABLES {
+        if !crate::db::table_exists(con, table)? {
+            continue;
+        }
+        let id_col = match key {
+            PreviewKey::Session(col) | PreviewKey::Aggregate(col) => *col,
+            PreviewKey::Job => continue,
+        };
         for chunk in ids.chunks(SQL_VAR_CHUNK) {
             if chunk.is_empty() {
                 continue;
@@ -1123,22 +1154,60 @@ fn preview_impact(con: &Connection, ids: &[String]) -> Result<(i64, Vec<DeleteSe
             })?;
             for r in rows {
                 let (sid, n) = r?;
-                per_session.entry(sid).or_default().push((table, n));
+                *per_session
+                    .entry(sid)
+                    .or_default()
+                    .entry(table)
+                    .or_insert(0) += n;
+            }
+        }
+    }
+    if crate::db::table_exists(con, "job")? {
+        // A job belongs to its session, or to its child session when the
+        // parent is not itself selected.
+        let selected: HashSet<&str> = ids.iter().map(String::as_str).collect();
+        for chunk in ids.chunks(SQL_VAR_CHUNK) {
+            let in_sql = placeholders(chunk.len());
+            let sql = format!(
+                "SELECT session_id, child_session_id FROM job \
+                 WHERE session_id IN ({in_sql}) OR child_session_id IN ({in_sql})"
+            );
+            let params_vec: Vec<&str> = chunk
+                .iter()
+                .map(String::as_str)
+                .chain(chunk.iter().map(String::as_str))
+                .collect();
+            let mut stmt = con.prepare(&sql)?;
+            let rows = stmt.query_map(rusqlite::params_from_iter(params_vec), |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
+            })?;
+            for row in rows {
+                let (session_id, child_id) = row?;
+                let owner = if selected.contains(session_id.as_str()) {
+                    session_id
+                } else {
+                    child_id.unwrap_or(session_id)
+                };
+                *per_session
+                    .entry(owner)
+                    .or_default()
+                    .entry("job")
+                    .or_insert(0) += 1;
             }
         }
     }
     let mut total_rows: i64 = 0;
     let mut sessions: Vec<DeleteSessionRow> = Vec::new();
     for id in ids {
+        let counts = per_session.remove(id).unwrap_or_default();
         let mut rows_map = serde_json::Map::new();
         for (table, _) in PREVIEW_TABLES {
-            rows_map.insert(table.to_string(), serde_json::json!(0));
+            rows_map.insert(
+                table.to_string(),
+                serde_json::json!(counts.get(table).copied().unwrap_or(0)),
+            );
         }
-        let mut total: i64 = 1; // the session row itself
-        for (table, n) in per_session.remove(id).unwrap_or_default() {
-            total += n;
-            rows_map.insert(table.to_string(), serde_json::json!(n));
-        }
+        let total: i64 = 1 + counts.values().sum::<i64>(); // + the session row
         total_rows += total;
         sessions.push(DeleteSessionRow {
             id: id.clone(),
@@ -1156,14 +1225,32 @@ fn placeholders(n: usize) -> String {
 
 /// Delete the given sessions in a single immediate transaction and verify
 /// they are gone. Related rows follow via `ON DELETE CASCADE`; `event` /
-/// `event_sequence` rows (which reference aggregates, not sessions) are
-/// deleted explicitly.
+/// `event_sequence` rows (which reference aggregates, not sessions) and
+/// `job` rows (no foreign keys) are deleted explicitly. Media blobs are
+/// left for `fs clean-blob-orphans` (also run by `cleanup`).
 fn execute_delete(con: &mut Connection, resolved: &[String]) -> Result<()> {
+    if resolved.is_empty() {
+        return Ok(());
+    }
     output::progress("deleting sessions");
     con.execute_batch("PRAGMA foreign_keys = ON;")?;
+    let has_jobs = crate::db::table_exists(con, "job")?;
     let tx = con.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     for chunk in resolved.chunks(SQL_VAR_CHUNK) {
         let in_sql = placeholders(chunk.len());
+        if has_jobs {
+            tx.execute(
+                &format!(
+                    "DELETE FROM job WHERE session_id IN ({in_sql}) OR child_session_id IN ({in_sql})"
+                ),
+                rusqlite::params_from_iter(
+                    chunk
+                        .iter()
+                        .map(String::as_str)
+                        .chain(chunk.iter().map(String::as_str)),
+                ),
+            )?;
+        }
         tx.execute(
             &format!("DELETE FROM event WHERE aggregate_id IN ({in_sql})"),
             rusqlite::params_from_iter(chunk),
@@ -1405,6 +1492,50 @@ mod tests {
     }
 
     #[test]
+    fn delete_removes_jobs_and_leaves_media_for_blob_cleanup() {
+        let mut con = testdb::create();
+        testdb::insert_session(&con, "s1", "/a", None);
+        testdb::insert_session_message(&con, "m1", "s1", "assistant", "{}");
+        testdb::insert_media_blob(&con, "s1", "m1", "live", 4, true);
+        testdb::insert_media_blob(&con, "s1", "m1", "gone", 3, false);
+        testdb::insert_job(&con, "j1", "s1", None);
+
+        cmd_session_delete(
+            &mut con,
+            &["s1".to_string()],
+            false,
+            Path::new("/tmp/x.db"),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            con.query_row("SELECT COUNT(*) FROM job", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        // Session rows cascade away, but media blobs are left for the
+        // explicit orphan cleanup (also run by `cleanup`).
+        assert_eq!(
+            con.query_row("SELECT COUNT(*) FROM blob_ref", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            con.query_row("SELECT COUNT(*) FROM blob", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+        let (rows, _) = crate::repo::delete_blob_orphans(&mut con).unwrap();
+        assert_eq!(rows, 2);
+        assert_eq!(
+            con.query_row("SELECT COUNT(*) FROM blob", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
     fn delete_leaf_keeps_parent() {
         let mut con = testdb::create();
         testdb::insert_session(&con, "parent", "/a", None);
@@ -1453,7 +1584,7 @@ mod tests {
         assert_eq!(total, 2); // session row + session_message row
         let row = serde_json::to_value(&arr[0]).unwrap();
         let rows = row["rows"].as_object().unwrap();
-        assert_eq!(rows.len(), 7, "all counted tables present");
+        assert_eq!(rows.len(), 10, "all counted tables present");
         assert_eq!(rows["session_message"], 1);
         assert_eq!(rows["session_inbox"], 0);
         assert_eq!(rows["event"], 0);
@@ -1522,12 +1653,16 @@ mod tests {
                 id: "ses_1".into(),
                 reasoning_events: 1,
                 reasoning_event_bytes: 50,
+                reasoning_parts: 3,
+                reasoning_part_bytes: 25,
                 messages_rewritten: 2,
                 rewritten_bytes: 5,
             }],
             total_sessions: 1,
             total_reasoning_events: 1,
             total_reasoning_event_bytes: 50,
+            total_reasoning_parts: 3,
+            total_reasoning_part_bytes: 25,
             total_messages_rewritten: 2,
             total_rewritten_bytes: 5,
             stripped: false,
@@ -1543,9 +1678,11 @@ mod tests {
                          "keep_latest_per_project": null },
             "sessions": [ { "id": "ses_1",
                             "reasoning_events": 1, "reasoning_event_bytes": 50,
+                            "reasoning_parts": 3, "reasoning_part_bytes": 25,
                             "messages_rewritten": 2, "rewritten_bytes": 5 } ],
             "total_sessions": 1,
             "total_reasoning_events": 1, "total_reasoning_event_bytes": 50,
+            "total_reasoning_parts": 3, "total_reasoning_part_bytes": 25,
             "total_messages_rewritten": 2, "total_rewritten_bytes": 5,
             "stripped": false
         });
@@ -2040,6 +2177,20 @@ mod tests {
     }
 
     #[test]
+    fn message_text_reads_current_user_shape() {
+        assert_eq!(
+            extract_message_text(r#"{"type":"user","text":"hello","files":[]}"#),
+            "hello"
+        );
+        assert_eq!(
+            extract_message_text(
+                r#"{"type":"assistant","content":[{"type":"text","text":"a"},{"type":"text","text":"b"}]}"#
+            ),
+            "a\nb"
+        );
+    }
+
+    #[test]
     fn verification_detects_reasoning_by_json_semantics() {
         let con = testdb::create();
         testdb::insert_session(&con, "s1", "/a", None);
@@ -2085,7 +2236,7 @@ mod tests {
             "session.next.reasoning.ended",
             r#"{"reasoningID":"r1","text":"chain of thought"}"#,
         );
-        testdb::insert_event(&con, "s1", "session.next.text.ended", r#"{"text":"hello"}"#);
+        testdb::insert_event(&con, "s1", "session.text.ended", r#"{"text":"hello"}"#);
 
         cmd_session_strip_reasoning(&mut con, &strip_filter(&[]), false, Path::new("/tmp/x.db"))
             .unwrap();
@@ -2097,7 +2248,60 @@ mod tests {
             .unwrap()
             .collect::<std::result::Result<Vec<_>, _>>()
             .unwrap();
-        assert_eq!(remaining, vec!["session.next.text.ended"]);
+        assert_eq!(remaining, vec!["session.text.ended"]);
+    }
+
+    #[test]
+    fn strip_reasoning_removes_current_events_and_parts() {
+        let mut con = testdb::create();
+        testdb::insert_session(&con, "s1", "/a", None);
+        testdb::insert_session_message(&con, "m1", "s1", "assistant", "{}");
+        testdb::insert_part(
+            &con,
+            "m1",
+            "s1",
+            0,
+            "reasoning",
+            r#"{"type":"reasoning","text":"part thought"}"#,
+        );
+        testdb::insert_part(
+            &con,
+            "m1",
+            "s1",
+            1,
+            "text",
+            r#"{"type":"text","text":"answer"}"#,
+        );
+        testdb::insert_event(
+            &con,
+            "s1",
+            "session.reasoning.ended",
+            r#"{"text":"thought"}"#,
+        );
+
+        cmd_session_strip_reasoning(&mut con, &strip_filter(&[]), false, Path::new("/tmp/x.db"))
+            .unwrap();
+
+        assert_eq!(
+            con.query_row("SELECT COUNT(*) FROM session_part", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            con.query_row(
+                "SELECT type FROM session_part WHERE message_id = 'm1'",
+                [],
+                |r| r.get::<_, String>(0)
+            )
+            .unwrap(),
+            "text"
+        );
+        assert_eq!(
+            con.query_row("SELECT COUNT(*) FROM event", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
     }
 
     #[test]
@@ -2269,6 +2473,31 @@ mod tests {
     }
 
     #[test]
+    fn zero_match_purge_leaves_orphan_media_blobs() {
+        let mut con = testdb::create();
+        testdb::insert_session(&con, "s1", "/a", None);
+        testdb::insert_media_blob(&con, "s1", "m1", "orphan", 3, false);
+
+        let value = session_purge_value(
+            &mut con,
+            &filter(&["--path".to_string(), "/nonexistent".to_string()]),
+            false,
+            Path::new("/tmp/x.db"),
+            None,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(value["sessions"].as_array().unwrap().len(), 0);
+        assert_eq!(
+            con.query_row("SELECT COUNT(*) FROM blob", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            1,
+            "a zero-match purge must not delete unrelated media blobs"
+        );
+    }
+
+    #[test]
     fn preview_counts_v2_tables() {
         let con = testdb::create();
         testdb::insert_session(&con, "s1", "/a", None);
@@ -2278,7 +2507,7 @@ mod tests {
         let rows = &arr[0].rows;
         assert_eq!(rows["session_message"], 1);
         assert_eq!(rows["event_sequence"], 0);
-        assert_eq!(rows.len(), 7);
+        assert_eq!(rows.len(), 10);
     }
 
     #[test]

@@ -311,7 +311,9 @@ impl ServiceInfo {
             .map_err(|e| AppError::db(format!("invalid /api/info response: {e}")))
     }
 
-    /// `GET /api/experimental/session/{id}/export` (raw export body).
+    /// `GET /api/experimental/session/{id}/export` (the transfer payload
+    /// itself: `{info, messages}`, which is what
+    /// `/api/experimental/session/import` accepts).
     pub fn export_session(&self, id: &str) -> Result<String> {
         let (status, body) = self.get_json(&format!("/api/experimental/session/{id}/export"))?;
         if status != 200 {
@@ -320,7 +322,14 @@ impl ServiceInfo {
                 body.trim()
             )));
         }
-        Ok(body)
+        // The HTTP success envelope is `{"data": {info, messages}}`;
+        // strip it so the file can be imported back unchanged. Earlier
+        // server builds may already return the payload directly.
+        let value: serde_json::Value = serde_json::from_str(&body)
+            .map_err(|e| AppError::db(format!("invalid export response for {id}: {e}")))?;
+        let payload = value.get("data").cloned().unwrap_or(value);
+        serde_json::to_string(&payload)
+            .map_err(|e| AppError::db(format!("cannot encode export for {id}: {e}")))
     }
 
     /// `POST /api/experimental/session/import`; returns the server's JSON
@@ -328,6 +337,9 @@ impl ServiceInfo {
     pub fn import_session(&self, body: &str) -> Result<serde_json::Value> {
         let value: serde_json::Value = serde_json::from_str(body)
             .map_err(|e| AppError::usage(format!("invalid import file: {e}")))?;
+        // Accept files written by `session export` (the transfer payload)
+        // and older wrappers that still carry it under `data`.
+        let value = value.get("data").cloned().unwrap_or(value);
         let url = format!("{}/api/experimental/session/import", self.url);
         let mut request = Self::agent().post(&url);
         if let Some(header) = self.auth_header() {
@@ -601,7 +613,18 @@ mod tests {
     }
 
     #[test]
-    fn api_import_posts_the_json_body() {
+    fn api_export_unwraps_the_data_envelope() {
+        let (url, _rx, handle) =
+            mock_server(200, r#"{"data":{"info":{"id":"ses_1"},"messages":[]}}"#);
+        let body = service_at(url).export_session("ses_1").unwrap();
+        handle.join().unwrap();
+        let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(value["info"]["id"], "ses_1");
+        assert!(value.get("data").is_none(), "envelope stripped: {body}");
+    }
+
+    #[test]
+    fn api_import_accepts_the_export_payload() {
         let (url, rx, handle) = mock_server(200, r#"{"id":"ses_new"}"#);
         let value = service_at(url)
             .import_session(r#"{"session":{"id":"x"}}"#)

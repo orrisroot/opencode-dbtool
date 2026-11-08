@@ -115,6 +115,12 @@ pub fn shell_dir(data_dir: &Path) -> PathBuf {
     data_dir.join("shell")
 }
 
+/// `tool-output` dir under the data dir (truncated tool output files,
+/// `tool_*`).
+pub fn tool_output_dir(data_dir: &Path) -> PathBuf {
+    data_dir.join("tool-output")
+}
+
 /// `repos` dir under the data dir (cached git repositories).
 pub fn repos_dir(data_dir: &Path) -> PathBuf {
     data_dir.join("repos")

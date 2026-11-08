@@ -198,6 +198,9 @@ fn mutation_guard<'a>(
                 Some("shell outputs are in use while opencode runs")
             },
         )),
+        // opencode prunes tool output on its own; removing old files is
+        // safe while it runs.
+        Command::Fs(FsCmd::ToolOutput(_)) => Some(("fs clean-tool-output", None)),
         // Blob cleanup re-checks references inside its transaction.
         Command::Fs(FsCmd::BlobOrphans) => Some(("fs clean-blob-orphans", None)),
         Command::Fs(FsCmd::Log(_)) => Some((
@@ -606,6 +609,12 @@ fn dispatch(
             FsCmd::Shell(a) => {
                 commands::fsops::cmd_fs_clean_shell(a.older_than.as_deref(), dry_run, dir, db_path)
             }
+            FsCmd::ToolOutput(a) => commands::fsops::cmd_fs_clean_tool_output(
+                a.older_than.as_deref(),
+                dry_run,
+                dir,
+                db_path,
+            ),
             FsCmd::BlobOrphans => {
                 let mut con = db::open_conn(db_path, dry_run)?;
                 commands::fsops::cmd_fs_clean_blob_orphans(&mut con, dry_run, db_path)

@@ -25,18 +25,23 @@ fn temp_dir(stem: &str) -> PathBuf {
 fn create_db(db_path: &Path) {
     let con = Connection::open(db_path).unwrap();
     con.execute_batch(
-        "CREATE TABLE project (id TEXT PRIMARY KEY, worktree TEXT, name TEXT);
-         CREATE TABLE session_v2 (id TEXT PRIMARY KEY, directory TEXT, title TEXT, parent_id TEXT, project_id TEXT, workspace_id TEXT, fork_session_id TEXT, time_updated INTEGER, cost REAL, time_archived INTEGER, version TEXT NOT NULL DEFAULT '2.0.0');
+        "CREATE TABLE project (id TEXT PRIMARY KEY, worktree TEXT, name TEXT, time_archived INTEGER);
+         CREATE TABLE session_v2 (id TEXT PRIMARY KEY, directory TEXT, title TEXT, parent_id TEXT, project_id TEXT, workspace_id TEXT, fork_session_id TEXT, time_updated INTEGER, cost REAL, time_archived INTEGER, time_busy INTEGER, version TEXT NOT NULL DEFAULT '2.2.0');
          CREATE TABLE session_message (id TEXT PRIMARY KEY, session_id TEXT, type TEXT, seq INTEGER NOT NULL DEFAULT 0, data TEXT, time_created INTEGER NOT NULL DEFAULT 0);
+         CREATE TABLE session_part (message_id TEXT NOT NULL, session_id TEXT NOT NULL, ordinal INTEGER NOT NULL, type TEXT NOT NULL, call_id TEXT, time_created INTEGER NOT NULL DEFAULT 0, time_updated INTEGER NOT NULL DEFAULT 0, data TEXT NOT NULL, PRIMARY KEY (message_id, ordinal));
          CREATE TABLE session_inbox (id TEXT PRIMARY KEY, session_id TEXT, type TEXT, payload TEXT NOT NULL, delivery TEXT NOT NULL, enqueued_seq INTEGER NOT NULL DEFAULT 0, time_created INTEGER NOT NULL DEFAULT 0);
-         CREATE TABLE session_pending (id TEXT PRIMARY KEY, session_id TEXT, type TEXT, data TEXT NOT NULL, delivery TEXT, admitted_seq INTEGER NOT NULL DEFAULT 0, time_created INTEGER NOT NULL DEFAULT 0);
          CREATE TABLE instruction_entry (session_id TEXT, key TEXT, value TEXT, PRIMARY KEY (session_id, key));
          CREATE TABLE instruction_state (session_id TEXT PRIMARY KEY, epoch_start INTEGER NOT NULL DEFAULT 0, through_seq INTEGER NOT NULL DEFAULT 0, initial_values TEXT NOT NULL DEFAULT '{}', current_values TEXT NOT NULL DEFAULT '{}');
          CREATE TABLE instruction_blob (hash TEXT PRIMARY KEY, value TEXT);
+         CREATE TABLE blob (hash TEXT PRIMARY KEY, mime TEXT NOT NULL, bytes INTEGER NOT NULL, width INTEGER, height INTEGER, data BLOB NOT NULL, time_created INTEGER NOT NULL DEFAULT 0);
+         CREATE TABLE blob_ref (session_id TEXT NOT NULL, message_id TEXT NOT NULL, hash TEXT NOT NULL, seq INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (session_id, message_id, hash));
          CREATE TABLE event (aggregate_id TEXT, type TEXT, data BLOB);
          CREATE TABLE event_sequence (aggregate_id TEXT PRIMARY KEY, seq INTEGER NOT NULL DEFAULT 0, owner_id TEXT);
          CREATE TABLE permission (project_id TEXT);
+         CREATE TABLE project_directory (project_id TEXT, directory TEXT);
          CREATE TABLE worktree (project_id TEXT, directory TEXT);
+         CREATE TABLE schedule (id TEXT PRIMARY KEY, session_id TEXT, type TEXT, data TEXT);
+         CREATE TABLE job (notification_id TEXT PRIMARY KEY, id TEXT, session_id TEXT NOT NULL, child_session_id TEXT, kind TEXT, title TEXT, status TEXT, output TEXT, error TEXT, recovery TEXT NOT NULL DEFAULT '{}', time_created INTEGER NOT NULL DEFAULT 0, time_updated INTEGER NOT NULL DEFAULT 0);
          CREATE TABLE kv (key TEXT PRIMARY KEY, value TEXT NOT NULL, time_created INTEGER NOT NULL DEFAULT 0, time_updated INTEGER NOT NULL DEFAULT 0);
          CREATE TABLE workspace (id TEXT PRIMARY KEY, provider TEXT NOT NULL);",
     )
@@ -66,8 +71,14 @@ fn create_db(db_path: &Path) {
     )
     .unwrap();
     con.execute(
+        "INSERT INTO session_part (message_id, session_id, ordinal, type, data) \
+         VALUES ('m1', 'ses_1', 0, 'reasoning', '{\"type\":\"reasoning\",\"text\":\"part-think\"}')",
+        [],
+    )
+    .unwrap();
+    con.execute(
         "INSERT INTO event (aggregate_id, type, data) \
-         VALUES ('ses_1', 'session.next.reasoning.ended', '{\"text\":\"think\"}')",
+         VALUES ('ses_1', 'session.reasoning.ended', '{\"text\":\"think\"}')",
         [],
     )
     .unwrap();
@@ -246,6 +257,7 @@ fn strip_reasoning_works_with_filters() {
     let v = stdout_json(&out);
     assert_eq!(v["action"], "strip-reasoning");
     assert_eq!(v["total_reasoning_events"], 1);
+    assert_eq!(v["total_reasoning_parts"], 1);
     assert_eq!(v["total_messages_rewritten"], 1);
     assert_eq!(v["stripped"], false);
 
@@ -450,15 +462,12 @@ fn v1_schema_is_rejected_exit_3() {
 
 #[test]
 fn removed_fs_commands_are_unknown() {
-    // V1 `storage/session_diff` and `tool-output` are gone with V1
-    // support: the commands no longer exist.
+    // The V1 `storage/session_diff` command no longer exists.
     let dir = temp_dir("removed-fs");
     create_db(&dir.join("opencode.db"));
 
-    for args in [vec!["fs", "clean-orphans"], vec!["fs", "clean-tool-output"]] {
-        let out = run(&args, &dir);
-        assert_eq!(out.status.code(), Some(2), "args: {args:?}");
-    }
+    let out = run(&["fs", "clean-orphans"], &dir);
+    assert_eq!(out.status.code(), Some(2), "args: clean-orphans");
 
     std::fs::remove_dir_all(&dir).unwrap();
 }
@@ -1783,7 +1792,7 @@ fn csv_format_and_fields() {
     );
     let text = String::from_utf8_lossy(&out.stdout);
     assert!(
-        text.starts_with("id,title,directory,updated,session_messages,size_bytes,cost\n"),
+        text.starts_with("id,title,directory,updated,session_messages,parts,size_bytes,cost\n"),
         "stdout: {text}"
     );
     assert!(text.contains("ses_1"), "stdout: {text}");
@@ -1945,6 +1954,161 @@ fn session_search_finds_messages() {
         "snippet: {}",
         v[0]["snippets"][0]["snippet"]
     );
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn older_v2_schema_without_new_tables_still_works() {
+    let dir = temp_dir("v2-old");
+    let db = dir.join("opencode.db");
+    {
+        let con = Connection::open(&db).unwrap();
+        con.execute_batch(
+            "CREATE TABLE project (id TEXT PRIMARY KEY, worktree TEXT, name TEXT);
+             CREATE TABLE session_v2 (id TEXT PRIMARY KEY, directory TEXT, title TEXT, parent_id TEXT, project_id TEXT, workspace_id TEXT, fork_session_id TEXT, time_updated INTEGER, cost REAL, time_archived INTEGER, version TEXT NOT NULL DEFAULT '2.0.0');
+             CREATE TABLE session_message (id TEXT PRIMARY KEY, session_id TEXT, type TEXT, seq INTEGER NOT NULL DEFAULT 0, data TEXT, time_created INTEGER NOT NULL DEFAULT 0);
+             CREATE TABLE session_inbox (id TEXT PRIMARY KEY, session_id TEXT, type TEXT, payload TEXT NOT NULL, delivery TEXT NOT NULL, enqueued_seq INTEGER NOT NULL DEFAULT 0, time_created INTEGER NOT NULL DEFAULT 0);
+             CREATE TABLE instruction_entry (session_id TEXT, key TEXT, value TEXT, PRIMARY KEY (session_id, key));
+             CREATE TABLE instruction_state (session_id TEXT PRIMARY KEY, epoch_start INTEGER NOT NULL DEFAULT 0, through_seq INTEGER NOT NULL DEFAULT 0, initial_values TEXT NOT NULL DEFAULT '{}', current_values TEXT NOT NULL DEFAULT '{}');
+             CREATE TABLE instruction_blob (hash TEXT PRIMARY KEY, value TEXT);
+             CREATE TABLE event (aggregate_id TEXT, type TEXT, data BLOB);
+             CREATE TABLE event_sequence (aggregate_id TEXT PRIMARY KEY, seq INTEGER NOT NULL DEFAULT 0, owner_id TEXT);
+             CREATE TABLE permission (project_id TEXT);
+             CREATE TABLE worktree (project_id TEXT, directory TEXT);
+             CREATE TABLE workspace (id TEXT PRIMARY KEY, provider TEXT NOT NULL);",
+        )
+        .unwrap();
+        con.execute(
+            "INSERT INTO session_v2 (id, directory, title, time_updated, cost) \
+             VALUES ('ses_old', '/work/a', 'old', 0, 0)",
+            [],
+        )
+        .unwrap();
+        con.execute(
+            "INSERT INTO session_message (id, session_id, type, data) \
+             VALUES ('m1', 'ses_old', 'assistant', '{\"content\":[{\"type\":\"reasoning\",\"text\":\"x\"}]}')",
+            [],
+        )
+        .unwrap();
+    }
+
+    for args in [
+        vec!["stats"],
+        vec!["doctor"],
+        vec!["session", "list"],
+        vec!["session", "show", "ses_old", "--messages"],
+        vec!["session", "delete", "ses_old", "--dry-run"],
+    ] {
+        let out = run(&args, &dir);
+        assert!(
+            out.status.success(),
+            "args: {args:?} stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn session_parts_are_previewed_and_searchable() {
+    let dir = temp_dir("search-part");
+    let db = dir.join("opencode.db");
+    create_db(&db);
+
+    let out = run(&["session", "show", "ses_1", "--messages", "--full"], &dir);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v = stdout_json(&out);
+    let preview = v["messages"][0]["preview"].as_str().unwrap();
+    assert!(preview.contains("part-think"), "preview: {preview}");
+    assert!(preview.contains("\"think\""), "preview: {preview}");
+
+    let out = run(&["session", "search", "part-think"], &dir);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v = stdout_json(&out);
+    assert_eq!(v.as_array().unwrap().len(), 1);
+    assert_eq!(v[0]["snippets"][0]["source"], "part");
+    assert!(v[0]["snippets"][0]["snippet"]
+        .as_str()
+        .unwrap()
+        .contains("part-think"));
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn fs_clean_tool_output_removes_files() {
+    let dir = temp_dir("tool-output");
+    let db = dir.join("opencode.db");
+    create_db(&db);
+    let tool_dir = dir.join("tool-output");
+    std::fs::create_dir_all(&tool_dir).unwrap();
+    std::fs::write(tool_dir.join("tool_abc"), b"1234").unwrap();
+    std::fs::write(tool_dir.join("keep.txt"), b"x").unwrap();
+
+    let out = run(
+        &["fs", "clean-tool-output", "--older-than", "1d", "--dry-run"],
+        &dir,
+    );
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let out = run(&["fs", "clean-tool-output", "--yes"], &dir);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!tool_dir.join("tool_abc").exists());
+    assert!(tool_dir.join("keep.txt").exists(), "unrelated file kept");
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn doctor_reports_orphan_jobs_and_media_blobs() {
+    let dir = temp_dir("doctor-new-orphans");
+    let db = dir.join("opencode.db");
+    create_db(&db);
+    {
+        let con = Connection::open(&db).unwrap();
+        con.execute(
+            "INSERT INTO job (notification_id, id, session_id, kind, status, recovery) \
+             VALUES ('j1', 'j1', 'ses_gone', 'task', 'completed', '{}')",
+            [],
+        )
+        .unwrap();
+        con.execute(
+            "INSERT INTO blob (hash, mime, bytes, data, time_created) \
+             VALUES ('media', 'image/png', 4, x'00000000', 0)",
+            [],
+        )
+        .unwrap();
+    }
+
+    let out = run(&["doctor"], &dir);
+    assert_eq!(out.status.code(), Some(3));
+    let v = stdout_json(&out);
+    assert_eq!(v["orphans"]["orphaned_jobs"], serde_json::json!(["j1"]));
+    assert_eq!(v["orphans"]["orphan_media_blobs"][0]["hash"], "media");
+
+    let out = run(&["doctor", "--fix", "--dry-run"], &dir);
+    assert_eq!(out.status.code(), Some(3), "problems still exist");
+    let v = stdout_json(&out);
+    assert_eq!(v["fix"]["jobs_deleted"], 1);
+    assert_eq!(v["fix"]["media_blobs_deleted"], 1);
 
     std::fs::remove_dir_all(&dir).unwrap();
 }

@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Default, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Settings {
-    /// Default output format (`table` or `json`).
+    /// Default output format (`table`, `json`, or `csv`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub format: Option<String>,
     /// Default for `--quiet`.

@@ -48,19 +48,21 @@ pub const SESSION_TABLE: &str = "session_v2";
 /// (`session`/`message`/`part`/...) are not supported. Older or corrupt
 /// databases fail with a descriptive error (exit 3).
 pub fn ensure_schema(con: &Connection) -> Result<()> {
-    // Core tables every command needs. Global tables (`kv`, `account`,
-    // `workspace`, ...) are intentionally not required.
+    // Core tables every command needs. Cache/account tables (`kv`,
+    // `account`, ...) are intentionally not required, and newer content
+    // tables (`session_part`, `blob`, `schedule`, `job`) are optional so a
+    // database opened by an older 2.x build still works.
     for t in [
         "project",
         "session_v2",
         "session_message",
         "session_inbox",
-        "session_pending",
         "instruction_entry",
         "instruction_state",
         "event",
         "event_sequence",
         "worktree",
+        "workspace",
         "permission",
     ] {
         let n: i64 = con
@@ -78,6 +80,20 @@ pub fn ensure_schema(con: &Connection) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Whether a table exists in this database. Optional tables added by newer
+/// opencode releases are detected this way so the tool keeps working when
+/// the database has not run the newest migrations yet.
+pub fn table_exists(con: &Connection, table: &str) -> Result<bool> {
+    let n: i64 = con
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+            params![table],
+            |r| r.get(0),
+        )
+        .map_err(|e| AppError::db(e.to_string()))?;
+    Ok(n > 0)
 }
 
 /// Open the database, read-only for passive commands, read-write otherwise.
