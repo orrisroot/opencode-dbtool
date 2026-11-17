@@ -104,6 +104,11 @@ pub struct Cli {
 pub enum Command {
     /// Database overview: table sizes, totals, storage usage
     Stats(StatsArgs),
+    /// Interactive full-screen menu for common operations (requires a TTY)
+    #[command(
+        after_help = "Keys:\n  Up/Down   move/select   Left/Right/tab   switch section\n  Enter     run/apply     Esc/q            back/quit\n  r         reload/rerun  R                refresh header\n  PgUp/PgDn scroll output\n\nSession and project lists:\n  Enter view   d delete   / filter   s sort   o older   c clear   r reload\n  Sessions: F search text, P purge old, S strip reasoning\n  Projects: E purge empty, P purge old\n\nThe menu always previews destructive actions with --dry-run before\nasking to apply. --yes does not skip that confirmation. Passing\n--dry-run makes the whole session preview-only; --no-input is rejected."
+    )]
+    Tui,
     /// Integrity and consistency checks (`--fix` repairs what it can)
     Doctor(DoctorArgs),
     /// Project commands (list, show, delete, purge)
@@ -874,6 +879,15 @@ mod tests {
         assert_eq!(cli.format, Some(Format::Table));
         let cli = parse(&["opencode-dbtool", "vacuum", "--restart-service"]);
         assert!(cli.restart_service);
+    }
+
+    #[test]
+    fn tui_parses_and_accepts_global_preview_mode() {
+        let cli = parse(&["opencode-dbtool", "tui"]);
+        assert!(matches!(cli.command, Some(Command::Tui)));
+        let cli = parse(&["opencode-dbtool", "tui", "--dry-run", "--no-color"]);
+        assert!(cli.dry_run);
+        assert!(cli.no_color);
     }
 
     #[test]

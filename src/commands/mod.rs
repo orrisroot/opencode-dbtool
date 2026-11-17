@@ -13,4 +13,5 @@ pub mod selfupdate;
 pub mod service;
 pub mod session;
 pub mod stats;
+pub mod tui;
 pub mod vacuum;

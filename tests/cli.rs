@@ -335,6 +335,45 @@ fn self_update_rejects_unknown_options() {
 }
 
 #[test]
+fn tui_requires_an_interactive_terminal() {
+    let dir = temp_dir("tui-notty");
+    create_db(&dir.join("opencode.db"));
+
+    let out = run(&["tui"], &dir);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("interactive terminal"), "stderr: {stderr}");
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn tui_rejects_no_input_before_entering_the_screen() {
+    let dir = temp_dir("tui-no-input");
+    create_db(&dir.join("opencode.db"));
+
+    let out = run(&["tui", "--no-input"], &dir);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("drop --no-input"),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
 fn unknown_command_is_exit_2() {
     let dir = temp_dir("unknown");
     let db = dir.join("opencode.db");

@@ -41,6 +41,7 @@ cargo build --release   # -> target/release/opencode-dbtool
 | command | description |
 | --- | --- |
 | `stats [--detail]` | DB overview: table sizes, totals, storage usage, reclaimable space (`--detail` adds activity/subagent analysis) |
+| `tui` | interactive full-screen menu for the common inspection, cleanup, backup, and maintenance actions (requires a TTY) |
 | `doctor [--fix] [--max-backup-age <age>]` | integrity + consistency checks; `--fix` repairs supported orphans |
 | `report [--costs] [--since <age>] [--project <ref>]` | read-only reclaim and cost suggestions |
 | `project list [--path <dir>...] [--sort size\|updated\|sessions]` | project overview (counts, sizes); `--path` filters to a directory (repeatable) |
@@ -147,6 +148,46 @@ Destructive commands (`session`/`project delete` and `purge`,
 - neither, on a terminal: print the preview, ask `Proceed? [y/N]`, then
   execute or abort.
 - neither, not a terminal: exit 2 with a message pointing at both flags.
+
+### `tui`
+
+`opencode-dbtool tui` opens a full-screen menu for the same operations as
+the CLI. Use `Up`/`Down` (or `j`/`k`) to select an action, `Left`/`Right`
+(or `Tab`, or `1`-`9`) to switch sections, and `Enter` to run it. `q` or
+`Esc` leaves the menu. The header shows the resolved database size, whether
+opencode is running, and the registered service pid.
+
+The sections cover overview/health, sessions, projects, kv cache, storage
+cleanup, database tools, backups, one-shot cleanup, and system commands
+(`service status`, `config show/path`, `self-update`).
+
+`Sessions` and `Projects` open file-manager-style lists instead of a command
+menu. Move with `Up`/`Down` (`j`/`k`); the right pane previews the selected
+item. `Enter` opens the full detail through the normal CLI, `d` deletes the
+selected item (preview first), `/` filters the list, `s` cycles the sort key,
+`c` clears filters, and `r` reloads. Session lists also support `o` (only
+older sessions), `F` (search message content), `P` (purge old sessions), and
+`S` (strip reasoning); project lists support `E` (purge empty projects) and
+`P` (purge old projects). All of those destructive operations use the same
+preview-and-confirm flow as the CLI.
+
+The other sections are command menus. Actions that need a key, text, age, or
+size ask for it in a one-line prompt; leaving the prompt empty uses the shown
+default where one exists (`30d` for purges and cleanup, `7d` for file
+cleanup, `90d` for projects, `1M` for kv sizes).
+
+Every action runs the real CLI as a child process with `--format table
+--no-pager --no-input`, so the menu cannot bypass the service guard,
+maintenance lock, or confirmation rules. Destructive actions are always
+previewed with `--dry-run` first; `Enter`/`a` then re-runs the same command
+with `--yes`, and `r` runs the preview again. In the result view,
+`Up`/`Down`, `PgUp`/`PgDn`, and `Home`/`End` scroll the captured output;
+`Esc` returns to the menu. `R` refreshes the header status.
+
+`tui --dry-run` makes the whole session preview-only, so no action can be
+applied. `--no-input` is rejected (the menu needs the terminal); all other
+global flags are passed through to the child commands where applicable.
+stdin and stdout must be a terminal, otherwise `tui` exits with code 2.
 
 ### Online maintenance (opencode running)
 
@@ -1229,6 +1270,12 @@ that deletes matching reasoning `event` and `session_part` rows, rewrites
 `session_message` rows when needed, then verifies the result.
 
 ## Changelog
+
+### [Unreleased]
+
+#### Added
+
+- `tui`: an interactive full-screen menu covering overview, sessions, projects, kv, storage cleanup, database tools, backups, one-shot cleanup, and system commands. Sessions and projects use file-manager-style lists with per-item actions (view, delete, filter, sort, bulk purge). Destructive actions preview with `--dry-run` first; `tui --dry-run` is preview-only.
 
 ### [0.4.0] - 2026-11-08
 

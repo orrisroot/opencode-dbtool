@@ -64,6 +64,11 @@ pub fn execute(mut cli: Cli) -> Result<()> {
         return commands::service::cmd_service_status(&db_path);
     }
     require_db(&db_path)?;
+    // The TUI owns the terminal and re-enters the CLI through child
+    // processes, so it runs before the service/guard machinery below.
+    if matches!(command, Command::Tui) {
+        return commands::tui::cmd_tui(&cli, &db_path);
+    }
     let service = service::discover();
     let restart = cli.restart_service;
 
@@ -639,7 +644,7 @@ fn dispatch(
         Command::Cleanup(a) => {
             commands::cleanup::cmd_cleanup(dir, db_path, a, dry_run, quiet, service)
         }
-        Command::SelfUpdate | Command::Completions(_) | Command::Service(_) => {
+        Command::Tui | Command::SelfUpdate | Command::Completions(_) | Command::Service(_) => {
             unreachable!("handled before database resolution")
         }
     }
