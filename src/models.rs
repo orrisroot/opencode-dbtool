@@ -166,10 +166,7 @@ impl PurgeFilter {
                 return false;
             }
         }
-        if self.empty && s.size_bytes() != 0 {
-            return false;
-        }
-        true
+        !(self.empty && s.size_bytes() != 0)
     }
 
     /// Same as `matches` minus the size check (which needs the
@@ -334,10 +331,7 @@ impl ProjectFilter {
                 return false;
             }
         }
-        if self.empty && p.sessions != 0 {
-            return false;
-        }
-        true
+        !(self.empty && p.sessions != 0)
     }
 
     /// Stable JSON contract for the `filters` field in purge output.
