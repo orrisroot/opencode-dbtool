@@ -4,10 +4,11 @@
 //! list` exposes per-key sizes so they can be found, and `kv delete`
 //! drops selected keys (opencode regenerates caches on demand).
 
+use crate::cli::{KvListArgs, KvSort};
 use crate::db::{env_status, EnvStatus};
 use crate::error::{AppError, Result};
 use crate::output;
-use crate::util::{dt, now_ms, parse_age_ms};
+use crate::util::{dt, now_ms, parse_age_ms, parse_size_bytes};
 use rusqlite::{params, Connection};
 use serde::Serialize;
 use std::path::Path;
@@ -20,6 +21,8 @@ struct KvEntry {
     key: String,
     bytes: i64,
     updated: String,
+    #[serde(skip)]
+    time_updated: i64,
 }
 
 #[derive(Serialize)]
@@ -49,25 +52,8 @@ struct KvKeyRow {
     bytes: i64,
 }
 
-pub fn cmd_kv_list(con: &Connection, older_than: Option<&str>, search: Option<&str>) -> Result<()> {
-    // Optional `--older-than <age>` limits the listing to keys not updated
-    // since the cutoff (stale caches first); `--search` matches key text.
-    let cutoff = match older_than {
-        Some(age) => Some(now_ms()? - parse_age_ms(age)?),
-        None => None,
-    };
-    let mut stmt = con.prepare(
-        "SELECT key, COALESCE(length(CAST(value AS BLOB)),0), time_updated FROM kv \
-         WHERE (?1 IS NULL OR time_updated < ?1) \
-           AND (?2 IS NULL OR instr(lower(key), lower(?2)) > 0) \
-         ORDER BY 2 DESC, key",
-    )?;
-    let rows = stmt.query_map(params![cutoff, search], read_entry)?;
-    let mut out = Vec::new();
-    for r in rows {
-        out.push(r?);
-    }
-    let value = serde_json::to_value(out)?;
+pub fn cmd_kv_list(con: &Connection, args: &KvListArgs) -> Result<()> {
+    let value = kv_list_value(con, args)?;
     let rows = value.as_array().map(Vec::as_slice).unwrap_or_default();
     let bytes: i64 = rows.iter().filter_map(|r| r["bytes"].as_i64()).sum();
     let footer = format!(
@@ -79,11 +65,54 @@ pub fn cmd_kv_list(con: &Connection, older_than: Option<&str>, search: Option<&s
     output::emit_cols_footer(&value, &["key", "bytes", "updated"], &footer)
 }
 
+/// Build the filtered/sorted kv list (exposed for tests).
+pub fn kv_list_value(con: &Connection, args: &KvListArgs) -> Result<serde_json::Value> {
+    let cutoff = match args.older_than.as_deref() {
+        Some(age) => Some(now_ms()? - parse_age_ms(age)?),
+        None => None,
+    };
+    let min_bytes = match args.min_size.as_deref() {
+        Some(size) => Some(parse_size_bytes(size)?),
+        None => None,
+    };
+    let mut stmt = con.prepare(
+        "SELECT key, COALESCE(length(CAST(value AS BLOB)),0), time_updated FROM kv \
+         WHERE (?1 IS NULL OR time_updated < ?1) \
+           AND (?2 IS NULL OR COALESCE(length(CAST(value AS BLOB)),0) >= ?2)",
+    )?;
+    let rows = stmt.query_map(params![cutoff, min_bytes], read_entry)?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r?);
+    }
+    if let Some(search) = args.search.as_deref() {
+        let needle = search.to_lowercase();
+        out.retain(|entry| entry.key.to_lowercase().contains(&needle));
+    }
+    match args.sort.unwrap_or(KvSort::Size) {
+        KvSort::Size => out.sort_by(|a, b| b.bytes.cmp(&a.bytes).then_with(|| a.key.cmp(&b.key))),
+        KvSort::Key => out.sort_by(|a, b| a.key.cmp(&b.key)),
+        KvSort::Updated => out.sort_by(|a, b| {
+            b.time_updated
+                .cmp(&a.time_updated)
+                .then_with(|| a.key.cmp(&b.key))
+        }),
+    }
+    if let Some(limit) = args.limit {
+        if limit > 0 {
+            out.truncate(limit);
+        }
+    }
+    Ok(serde_json::to_value(out)?)
+}
+
 fn read_entry(r: &rusqlite::Row) -> rusqlite::Result<KvEntry> {
+    let time_updated = r.get::<_, i64>(2)?;
     Ok(KvEntry {
         key: r.get(0)?,
         bytes: r.get(1)?,
-        updated: dt(r.get::<_, i64>(2)?),
+        updated: dt(time_updated),
+        time_updated,
     })
 }
 
@@ -325,12 +354,65 @@ mod tests {
         .is_err());
     }
 
+    fn list_args() -> KvListArgs {
+        KvListArgs {
+            sort: None,
+            older_than: None,
+            search: None,
+            min_size: None,
+            limit: None,
+        }
+    }
+
     #[test]
     fn list_search_filters_keys() {
         let con = kv_db();
-        cmd_kv_list(&con, None, Some("BI")).unwrap();
-        cmd_kv_list(&con, None, Some("nope")).unwrap();
-        cmd_kv_list(&con, Some("1d"), Some("a")).unwrap();
+        let mut args = list_args();
+        args.search = Some("BI".to_string());
+        cmd_kv_list(&con, &args).unwrap();
+        args.search = Some("nope".to_string());
+        cmd_kv_list(&con, &args).unwrap();
+        args.search = Some("a".to_string());
+        args.older_than = Some("1d".to_string());
+        cmd_kv_list(&con, &args).unwrap();
+    }
+
+    #[test]
+    fn list_filters_sorts_and_limits() {
+        let con = kv_db();
+        let mut args = list_args();
+        args.search = Some("B".to_string());
+        args.min_size = Some("10".to_string());
+        let value = kv_list_value(&con, &args).unwrap();
+        let keys: Vec<&str> = value
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["key"].as_str().unwrap())
+            .collect();
+        assert_eq!(keys, vec!["big"]);
+
+        args.search = None;
+        args.min_size = None;
+        args.sort = Some(KvSort::Key);
+        let value = kv_list_value(&con, &args).unwrap();
+        let keys: Vec<&str> = value
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["key"].as_str().unwrap())
+            .collect();
+        assert_eq!(keys, vec!["a", "big"]);
+
+        args.sort = Some(KvSort::Size);
+        args.limit = Some(1);
+        let value = kv_list_value(&con, &args).unwrap();
+        assert_eq!(value.as_array().unwrap().len(), 1);
+        assert_eq!(value[0]["key"], "big");
+
+        args.limit = Some(0);
+        let value = kv_list_value(&con, &args).unwrap();
+        assert_eq!(value.as_array().unwrap().len(), 2);
     }
 
     #[test]

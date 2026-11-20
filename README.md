@@ -1,8 +1,8 @@
 # opencode-dbtool
 
 Maintenance tool for the [opencode](https://opencode.ai) 2.x SQLite database
-(`~/.local/share/opencode/opencode.db`): inspect sizes and integrity, and delete
-projects/sessions to reclaim space.
+(`~/.local/share/opencode/opencode.db`): inspect sizes and integrity, clean up
+sessions/projects/kv caches, and manage backups.
 
 Written in Rust. Output is a human-readable table on a terminal, JSON when
 piped, and CSV with `--format csv`. `--format table|json|csv` forces a format;
@@ -41,23 +41,23 @@ cargo build --release   # -> target/release/opencode-dbtool
 | command | description |
 | --- | --- |
 | `stats [--detail]` | DB overview: table sizes, totals, storage usage, reclaimable space (`--detail` adds activity/subagent analysis) |
-| `tui` | interactive full-screen menu for the common inspection, cleanup, backup, and maintenance actions (requires a TTY) |
+| `tui` | interactive full-screen menu for the common inspection, cleanup, backup, and maintenance actions, with list browsers for sessions, projects, kv, and backups (requires a TTY) |
 | `doctor [--fix] [--max-backup-age <age>]` | integrity + consistency checks; `--fix` repairs supported orphans |
 | `report [--costs] [--since <age>] [--project <ref>]` | read-only reclaim and cost suggestions |
-| `project list [--path <dir>...] [--sort size\|updated\|sessions]` | project overview (counts, sizes); `--path` filters to a directory (repeatable) |
+| `project list [--path <dir>...] [--sort worktree\|size\|updated\|sessions] [--search <text>] [--older-than <age>] [--min-size <size>] [--limit <n>]` | project overview (counts, sizes); list filters match the session/kv/backup conventions |
 | `project show <id>` | project detail (sessions, breakdown) |
 | `project delete <id>...` | delete project(s) + all related data |
 | `project purge [--older-than <age>] [--path <dir>...] [--empty]` | delete projects matching all filters |
 | `session list [--sort size\|cost\|updated\|messages] [--limit <n>] [--search <text>] [--min-size <size>] [--older-than <age>] [--project <ref>] [--parent <ref>]` | per-session breakdown (full ids) |
 | `session show <id> [--messages [--limit <n>\|--last <n>] [--full] [--markdown [--include-tools]]]` | session detail, optionally with message previews |
-| `session search <text> [--limit <n>] [--snippets <n>] [--since <age>]` | search message/part content across sessions |
+| `session search <text> [--limit <n>] [--snippets <n>] [--since <age>]` | search message/part content across sessions (`--limit 0` = no limit) |
 | `session delete <id>...` | delete session(s) + cascade |
 | `session purge [filters]` | delete sessions matching all filters |
 | `session strip-reasoning [filters]` | delete only the reasoning content of matching sessions |
 | `session export <id> [--out <file>] [--markdown [--include-tools]]` | export one session (JSON or Markdown) |
 | `session export --out-dir <dir> [--older-than <age>] [--project <ref>] [--limit <n>] [--markdown [--include-tools]]` | batch-export sessions |
 | `session import <file>` | import a session through the running server |
-| `kv list [--older-than <age>] [--search <text>]` | list global kv entries with sizes (large caches first) |
+| `kv list [--sort size\|key\|updated] [--older-than <age>] [--search <text>] [--min-size <size>] [--limit <n>]` | list global kv entries with sizes (large caches first by default) |
 | `kv show <key> [--raw]` | show a kv value (truncated; `--raw` prints it verbatim) |
 | `kv delete <key>...` | delete kv entries (caches regenerate on demand) |
 | `kv purge [--older-than <age>] [--larger-than <size>]` | delete kv entries matching filters |
@@ -66,8 +66,9 @@ cargo build --release   # -> target/release/opencode-dbtool
 | `db optimize` | refresh SQLite query-planner statistics (online) |
 | `db query <sql> [--limit <n>]` | run a read-only SELECT/WITH/EXPLAIN query |
 | `backup [--keep-backups <n>]` | online verified backup (safe while opencode runs) |
-| `backup list [--verify] [--sort date\|size]` | list timestamped backups |
-| `backup restore <file>\|--latest` | restore a backup over the current database (safety copy first) |
+| `backup list [--verify] [--sort date\|size] [--search <text>] [--older-than <age>] [--min-size <size>] [--limit <n>]` | list timestamped backups |
+| `backup restore <file>\|--latest` | restore a backup over the current database (bare names resolve in the DB directory; safety copy first) |
+| `backup delete <file>...` | delete specific backup files (preview with `--dry-run` first) |
 | `backup prune [--keep <n>\|--older-than <age>]` | delete old backups without creating one |
 | `service status` | diagnose the running opencode service (API, DB match) |
 | `fs clean-snapshots [--project <id>...] [--orphans-only]` | delete snapshot storage, optionally scoped |
@@ -88,6 +89,11 @@ All commands accept the global flags listed under [Flags](#flags), including
 `--no-pager`, `--wait-lock`, `--config`, `--dry-run`, `--yes`,
 `--no-input`, and `--restart-service`. Every subcommand has its own
 `--help`.
+
+The list commands (`project list`, `session list`, `kv list`, `backup list`)
+share the same filter conventions: `--sort`, `--limit` (0 = no limit),
+`--search`, `--older-than`, and `--min-size` where the item has a size.
+`session search` also treats `--limit 0` as no limit.
 
 Filters for `session purge` / `session strip-reasoning` are
 `--older-than <age>`, `--subagents`, `--archived`, `--empty`,
@@ -139,7 +145,7 @@ go to stderr, so stdout stays machine-readable.
 
 Destructive commands (`session`/`project delete` and `purge`,
 `strip-reasoning`, `session import`, `kv delete`/`purge`,
-`backup`/`restore`/`prune`, `doctor --fix`, `fs clean-*`, `vacuum`,
+`backup`/`restore`/`delete`/`prune`, `doctor --fix`, `fs clean-*`, `vacuum`,
 `cleanup`, `self-update`) work in three modes:
 
 - `--dry-run`: print the preview and change nothing (safe while opencode
@@ -153,28 +159,47 @@ Destructive commands (`session`/`project delete` and `purge`,
 
 `opencode-dbtool tui` opens a full-screen menu for the same operations as
 the CLI. Use `Up`/`Down` (or `j`/`k`) to select an action, `Left`/`Right`
-(or `Tab`, or `1`-`9`) to switch sections, and `Enter` to run it. `q` or
-`Esc` leaves the menu. The header shows the resolved database size, whether
+(or `Tab`, or `1`-`9`) to switch sections, and `Enter` to run it. `PgUp`/
+`PgDn` jump a page in long lists. In command menus `/` searches every action
+by label or description; in the list browsers it filters the list. `?` or
+`F1` shows a context-sensitive help screen for the current view. `q` or `Esc`
+leaves the menu. The header shows the resolved database size, whether
 opencode is running, and the registered service pid.
+Layout uses terminal cell widths, so Japanese and other wide characters
+stay aligned in titles and columns.
 
-The sections cover overview/health, sessions, projects, kv cache, storage
-cleanup, database tools, backups, one-shot cleanup, and system commands
+The sections cover overview/health, sessions, projects, kv cache, backups,
+storage cleanup, database tools, one-shot cleanup, and system commands
 (`service status`, `config show/path`, `self-update`).
 
-`Sessions` and `Projects` open file-manager-style lists instead of a command
-menu. Move with `Up`/`Down` (`j`/`k`); the right pane previews the selected
-item. `Enter` opens the full detail through the normal CLI, `d` deletes the
-selected item (preview first), `/` filters the list, `s` cycles the sort key,
-`c` clears filters, and `r` reloads. Session lists also support `o` (only
-older sessions), `F` (search message content), `P` (purge old sessions), and
-`S` (strip reasoning); project lists support `E` (purge empty projects) and
-`P` (purge old projects). All of those destructive operations use the same
-preview-and-confirm flow as the CLI.
+`Sessions`, `Projects`, `KV cache`, and `Backups` open file-manager-style
+lists instead of command menus. Move with `Up`/`Down` (`j`/`k`) or
+`PgUp`/`PgDn`; the right pane previews the selected item. Common keys are
+`/` (filter), `o` (only items older than an age), `s` (cycle the sort key),
+`c` (clear filters), `r` (reload), and `d` (delete the selected item, preview
+first). `Enter` opens the detail or value, except in `Backups`, where it
+restores the selected backup.
+
+- Sessions: `Enter` opens messages; `F` searches message content; `P` purges
+  old sessions; `S` strips reasoning.
+- Projects: `E` purges empty projects; `P` purges old projects.
+- KV cache: `Enter` shows the value; `P` purges old entries; `L` purges
+  entries larger than a size.
+- Backups: `b` creates a new verified backup; `V` toggles integrity
+  verification of the list; `K` keeps only the newest N; `P` prunes old
+  backups.
+
+All of those destructive operations use the same preview-and-confirm flow as
+the CLI. The rightmost session column follows the active sort key (size,
+cost, or messages/parts). Press `?` or `F1` for the full key list in any
+browser.
 
 The other sections are command menus. Actions that need a key, text, age, or
 size ask for it in a one-line prompt; leaving the prompt empty uses the shown
 default where one exists (`30d` for purges and cleanup, `7d` for file
-cleanup, `90d` for projects, `1M` for kv sizes).
+cleanup, `90d` for projects, `1M` for kv sizes). The prompt supports cursor
+movement, `Ctrl+U` (clear), `Ctrl+W` (delete the previous word), and
+`Ctrl+K` (delete to the end).
 
 Every action runs the real CLI as a child process with `--format table
 --no-pager --no-input`, so the menu cannot bypass the service guard,
@@ -209,8 +234,9 @@ tool adapts:
   are safe online.
 - **`report`, `session search`, `db path`, `db optimize`, and `db query`**
   read the database without modifying it.
-- **`backup prune`** only removes backup files, and **`vacuum --into`**
-  writes a separate compacted copy, so both are safe online.
+- **`backup delete`/`backup prune`** only remove backup files, and
+  **`vacuum --into`** writes a separate compacted copy, so all are safe
+  online.
 - **`session export`** reads through the server API (or the local database
   for `--markdown`); **`session import`** uses the server API.
 - **`vacuum --online`** attempts a VACUUM while opencode runs with a long
@@ -407,8 +433,12 @@ prefix, or an exact worktree path (when it maps to exactly one project).
 
 `project list --path <dir>` filters the array to projects whose worktree
 matches the directory. `--path` is repeatable (OR) and matches **every**
-project registered at that directory. `project purge --path` deletes all of
-them likewise.
+project registered at that directory. `--search <text>` matches the id,
+worktree, or name; `--older-than <age>` keeps projects whose latest session
+activity is older than the cutoff; `--min-size <size>` keeps projects at
+least that large. `--sort` accepts `worktree` (default), `size`, `updated`,
+and `sessions`; `--limit` caps the output (0 = no limit). `project purge
+--path` deletes all matching directory projects likewise.
 
 ```json
 {
@@ -475,7 +505,8 @@ sessions at least that large; `--older-than <age>` keeps sessions updated
 before the cutoff; `--project <ref>` and `--parent <ref>` restrict the
 list to a project or to direct children of a parent session. `--search
 <text>` keeps only sessions whose title or directory contains the text
-(case-insensitive). `session list` prints an array; `session show <ref>`
+(case-insensitive). `--limit 0` means no limit. `session list` prints an
+array; `session show <ref>`
 prints one object. With `--messages`, previews are oldest first and limited
 to 50 by default; `--limit <n>` caps the number shown, `--last <n>` selects
 the newest window, `--full` keeps whole messages instead of 300-char
@@ -523,7 +554,8 @@ top-level sessions. It also appears in `project show`'s `session_list`.
 
 Search message and `session_part` content without an index; expect a full
 scan on large databases. `--limit <n>` caps the number of sessions
-(default 20), `--snippets <n>` caps snippets per session (default 3), and
+(default 20; 0 = no limit), `--snippets <n>` caps snippets per session
+(default 3), and
 `--since <age>` limits results to recently updated sessions. The output is a
 bare array:
 
@@ -558,8 +590,8 @@ server and prints it (or writes it with `--out <file>`). `--markdown` renders
 from the local database instead and needs no server; `--include-tools` adds
 non-text parts to the Markdown. Batch export uses `--out-dir <dir>` and can
 select sessions with `--older-than <age>`, `--project <ref>`, and `--limit
-<n>`; `--markdown` writes `.md` files instead of JSON, and `--include-tools`
-adds non-text parts to each Markdown file. Import uses the
+<n>` (0 = no limit); `--markdown` writes `.md` files instead of JSON, and
+`--include-tools` adds non-text parts to each Markdown file. Import uses the
 server API (`session import <file>`) and accepts both the current transfer
 payload and older `{"data": ...}` wrappers.
 
@@ -829,19 +861,27 @@ optional `--keep-backups <n>` pruning. Safe while opencode runs.
 }
 ```
 
-`backup list [--verify] [--sort date|size]` lists the timestamped backups
-(newest first by default) with size and creation time; `--verify` runs an
-integrity check on each. `backup restore <file>` (or `--latest`) verifies the
-source, takes a safety backup of the current database (best effort, so a
-corrupt current database can still be recovered), removes stale WAL/SHM
-files, replaces the database, and verifies the result. It needs exclusive
-access (or `--restart-service`) and `--dry-run` reports the plan without
-touching anything. `backup prune` removes old backups without creating a new
-one and requires `--keep <n>` or `--older-than <age>`.
+`backup list [--verify] [--sort date|size] [--search <text>]
+[--older-than <age>] [--min-size <size>] [--limit <n>]` lists the
+timestamped backups (newest first by default) with size and creation time;
+`--verify` runs an integrity check on each. A bare file name in `backup
+restore`/`backup delete` is resolved in the database directory, so the names
+printed by `backup list` can be used directly.
+
+`backup restore <file>` (or `--latest`) verifies the source, takes a safety
+backup of the current database (best effort, so a corrupt current database
+can still be recovered), removes stale WAL/SHM files, replaces the database,
+and verifies the result. It needs exclusive access (or `--restart-service`)
+and `--dry-run` reports the plan without touching anything. `backup delete
+<file>...` removes selected backup files (only files matching this
+database's backup prefix in its directory); `backup prune` removes old
+backups without creating a new one and requires `--keep <n>` or
+`--older-than <age>`. Both deletion commands preview with `--dry-run` first.
 
 ```sh
 opencode-dbtool backup list --verify
-opencode-dbtool backup list --sort size
+opencode-dbtool backup list --sort size --limit 5
+opencode-dbtool backup delete opencode.db.backup-20260830T120000Z --dry-run
 opencode-dbtool backup prune --keep 3 --dry-run
 opencode-dbtool backup restore --latest --yes
 opencode-dbtool backup restore opencode.db.backup-20260830T120000Z --yes
@@ -850,14 +890,15 @@ opencode-dbtool backup restore opencode.db.backup-20260830T120000Z --yes
 ### `kv list` / `kv show` / `kv delete` / `kv purge`
 
 Inspect the global `kv` table, which can dominate database size (e.g. the
-multi-megabyte `models-dev:catalog` cache). `kv list [--older-than <age>]
-[--search <text>]` prints `{key, bytes, updated}` largest first; `kv show
-<key>` prints the value truncated to 2000 chars plus `truncated` (`--raw`
-prints it verbatim with no wrapper or truncation); `kv delete <key>...`
-removes keys (caches regenerate on demand) and is guarded while opencode
-runs. `kv purge` requires `--older-than <age>` and/or `--larger-than
-<size>`, then removes every matching key in one pass. Preview all three
-with `--dry-run` first.
+multi-megabyte `models-dev:catalog` cache). `kv list [--sort size|key|updated]
+[--older-than <age>] [--search <text>] [--min-size <size>] [--limit <n>]`
+prints `{key, bytes, updated}` largest first by default; `kv show <key>`
+prints the value truncated to 2000 chars plus `truncated` (`--raw` prints it
+verbatim with no wrapper or truncation); `kv delete <key>...` removes keys
+(caches regenerate on demand) and is guarded while opencode runs. `kv purge`
+requires `--older-than <age>` and/or `--larger-than <size>`, then removes
+every matching key in one pass. Preview all three with `--dry-run` first.
+All list commands use `--limit 0` for "no limit".
 
 ### `vacuum`
 
@@ -1072,7 +1113,7 @@ standard location is ignored.
 | flag | meaning |
 | --- | --- |
 | `--dry-run`, `-n` | print actions without changing anything (safe while opencode runs) and show a `to apply:` hint |
-| `--yes`, `-y` | confirm a destructive command. On a terminal, omitting `--yes`/`--dry-run` shows the preview and asks `Proceed? [y/N]` instead; off a terminal `--yes` is required for every real run of `delete`, `purge`, `strip-reasoning`, `session import`, `kv delete`/`purge`, `backup`/`restore`/`prune`, `doctor --fix`, `fs clean-*`, `vacuum`, `cleanup`, and `self-update` |
+| `--yes`, `-y` | confirm a destructive command. On a terminal, omitting `--yes`/`--dry-run` shows the preview and asks `Proceed? [y/N]` instead; off a terminal `--yes` is required for every real run of `delete`, `purge`, `strip-reasoning`, `session import`, `kv delete`/`purge`, `backup`/`restore`/`delete`/`prune`, `doctor --fix`, `fs clean-*`, `vacuum`, `cleanup`, and `self-update` |
 | `--no-input` | never prompt: destructive commands then require `--yes`, even on a terminal (useful for CI with a pseudo-TTY) |
 | `--format <table\|json\|csv>` | output format (default: table on a terminal, JSON when piped) |
 | `--fields <fields>` | table/CSV columns to print, comma-separated (for example `id,title,size_bytes`) |
@@ -1209,16 +1250,17 @@ matching busy timeout, so concurrent reads never wedge.
 - `stats`, `doctor`, `report`, `project list/show`, `session list/show`,
   `session search`, `session export` (API or local Markdown), `kv
   list/show`, `db path`, and `config show/path` read-only commands are safe
-  while opencode runs. `db optimize` and `backup prune` are also safe.
+  while opencode runs. `db optimize`, `backup delete`, and `backup prune`
+  are also safe.
 - Running instances are detected by process name, executable path, and
   command line (`opencode`, `opencode-server`, `opencode2`) via the
   [sysinfo](https://crates.io/crates/sysinfo) crate, which works on
   Linux, macOS, and Windows. Command-line matching only accepts
   invocations (e.g. `/usr/bin/opencode`), not references to opencode's
   data files.
-- Safe online: `backup`, `backup prune`, `db checkpoint`, `db optimize`,
-  `vacuum --into`, `fs clean-shell --older-than`, `fs clean-tool-output
-  --older-than`, `fs clean-snapshots --orphans-only`,
+- Safe online: `backup`, `backup delete`, `backup prune`, `db checkpoint`,
+  `db optimize`, `vacuum --into`, `fs clean-shell --older-than`,
+  `fs clean-tool-output --older-than`, `fs clean-snapshots --orphans-only`,
   `fs clean-blob-orphans`, `session import` (server API), and `session
   delete`/`purge` (also the purge step of `cleanup`) when the running
   server's API is available — see "Online maintenance" above.
@@ -1270,12 +1312,6 @@ that deletes matching reasoning `event` and `session_part` rows, rewrites
 `session_message` rows when needed, then verifies the result.
 
 ## Changelog
-
-### [Unreleased]
-
-#### Added
-
-- `tui`: an interactive full-screen menu covering overview, sessions, projects, kv, storage cleanup, database tools, backups, one-shot cleanup, and system commands. Sessions and projects use file-manager-style lists with per-item actions (view, delete, filter, sort, bulk purge). Destructive actions preview with `--dry-run` first; `tui --dry-run` is preview-only.
 
 ### [0.4.0] - 2026-11-08
 

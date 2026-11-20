@@ -184,6 +184,7 @@ fn mutation_guard<'a>(
                 "backup restore",
                 Some("restoring while opencode is running is not allowed"),
             )),
+            Some(BackupCmd::Delete(_)) => Some(("backup delete", None)),
             Some(BackupCmd::Prune(_)) => Some(("backup prune", None)),
             None => Some(("backup", None)),
         },
@@ -441,7 +442,7 @@ fn dispatch(
         Command::Project(cmd) => match cmd {
             ProjectCmd::List(a) => {
                 let con = db::open_conn(db_path, true)?;
-                commands::project::cmd_project_list(&con, &a.paths, a.sort)
+                commands::project::cmd_project_list(&con, a)
             }
             ProjectCmd::Show(a) => {
                 let con = db::open_conn(db_path, true)?;
@@ -534,7 +535,7 @@ fn dispatch(
         Command::Kv(cmd) => match cmd {
             KvCmd::List(a) => {
                 let con = db::open_conn(db_path, true)?;
-                commands::kv::cmd_kv_list(&con, a.older_than.as_deref(), a.search.as_deref())
+                commands::kv::cmd_kv_list(&con, a)
             }
             KvCmd::Show(a) => {
                 let con = db::open_conn(db_path, true)?;
@@ -576,9 +577,7 @@ fn dispatch(
                 ));
             }
             match &a.command {
-                Some(BackupCmd::List(l)) => {
-                    commands::vacuum::cmd_backup_list(db_path, l.verify, l.sort)
-                }
+                Some(BackupCmd::List(l)) => commands::vacuum::cmd_backup_list(db_path, l),
                 Some(BackupCmd::Restore(r)) => {
                     let path = if r.latest {
                         let files = commands::vacuum::list_backup_files(db_path, false)?;
@@ -587,11 +586,15 @@ fn dispatch(
                             .ok_or_else(|| AppError::usage("no backups found to restore"))?;
                         db_path.with_file_name(&newest.file)
                     } else {
-                        r.file.clone().ok_or_else(|| {
+                        let reference = r.file.clone().ok_or_else(|| {
                             AppError::usage("a backup file or --latest is required")
-                        })?
+                        })?;
+                        commands::vacuum::resolve_backup_path(db_path, &reference)
                     };
                     commands::vacuum::cmd_restore(db_path, &path, dry_run)
+                }
+                Some(BackupCmd::Delete(d)) => {
+                    commands::vacuum::cmd_backup_delete(db_path, d, dry_run)
                 }
                 Some(BackupCmd::Prune(p)) => {
                     commands::vacuum::cmd_backup_prune(db_path, p, dry_run)

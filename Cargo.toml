@@ -15,6 +15,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 sysinfo = "0.39.6"
 toml = "1.1.6"
+unicode-width = "0.2"
 ureq = "3.4.2"
 
 [profile.release]

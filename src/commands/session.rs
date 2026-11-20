@@ -232,7 +232,9 @@ pub fn session_list_value(con: &Connection, opts: &ListOptions) -> Result<serde_
         Some(SortKey::Updated) | None => {}
     }
     if let Some(n) = opts.limit {
-        meta.truncate(n);
+        if n > 0 {
+            meta.truncate(n);
+        }
     }
     let ids: Vec<String> = meta.iter().map(|m| m.id.clone()).collect();
     let rows = crate::repo::load_sessions_by_ids(con, &ids)?;
@@ -246,8 +248,13 @@ pub fn cmd_session_search(con: &Connection, args: &crate::cli::SessionSearchArgs
         Some(age) => Some(now_ms()? - parse_age_ms(age)?),
         None => None,
     };
+    let limit = if args.limit == 0 {
+        usize::MAX / 2
+    } else {
+        args.limit
+    };
     output::emit_cols(
-        &session_search_value(con, &args.text, args.limit, args.snippets, cutoff)?,
+        &session_search_value(con, &args.text, limit, args.snippets, cutoff)?,
         &["id", "title", "updated", "matches", "directory"],
     )
 }
@@ -644,7 +651,9 @@ fn select_export_ids(
     }
     let mut ids: Vec<String> = meta.into_iter().map(|m| m.id).collect();
     if let Some(limit) = limit {
-        ids.truncate(limit);
+        if limit > 0 {
+            ids.truncate(limit);
+        }
     }
     Ok(ids)
 }
@@ -2414,6 +2423,17 @@ mod tests {
             .map(|s| s["id"].as_str().unwrap())
             .collect();
         assert_eq!(ids, vec!["big", "medium"]);
+
+        let unlimited = session_list_value(
+            &con,
+            &ListOptions {
+                sort: Some(SortKey::Size),
+                limit: Some(0),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(unlimited.as_array().unwrap().len(), 3);
 
         // Search matches title or directory (case-insensitive).
         let searched = session_list_value(

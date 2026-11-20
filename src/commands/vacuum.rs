@@ -1,10 +1,10 @@
 //! `vacuum` command: safe VACUUM with backup and journal mode handling.
 
-use crate::cli::{BackupPruneArgs, BackupSort, VacuumArgs};
+use crate::cli::{BackupDeleteArgs, BackupListArgs, BackupPruneArgs, BackupSort, VacuumArgs};
 use crate::db::{env_status, file_size, quick_check, EnvStatus};
 use crate::error::{AppError, Result};
 use crate::output;
-use crate::util::{file_mtime_ms, now_ms, parse_age_ms, timestamp_utc};
+use crate::util::{file_mtime_ms, now_ms, parse_age_ms, parse_size_bytes, timestamp_utc};
 use rusqlite::Connection;
 use serde::Serialize;
 use std::path::{Path, PathBuf};
@@ -388,6 +388,8 @@ pub struct BackupFileOut {
     pub created: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub integrity: Option<String>,
+    #[serde(skip)]
+    created_ms: i64,
 }
 
 /// Timestamped backups of this database, newest first.
@@ -424,11 +426,13 @@ pub fn list_backup_files(db_path: &Path, verify: bool) -> Result<Vec<BackupFileO
         } else {
             None
         };
+        let created_ms = file_mtime_ms(&path).unwrap_or(0);
         out.push(BackupFileOut {
             file: name,
             bytes: file_size(&path),
-            created: crate::util::dt(file_mtime_ms(&path).unwrap_or(0)),
+            created: crate::util::dt(created_ms),
             integrity,
+            created_ms,
         });
     }
     out.sort_by(|a, b| b.file.cmp(&a.file));
@@ -436,11 +440,8 @@ pub fn list_backup_files(db_path: &Path, verify: bool) -> Result<Vec<BackupFileO
 }
 
 /// List timestamped backups (newest first by default; `--sort size`).
-pub fn cmd_backup_list(db_path: &Path, verify: bool, sort: Option<BackupSort>) -> Result<()> {
-    let mut files = list_backup_files(db_path, verify)?;
-    if sort == Some(BackupSort::Size) {
-        files.sort_by(|a, b| b.bytes.cmp(&a.bytes).then_with(|| b.file.cmp(&a.file)));
-    }
+pub fn cmd_backup_list(db_path: &Path, args: &BackupListArgs) -> Result<()> {
+    let files = backup_list_value(db_path, args)?;
     let total: u64 = files.iter().map(|b| b.bytes).sum();
     let footer = format!(
         "{} backup{}, {} total",
@@ -453,6 +454,141 @@ pub fn cmd_backup_list(db_path: &Path, verify: bool, sort: Option<BackupSort>) -
         &["file", "bytes", "created", "integrity"],
         &footer,
     )
+}
+
+/// Build the filtered/sorted backup list (exposed for tests).
+pub fn backup_list_value(db_path: &Path, args: &BackupListArgs) -> Result<Vec<BackupFileOut>> {
+    let mut files = list_backup_files(db_path, args.verify)?;
+    if let Some(search) = args.search.as_deref() {
+        let needle = search.to_lowercase();
+        files.retain(|b| b.file.to_lowercase().contains(&needle));
+    }
+    if let Some(age) = args.older_than.as_deref() {
+        let cutoff = now_ms()? - parse_age_ms(age)?;
+        files.retain(|b| b.created_ms < cutoff);
+    }
+    if let Some(size) = args.min_size.as_deref() {
+        let min = parse_size_bytes(size)? as u64;
+        files.retain(|b| b.bytes >= min);
+    }
+    if args.sort == Some(BackupSort::Size) {
+        files.sort_by(|a, b| b.bytes.cmp(&a.bytes).then_with(|| b.file.cmp(&a.file)));
+    } else {
+        files.sort_by(|a, b| {
+            b.created_ms
+                .cmp(&a.created_ms)
+                .then_with(|| b.file.cmp(&a.file))
+        });
+    }
+    if let Some(limit) = args.limit {
+        if limit > 0 {
+            files.truncate(limit);
+        }
+    }
+    Ok(files)
+}
+
+/// Resolve a backup reference: bare file names live next to the database.
+pub fn resolve_backup_path(db_path: &Path, reference: &Path) -> PathBuf {
+    if reference.is_absolute() || reference.components().count() > 1 {
+        reference.to_path_buf()
+    } else {
+        db_path.parent().unwrap_or(Path::new(".")).join(reference)
+    }
+}
+
+#[derive(Serialize)]
+struct DeletedBackup {
+    file: String,
+    bytes: u64,
+}
+
+#[derive(Serialize)]
+struct BackupDeleteOut {
+    #[serde(flatten)]
+    env: EnvStatus,
+    dry_run: bool,
+    files: Vec<DeletedBackup>,
+    total_bytes: u64,
+    deleted: bool,
+    failed: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    note: Option<String>,
+}
+
+/// Delete specific backup files. Only files matching this database's
+/// backup prefix in its directory are accepted.
+pub fn cmd_backup_delete(db_path: &Path, args: &BackupDeleteArgs, dry_run: bool) -> Result<()> {
+    let dir = db_path.parent().unwrap_or(Path::new("."));
+    let prefix = format!(
+        "{}.backup-",
+        db_path.file_name().unwrap_or_default().to_string_lossy()
+    );
+    let dir_abs = std::fs::canonicalize(dir).map_err(|e| {
+        AppError::db(format!(
+            "cannot resolve backup directory {}: {e}",
+            dir.display()
+        ))
+    })?;
+    let mut files = Vec::new();
+    for reference in &args.files {
+        let path = resolve_backup_path(db_path, reference);
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        if !name.starts_with(&prefix) || is_backup_sidecar(&name) {
+            return Err(AppError::usage(format!(
+                "not a backup of this database: {}",
+                path.display()
+            )));
+        }
+        let parent = path.parent().unwrap_or(Path::new("."));
+        let parent_abs = std::fs::canonicalize(parent)
+            .map_err(|e| AppError::usage(format!("cannot resolve {}: {e}", path.display())))?;
+        if parent_abs != dir_abs {
+            return Err(AppError::usage(format!(
+                "backup is not in the database directory: {}",
+                path.display()
+            )));
+        }
+        if !path.is_file() {
+            return Err(AppError::usage(format!(
+                "backup file not found: {}",
+                path.display()
+            )));
+        }
+        if files.iter().any(|f: &DeletedBackup| f.file == name) {
+            continue;
+        }
+        files.push(DeletedBackup {
+            file: name,
+            bytes: file_size(&path),
+        });
+    }
+    let total_bytes = files.iter().map(|f| f.bytes).sum();
+    let mut out = BackupDeleteOut {
+        env: env_status(db_path),
+        dry_run,
+        files,
+        total_bytes,
+        deleted: false,
+        failed: 0,
+        note: None,
+    };
+    if dry_run {
+        return output::emit(&serde_json::to_value(&out)?);
+    }
+    for f in &out.files {
+        if std::fs::remove_file(dir.join(&f.file)).is_err() {
+            out.failed += 1;
+        }
+    }
+    out.deleted = true;
+    if out.failed > 0 {
+        out.note = Some(format!("{} file(s) could not be removed", out.failed));
+    }
+    output::emit(&serde_json::to_value(&out)?)
 }
 
 /// One backup selected by `backup prune`.
@@ -981,6 +1117,105 @@ mod tests {
         // A fresh backup is not older than 1d, so --older-than removes nothing.
         let v = backup_prune_value(&path, None, Some("1d"), false).unwrap();
         assert_eq!(v["total_files"], 0);
+
+        drop(con);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn backup_list_filters_sorts_and_limits() {
+        let (con, path) = temp_db("list");
+        let dir = path.parent().unwrap();
+        let names = [
+            "list.db.backup-20260101-000000",
+            "list.db.backup-20260102-000000",
+            "list.db.backup-20260103-000000",
+        ];
+        for (index, name) in names.iter().enumerate() {
+            std::fs::write(dir.join(name), vec![0u8; (index + 1) * 10]).unwrap();
+        }
+
+        let mut args = BackupListArgs {
+            verify: false,
+            sort: None,
+            search: None,
+            older_than: None,
+            min_size: None,
+            limit: None,
+        };
+        let files = backup_list_value(&path, &args).unwrap();
+        assert_eq!(files.len(), 3);
+        assert_eq!(files[0].file, names[2], "newest first");
+
+        args.sort = Some(BackupSort::Size);
+        let files = backup_list_value(&path, &args).unwrap();
+        assert_eq!(files[0].file, names[2], "largest first");
+
+        args.search = Some("20260102".to_string());
+        let files = backup_list_value(&path, &args).unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].file, names[1]);
+
+        args.search = None;
+        args.min_size = Some("25".to_string());
+        let files = backup_list_value(&path, &args).unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].file, names[2]);
+
+        args.min_size = None;
+        args.older_than = Some("1d".to_string());
+        let files = backup_list_value(&path, &args).unwrap();
+        assert!(files.is_empty(), "fresh backups are not old");
+
+        args.older_than = None;
+        args.limit = Some(0);
+        assert_eq!(backup_list_value(&path, &args).unwrap().len(), 3);
+        args.limit = Some(2);
+        assert_eq!(backup_list_value(&path, &args).unwrap().len(), 2);
+
+        drop(con);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn backup_references_resolve_next_to_the_database() {
+        let db = Path::new("/data/opencode.db");
+        assert_eq!(
+            resolve_backup_path(db, Path::new("opencode.db.backup-x")),
+            PathBuf::from("/data/opencode.db.backup-x")
+        );
+        assert_eq!(
+            resolve_backup_path(db, Path::new("/elsewhere/opencode.db.backup-x")),
+            PathBuf::from("/elsewhere/opencode.db.backup-x")
+        );
+    }
+
+    #[test]
+    fn backup_delete_previews_and_removes_only_backups() {
+        let (con, path) = temp_db("delete");
+        let dir = path.parent().unwrap();
+        let keep = dir.join("delete.db.backup-20260102-000000");
+        let remove = dir.join("delete.db.backup-20260101-000000");
+        let other = dir.join("other.txt");
+        std::fs::write(&keep, b"keep").unwrap();
+        std::fs::write(&remove, b"remove").unwrap();
+        std::fs::write(&other, b"other").unwrap();
+
+        let args = BackupDeleteArgs {
+            files: vec![PathBuf::from("delete.db.backup-20260101-000000")],
+        };
+        cmd_backup_delete(&path, &args, true).unwrap();
+        assert!(remove.exists(), "dry-run changes nothing");
+
+        cmd_backup_delete(&path, &args, false).unwrap();
+        assert!(!remove.exists());
+        assert!(keep.exists());
+        assert!(other.exists());
+
+        let args = BackupDeleteArgs {
+            files: vec![PathBuf::from("other.txt")],
+        };
+        assert!(cmd_backup_delete(&path, &args, true).is_err());
 
         drop(con);
         cleanup(&path);

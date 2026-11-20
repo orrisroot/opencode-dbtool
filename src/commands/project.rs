@@ -1,6 +1,6 @@
 //! `project` subcommands: list, show, delete, purge.
 
-use crate::cli::ProjectSort;
+use crate::cli::{ProjectListArgs, ProjectSort};
 use crate::db::{env_status, EnvStatus};
 use crate::error::{AppError, Result};
 use crate::models::{
@@ -9,6 +9,7 @@ use crate::models::{
 };
 use crate::output;
 use crate::repo::{load_project, load_projects, project_impact, resolve_project};
+use crate::util::{now_ms, parse_age_ms, parse_size_bytes};
 use rusqlite::{params, Connection};
 use serde::Serialize;
 use std::path::Path;
@@ -51,34 +52,8 @@ struct ProjectDeleteOut {
     note: Option<String>,
 }
 
-pub fn cmd_project_list(
-    con: &Connection,
-    paths: &[String],
-    sort: Option<ProjectSort>,
-) -> Result<()> {
-    let projects = load_projects(con)?;
-    let refs: Vec<&str> = paths.iter().map(String::as_str).collect();
-    let mut rows: Vec<&ProjectRow> = filter_projects(&projects, &refs);
-    match sort {
-        Some(ProjectSort::Size) => rows.sort_by(|a, b| {
-            project_total_bytes(b)
-                .cmp(&project_total_bytes(a))
-                .then_with(|| a.worktree.cmp(&b.worktree))
-        }),
-        Some(ProjectSort::Updated) => rows.sort_by(|a, b| {
-            b.updated
-                .cmp(&a.updated)
-                .then_with(|| a.worktree.cmp(&b.worktree))
-        }),
-        Some(ProjectSort::Sessions) => rows.sort_by(|a, b| {
-            b.sessions
-                .cmp(&a.sessions)
-                .then_with(|| a.worktree.cmp(&b.worktree))
-        }),
-        None => {}
-    }
-    let arr: Vec<ProjectOut> = rows.iter().map(|p| project_json(p)).collect();
-    let value = serde_json::to_value(arr)?;
+pub fn cmd_project_list(con: &Connection, args: &ProjectListArgs) -> Result<()> {
+    let value = project_list_value(con, args)?;
     let out_rows = value.as_array().map(Vec::as_slice).unwrap_or_default();
     let bytes: i64 = out_rows
         .iter()
@@ -104,6 +79,56 @@ pub fn cmd_project_list(
         ],
         &footer,
     )
+}
+
+/// Build the filtered/sorted project list (exposed for tests).
+pub fn project_list_value(con: &Connection, args: &ProjectListArgs) -> Result<serde_json::Value> {
+    let projects = load_projects(con)?;
+    let refs: Vec<&str> = args.paths.iter().map(String::as_str).collect();
+    let mut rows: Vec<&ProjectRow> = filter_projects(&projects, &refs);
+    if let Some(search) = args.search.as_deref() {
+        let needle = search.to_lowercase();
+        rows.retain(|p| {
+            p.id.to_lowercase().contains(&needle)
+                || p.worktree.to_lowercase().contains(&needle)
+                || p.name.to_lowercase().contains(&needle)
+        });
+    }
+    if let Some(age) = args.older_than.as_deref() {
+        let cutoff = now_ms()? - parse_age_ms(age)?;
+        rows.retain(|p| p.updated < cutoff);
+    }
+    if let Some(size) = args.min_size.as_deref() {
+        let min = parse_size_bytes(size)?;
+        rows.retain(|p| project_total_bytes(p) >= min);
+    }
+    match args.sort {
+        Some(ProjectSort::Size) => rows.sort_by(|a, b| {
+            project_total_bytes(b)
+                .cmp(&project_total_bytes(a))
+                .then_with(|| a.worktree.cmp(&b.worktree))
+        }),
+        Some(ProjectSort::Updated) => rows.sort_by(|a, b| {
+            b.updated
+                .cmp(&a.updated)
+                .then_with(|| a.worktree.cmp(&b.worktree))
+        }),
+        Some(ProjectSort::Sessions) => rows.sort_by(|a, b| {
+            b.sessions
+                .cmp(&a.sessions)
+                .then_with(|| a.worktree.cmp(&b.worktree))
+        }),
+        Some(ProjectSort::Worktree) | None => {
+            rows.sort_by(|a, b| a.worktree.cmp(&b.worktree));
+        }
+    }
+    if let Some(limit) = args.limit {
+        if limit > 0 {
+            rows.truncate(limit);
+        }
+    }
+    let arr: Vec<ProjectOut> = rows.iter().map(|p| project_json(p)).collect();
+    Ok(serde_json::to_value(arr)?)
 }
 
 pub fn cmd_project_show(con: &Connection, reference: &str) -> Result<()> {
@@ -302,7 +327,8 @@ fn delete_output(
 
 #[cfg(test)]
 mod tests {
-    use super::{cmd_project_delete, cmd_project_purge};
+    use super::{cmd_project_delete, cmd_project_purge, project_list_value};
+    use crate::cli::{ProjectListArgs, ProjectSort};
     use crate::models::ProjectFilter;
     use crate::testdb;
     use std::path::Path;
@@ -454,5 +480,63 @@ mod tests {
             .query_row("SELECT id FROM project", [], |r| r.get(0))
             .unwrap();
         assert_eq!(remaining, "full");
+    }
+
+    #[test]
+    fn list_filters_sorts_and_limits() {
+        let con = testdb::create();
+        testdb::insert_project(&con, "p1", "/a");
+        testdb::insert_project(&con, "p2", "/b");
+        testdb::insert_project(&con, "p3", "/c");
+        testdb::insert_project_session(&con, "s1", "/a", "p1", 1_000);
+        testdb::insert_project_session(&con, "s2", "/b", "p2", crate::util::now_ms().unwrap());
+        testdb::insert_session_message(&con, "m1", "s1", "user", "hello");
+
+        let mut args = ProjectListArgs {
+            paths: Vec::new(),
+            sort: Some(ProjectSort::Size),
+            search: None,
+            older_than: None,
+            min_size: None,
+            limit: None,
+        };
+        let value = project_list_value(&con, &args).unwrap();
+        let ids: Vec<&str> = value
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids[0], "p1");
+
+        args.search = Some("p2".to_string());
+        let value = project_list_value(&con, &args).unwrap();
+        assert_eq!(value.as_array().unwrap().len(), 1);
+        assert_eq!(value[0]["id"], "p2");
+
+        args.search = None;
+        args.min_size = Some("1".to_string());
+        let value = project_list_value(&con, &args).unwrap();
+        assert_eq!(value.as_array().unwrap().len(), 1);
+        assert_eq!(value[0]["id"], "p1");
+
+        args.min_size = None;
+        args.search = Some("p1".to_string());
+        args.older_than = Some("1d".to_string());
+        let value = project_list_value(&con, &args).unwrap();
+        assert_eq!(value.as_array().unwrap().len(), 1);
+        assert_eq!(value[0]["id"], "p1");
+
+        args.search = None;
+        args.older_than = None;
+        args.sort = Some(ProjectSort::Updated);
+        args.limit = Some(1);
+        let value = project_list_value(&con, &args).unwrap();
+        assert_eq!(value.as_array().unwrap().len(), 1);
+        assert_eq!(value[0]["id"], "p2");
+
+        args.limit = Some(0);
+        let value = project_list_value(&con, &args).unwrap();
+        assert_eq!(value.as_array().unwrap().len(), 3);
     }
 }

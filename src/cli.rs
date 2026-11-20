@@ -106,7 +106,7 @@ pub enum Command {
     Stats(StatsArgs),
     /// Interactive full-screen menu for common operations (requires a TTY)
     #[command(
-        after_help = "Keys:\n  Up/Down   move/select   Left/Right/tab   switch section\n  Enter     run/apply     Esc/q            back/quit\n  r         reload/rerun  R                refresh header\n  PgUp/PgDn scroll output\n\nSession and project lists:\n  Enter view   d delete   / filter   s sort   o older   c clear   r reload\n  Sessions: F search text, P purge old, S strip reasoning\n  Projects: E purge empty, P purge old\n\nThe menu always previews destructive actions with --dry-run before\nasking to apply. --yes does not skip that confirmation. Passing\n--dry-run makes the whole session preview-only; --no-input is rejected."
+        after_help = "Keys:\n  Up/Down   move/select   Left/Right/tab   switch section\n  PgUp/PgDn jump a page  Home/End         first/last\n  Enter     run/apply     Esc/q            back/quit\n  /         search actions (filter in browsers)\n  ?/F1      context help  R                refresh header\n  r         reload/rerun\n\nList browsers (Sessions, Projects, KV, Backups):\n  Enter open/restore  d delete  / filter  s sort  o older  c clear  r reload\n  Sessions: F search text, P purge old, S strip reasoning\n  Projects: E purge empty, P purge old\n  KV: P purge old, L purge large\n  Backups: b create, V verify, K keep newest, P prune old\n\nThe menu always previews destructive actions with --dry-run before\nasking to apply. --yes does not skip that confirmation. Passing\n--dry-run makes the whole session preview-only; --no-input is rejected."
     )]
     Tui,
     /// Integrity and consistency checks (`--fix` repairs what it can)
@@ -226,10 +226,23 @@ pub struct ProjectListArgs {
     /// Sort key (default: worktree)
     #[arg(long, value_enum, value_name = "KEY")]
     pub sort: Option<ProjectSort>,
+    /// Only projects whose id, worktree, or name contains this text
+    #[arg(long, value_name = "TEXT")]
+    pub search: Option<String>,
+    /// Only projects whose latest session activity is older than the age
+    #[arg(long = "older-than", value_name = "AGE", value_parser = age_value)]
+    pub older_than: Option<String>,
+    /// Only projects at least this large (e.g. 50M)
+    #[arg(long = "min-size", value_name = "SIZE", value_parser = size_value)]
+    pub min_size: Option<String>,
+    /// Maximum number of projects to print (0 = no limit)
+    #[arg(long, value_name = "N")]
+    pub limit: Option<usize>,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
 pub enum ProjectSort {
+    Worktree,
     Size,
     Updated,
     Sessions,
@@ -310,7 +323,7 @@ pub struct SessionSearchArgs {
     /// Text to find in message content (case-insensitive)
     #[arg(value_name = "TEXT")]
     pub text: String,
-    /// Maximum number of sessions to report
+    /// Maximum number of sessions to report (0 = no limit)
     #[arg(long, value_name = "N", default_value_t = 20)]
     pub limit: usize,
     /// Maximum snippets per session
@@ -350,7 +363,7 @@ pub struct SessionExportArgs {
     /// Only sessions of this project (batch mode)
     #[arg(long, value_name = "REF", requires = "out_dir")]
     pub project: Option<String>,
-    /// Maximum number of sessions to export (batch mode)
+    /// Maximum number of sessions to export (batch mode, 0 = no limit)
     #[arg(long, value_name = "N", requires = "out_dir")]
     pub limit: Option<usize>,
 }
@@ -378,7 +391,7 @@ pub struct SessionListArgs {
     /// Sort key (default: time_updated descending)
     #[arg(long, value_enum, value_name = "KEY")]
     pub sort: Option<SortKey>,
-    /// Maximum number of sessions to print
+    /// Maximum number of sessions to print (0 = no limit)
     #[arg(long, value_name = "N")]
     pub limit: Option<usize>,
     /// Only sessions whose title or directory contains this text
@@ -525,12 +538,28 @@ pub enum KvCmd {
 
 #[derive(Args)]
 pub struct KvListArgs {
+    /// Sort key (default: size, largest first)
+    #[arg(long, value_enum, value_name = "KEY")]
+    pub sort: Option<KvSort>,
     /// Only entries not updated since the cutoff
     #[arg(long, value_name = "AGE", value_parser = age_value)]
     pub older_than: Option<String>,
-    /// Only keys containing this text (case-insensitive, ASCII)
+    /// Only keys containing this text (case-insensitive)
     #[arg(long, value_name = "TEXT")]
     pub search: Option<String>,
+    /// Only entries at least this large (e.g. 1M)
+    #[arg(long = "min-size", value_name = "SIZE", value_parser = size_value)]
+    pub min_size: Option<String>,
+    /// Maximum number of entries to print (0 = no limit)
+    #[arg(long, value_name = "N")]
+    pub limit: Option<usize>,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+pub enum KvSort {
+    Size,
+    Key,
+    Updated,
 }
 
 #[derive(Args)]
@@ -602,7 +631,7 @@ pub struct DbCheckpointArgs {
 
 #[derive(Args)]
 #[command(
-    after_help = "Examples:\n  opencode-dbtool backup\n  opencode-dbtool backup list --verify\n  opencode-dbtool backup restore --latest --dry-run"
+    after_help = "Examples:\n  opencode-dbtool backup\n  opencode-dbtool backup list --verify --limit 5\n  opencode-dbtool backup delete opencode.db.backup-20260830T120000Z --dry-run\n  opencode-dbtool backup restore --latest --dry-run"
 )]
 pub struct BackupArgs {
     /// List backups or restore one (default: create a backup)
@@ -623,6 +652,11 @@ pub enum BackupCmd {
     List(BackupListArgs),
     /// Restore a backup over the current database
     Restore(BackupRestoreArgs),
+    /// Delete specific backup files
+    #[command(
+        after_help = "Bare file names are resolved in the database directory.\n\nExamples:\n  opencode-dbtool backup delete opencode.db.backup-20260830T120000Z --dry-run\n  opencode-dbtool backup delete opencode.db.backup-20260830T120000Z --yes"
+    )]
+    Delete(BackupDeleteArgs),
     /// Delete old backups without creating a new one
     #[command(
         after_help = "Examples:\n  opencode-dbtool backup prune --keep 3 --dry-run\n  opencode-dbtool backup prune --older-than 30d --yes"
@@ -638,6 +672,25 @@ pub struct BackupListArgs {
     /// Sort key (default: date, newest first)
     #[arg(long, value_enum, value_name = "KEY")]
     pub sort: Option<BackupSort>,
+    /// Only backups whose file name contains this text (case-insensitive)
+    #[arg(long, value_name = "TEXT")]
+    pub search: Option<String>,
+    /// Only backups created before this age (e.g. 30d)
+    #[arg(long = "older-than", value_name = "AGE", value_parser = age_value)]
+    pub older_than: Option<String>,
+    /// Only backups at least this large (e.g. 50M)
+    #[arg(long = "min-size", value_name = "SIZE", value_parser = size_value)]
+    pub min_size: Option<String>,
+    /// Maximum number of backups to print (0 = no limit)
+    #[arg(long, value_name = "N")]
+    pub limit: Option<usize>,
+}
+
+#[derive(Args)]
+pub struct BackupDeleteArgs {
+    /// One or more backup files (bare names are resolved in the DB directory)
+    #[arg(required = true, value_name = "FILE")]
+    pub files: Vec<PathBuf>,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
