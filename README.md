@@ -17,11 +17,11 @@ Requires the opencode 2.x database schema (`session_v2`, `session_message`,
 are not supported and fail with exit code 3; open the DB once with
 opencode 2.x so its migrations run, then retry.
 
-Current releases are verified against the opencode 2.2 schema and use the
-newer tables when present: `session_part` (assistant content on builds
-with part rows), `blob`/`blob_ref` (media), `schedule`, and `job`.
-Databases opened by older 2.x builds that lack them still work; their
-sizes report zero for the missing storage. Session output reports
+Current releases track the latest opencode 2.x schema (`account*`,
+`credential`, `machine`, `automation`, `session_part`, `blob`/`blob_ref`,
+`job`, and optional `session_search*` full-text index tables). Databases
+opened by older 2.x builds that lack newer optional tables still work;
+their sizes report zero for the missing storage. Session output reports
 `parts`/`session_parts` for the newer content rows.
 
 ## Install
@@ -158,41 +158,55 @@ Destructive commands (`session`/`project delete` and `purge`,
 ### `tui`
 
 `opencode-dbtool tui` opens a full-screen menu for the same operations as
-the CLI. Use `Up`/`Down` (or `j`/`k`) to select an action, `Left`/`Right`
-(or `Tab`, or `1`-`9`) to switch sections, and `Enter` to run it. `PgUp`/
-`PgDn` jump a page in long lists. In command menus `/` searches every action
-by label or description; in the list browsers it filters the list. `?` or
-`F1` shows a context-sensitive help screen for the current view. `q` or `Esc`
-leaves the menu. The header shows the resolved database size, whether
-opencode is running, and the registered service pid.
-Layout uses terminal cell widths, so Japanese and other wide characters
-stay aligned in titles and columns.
+the CLI. Use `Up`/`Down` (or `j`/`k`) to select an item, `Left`/`Right`
+(or `Tab`, or `1`-`9`) to switch sections, and `Enter` to open or run it.
+`PgUp`/`PgDn` jump a page in long lists. In command menus `/` searches
+every action by label or description; in the list browsers it filters the
+list. `?` or `F1` shows a context-sensitive help screen for the current
+view. `q` or `Esc` steps back out of a nested list or leaves the menu
+(`Ctrl+C` always quits). The header shows the resolved database size,
+whether opencode is running, and the registered service pid. Layout uses
+terminal cell widths, so Japanese and other wide characters stay aligned
+in titles and columns.
 
-The sections cover overview/health, sessions, projects, kv cache, backups,
+The sections cover overview/health, projects, sessions, kv cache, backups,
 storage cleanup, database tools, one-shot cleanup, and system commands
 (`service status`, `config show/path`, `self-update`).
 
-`Sessions`, `Projects`, `KV cache`, and `Backups` open file-manager-style
+`Projects`, `Sessions`, `KV cache`, and `Backups` open file-manager-style
 lists instead of command menus. Move with `Up`/`Down` (`j`/`k`) or
 `PgUp`/`PgDn`; the right pane previews the selected item. Common keys are
 `/` (filter), `o` (only items older than an age), `s` (cycle the sort key),
 `c` (clear filters), `r` (reload), and `d` (delete the selected item, preview
-first). `Enter` opens the detail or value, except in `Backups`, where it
-restores the selected backup.
+first).
 
-- Sessions: `Enter` opens messages; `F` searches message content; `P` purges
-  old sessions; `S` strips reasoning.
-- Projects: `E` purges empty projects; `P` purges old projects.
+- Projects (staged browsing): `Enter` opens the selected project's sessions,
+  `v` opens the project summary (`project show`), `d` deletes the project,
+  `E` purges empty projects, and `P` purges old projects. Inside a
+  project's sessions, `u` or `>` drills into a session's subagents, `t`
+  toggles top-level sessions only vs all sessions, `v` shows the project
+  summary, and `Esc` or `Backspace` steps back one level (restoring your
+  previous filters and cursor).
+- Sessions: `Enter` opens session messages; `u` or `>` drills into direct
+  subagent sessions (`Esc`/`Backspace` steps back); `t` toggles top-level
+  sessions only; `F` searches message content; `P` purges old sessions;
+  `S` strips reasoning. Subagent rows are tagged `[sub]` and parent rows
+  with loaded children show `[+N sub]`.
 - KV cache: `Enter` shows the value; `P` purges old entries; `L` purges
   entries larger than a size.
-- Backups: `b` creates a new verified backup; `V` toggles integrity
-  verification of the list; `K` keeps only the newest N; `P` prunes old
-  backups.
+- Backups: `Enter` restores the selected backup; `b` creates a new
+  verified backup; `V` toggles integrity verification of the list; `K`
+  keeps only the newest N; `P` prunes old backups.
 
 All of those destructive operations use the same preview-and-confirm flow as
-the CLI. The rightmost session column follows the active sort key (size,
-cost, or messages/parts). Press `?` or `F1` for the full key list in any
-browser.
+the CLI. Delete previews and completion screens render structured summaries
+with clear status badges (`[PREVIEW]`, `[DELETED]`, `[NO CHANGES]`,
+`[FAILED]`), affected item lists, and table row counts without raw JSON
+dumps. After a delete finishes, `Enter` or `Esc` returns to the refreshed
+list with the cursor position preserved, and `r` is disabled so completed
+deletes cannot be accidentally re-run against removed IDs. The rightmost
+session column follows the active sort key (size, cost, or
+messages/parts). Press `?` or `F1` for the full key list in any browser.
 
 The other sections are command menus. Actions that need a key, text, age, or
 size ask for it in a one-line prompt; leaving the prompt empty uses the shown
@@ -201,13 +215,15 @@ cleanup, `90d` for projects, `1M` for kv sizes). The prompt supports cursor
 movement, `Ctrl+U` (clear), `Ctrl+W` (delete the previous word), and
 `Ctrl+K` (delete to the end).
 
-Every action runs the real CLI as a child process with `--format table
---no-pager --no-input`, so the menu cannot bypass the service guard,
-maintenance lock, or confirmation rules. Destructive actions are always
-previewed with `--dry-run` first; `Enter`/`a` then re-runs the same command
-with `--yes`, and `r` runs the preview again. In the result view,
+Every action runs the real CLI as a child process with `--no-pager --no-input`
+(using structured JSON internally for list browsers and delete reports, and
+`--format table` for command views), so the menu cannot bypass the service
+guard, maintenance lock, or confirmation rules. Destructive actions are
+always previewed with `--dry-run` first; `Enter`/`a` then re-runs the same
+command with `--yes`, and `r` runs the preview again. In the result view,
 `Up`/`Down`, `PgUp`/`PgDn`, and `Home`/`End` scroll the captured output;
-`Esc` returns to the menu. `R` refreshes the header status.
+`Enter` (when no preview confirmation is pending) or `Esc` returns to the
+menu. `R` refreshes the header status.
 
 `tui --dry-run` makes the whole session preview-only, so no action can be
 applied. `--no-input` is rejected (the menu needs the terminal); all other
@@ -357,9 +373,10 @@ relative to all sessions.
 
 Integrity and consistency checks. Run it when something looks wrong, or
 before `vacuum`, to confirm the database is healthy. `--fix` applies the
-supported repairs (orphan blobs/jobs/events and dangling references) in one pass;
-combine it with `--dry-run` to preview. `--max-backup-age <age>` adds an
-advisory warning when the newest backup is missing or older than the age.
+supported repairs (orphan blobs/jobs/automations/events/search index
+entries and dangling references) in one pass; combine it with `--dry-run`
+to preview. `--max-backup-age <age>` adds an advisory warning when the
+newest backup is missing or older than the age.
 
 ```json
 {
@@ -375,7 +392,10 @@ advisory warning when the newest backup is missing or older than the age.
     "orphaned_event_sequences": [],
     "orphan_instruction_blobs": [],
     "orphan_media_blobs": [],
-    "orphaned_jobs": []
+    "orphaned_jobs": [],
+    "orphaned_automations": [],
+    "orphaned_search_documents": [],
+    "orphaned_session_rows": []
   },
   "ok": true
 }
@@ -392,12 +412,15 @@ advisory warning when the newest backup is missing or older than the age.
 | `orphans.orphan_instruction_blobs` | `instruction_blob` rows referenced by no state (leaked by session/project deletes; reclaim with `fs clean-blob-orphans`) |
 | `orphans.orphan_media_blobs` | `blob` rows referenced by no `blob_ref` (left by a direct delete or interrupted run; reclaim with `fs clean-blob-orphans`) |
 | `orphans.orphaned_jobs` | `job` rows whose session or child session is gone (the table has no foreign keys) |
+| `orphans.orphaned_automations` | `automation` rows whose `project_id` has no `project` row (automations intentionally keep a missing `session_id`) |
+| `orphans.orphaned_search_documents` | `session_search_document` rows whose session or message is gone (the table has no foreign keys) |
+| `orphans.orphaned_session_rows` | per-table `{ table, count }` entries for session child tables (`session_message`, `session_part`, `session_inbox`, `instruction_*`, `blob_ref`, legacy `schedule`) whose session is gone |
 
-`orphans` collects references that no FK constraint covers, plus
-`session_message`/`session_part`/`inbox`/`instruction_*`/`schedule`/
-`blob_ref` rows whose session is gone (folded into `ok: false`). `doctor
---fix` removes orphan blobs and jobs and clears dangling references.
-`ok: false` (exit code 3) when integrity/fk/orphan checks fail.
+`orphans` collects references that no FK constraint covers, plus explicit
+per-table counts for session child tables whose session is gone (folded
+into `ok: false`). `doctor --fix` removes orphan blobs, jobs,
+automations, events, and search index entries and clears dangling
+references. `ok: false` (exit code 3) when integrity/fk/orphan checks fail.
 
 ### `report`
 
@@ -1045,15 +1068,15 @@ environment when set, avoiding the unauthenticated GitHub API rate limit.
 ```json
 {
   "command": "self-update",
-  "current_version": "0.4.0",
-  "latest_version": "0.4.0",
+  "current_version": "0.5.0",
+  "latest_version": "0.5.0",
   "target": "x86_64-unknown-linux-musl",
   "update_available": true,
   "updated": false,
   "dry_run": true,
   "status": "update-available",
   "path": "/home/user/.cargo/bin/opencode-dbtool",
-  "release_url": "https://github.com/orrisroot/opencode-dbtool/releases/tag/v0.4.0"
+  "release_url": "https://github.com/orrisroot/opencode-dbtool/releases/tag/v0.5.0"
 }
 ```
 
@@ -1285,13 +1308,16 @@ Deletes run in a single immediate transaction with `PRAGMA foreign_keys=ON`:
 - `event` / `event_sequence` rows for the target are deleted explicitly (they
   reference aggregates, not sessions).
 - `job` rows for the target session or its child sessions are deleted
-  explicitly: the table has no foreign keys.
+  explicitly: the table has no foreign keys. Project deletes also delete
+  `automation` rows and project-level event aggregates (`event` /
+  `event_sequence`).
 - Direct deletes leave orphan `instruction_blob`/`blob` rows for
   `fs clean-blob-orphans` (also run by `cleanup`). The server API path
   releases media blobs itself.
 - The `session_v2` / `project` row is deleted; `session_message`,
-  `session_part`, `session_inbox`, `schedule`, `blob_ref`, `instruction_*`
-  and the other project-scoped tables follow via `ON DELETE CASCADE`.
+  `session_part`, `session_inbox`, `blob_ref`, `instruction_*`
+  and the other project-scoped tables follow via `ON DELETE CASCADE` (with
+  optional `session_search*` entries cleaned up explicitly too).
 - After commit the tool verifies the rows are gone and reports an error
   (exit 2) if not.
 
@@ -1313,59 +1339,7 @@ that deletes matching reasoning `event` and `session_part` rows, rewrites
 
 ## Changelog
 
-### [0.4.0] - 2026-11-08
-
-#### Added
-
-- Resident-service maintenance: `service status`, API-routed session deletes, and the global `--restart-service` flag.
-- Backup management: `backup list --verify/--sort`, `backup restore`, `backup prune`, and `vacuum --into`.
-- Diagnostics and planning: `doctor --fix`, `doctor --max-backup-age`, `report` with costs and scoped filters, `db path`, `db optimize`, and `db query`.
-- Workflow controls: one-shot `cleanup` with summaries, `cleanup --verify`, `cleanup --vacuum-online`, `config show`/`config path`, and `--wait-lock`.
-- Session tools: `session search`, JSON/Markdown/batch `session export`, `session import`, and project/parent filters for session listings.
-- Output controls: CSV output, `--fields`, `--color`, `--no-pager`, and shell completions.
-- Storage tools: `kv purge`, `kv list --search`, `fs clean-repos`, and `fs clean-tool-output`.
-- opencode 2.2 schema support for `session_part`, `blob`/`blob_ref`, `schedule`, and `job`, including part types, media blob sizes, tool-output storage, and reasoning stripping of current events and parts.
-
-#### Changed
-
-- Reworked the CLI for interactive and scriptable use; `--dry-run` previews include a copyable apply command.
-- Session sizes and project sizes include `session_part` and referenced media blob bytes.
-- Session JSON reports `parts` and `blob_bytes`; project JSON reports `session_parts` and `blob_bytes`.
-- Direct deletes leave orphan blob rows for `fs clean-blob-orphans` (also run by `cleanup`); the server API path releases media blobs itself.
-- Expanded docs and added scheduling templates under `contrib/`.
-
-#### Removed
-
-- The session `pending` field and use of the removed `session_pending` table.
-
-#### Fixed
-
-- Hardened backup restore, made backup names unique within a second, and added maintenance locking and disk-space checks.
-- Addressed review findings across search, costs, cleanup, restart handling, and output formats.
-- Zero-match session/project purges no longer delete unrelated orphan media blobs; direct deletes leave blob cleanup to `fs clean-blob-orphans`.
-- Fixed formatting and lint failures in CI.
-
-### [0.2.0] - 2026-10-03
-
-#### Added
-
-- opencode 2.x database schema support (`session_v2`, `event`, instruction, and workspace tables).
-- `OPENCODE_DB` and channel-database resolution.
-- Detection of the `opencode2` beta executable.
-
-#### Removed
-
-- opencode 1.x database support.
-
-### [0.1.1] - 2026-09-05
-
-#### Added
-
-- `self-update` from GitHub releases.
-
-#### Fixed
-
-- Correctness, performance, and safety hardening, including database connection cleanup.
+See [CHANGELOG.md](CHANGELOG.md) for the release history.
 
 ### [0.1.0] - 2026-09-01
 
