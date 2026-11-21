@@ -106,7 +106,7 @@ pub enum Command {
     Stats(StatsArgs),
     /// Interactive full-screen menu for common operations (requires a TTY)
     #[command(
-        after_help = "Keys:\n  Up/Down   move/select   Left/Right/tab   switch section\n  PgUp/PgDn jump a page  Home/End         first/last\n  Enter     run/apply     Esc/q            back/quit\n  /         search actions (filter in browsers)\n  ?/F1      context help  R                refresh header\n  r         reload/rerun\n\nList browsers (Sessions, Projects, KV, Backups):\n  Enter open/restore  d delete  / filter  s sort  o older  c clear  r reload\n  Sessions: F search text, P purge old, S strip reasoning\n  Projects: E purge empty, P purge old\n  KV: P purge old, L purge large\n  Backups: b create, V verify, K keep newest, P prune old\n\nThe menu always previews destructive actions with --dry-run before\nasking to apply. --yes does not skip that confirmation. Passing\n--dry-run makes the whole session preview-only; --no-input is rejected."
+        after_help = "Keys:\n  Up/Down   move/select   Left/Right/tab   switch section\n  PgUp/PgDn jump a page  Home/End         first/last\n  Enter     open/run      Esc/Bksp         back / quit\n  /         search actions (filter in browsers)\n  ?/F1      context help  R                refresh header\n  r         reload/rerun\n\nList browsers (Projects, Sessions, KV, Backups):\n  Projects: Enter sessions, v summary, d delete, E empty, P purge\n  Sessions: Enter show, u subagents, t top-level, d delete, F text, P purge, S strip\n  KV:       Enter show, d delete, P purge old, L purge large\n  Backups:  Enter restore, d delete, b create, V verify, K keep newest, P prune\n  Common:   / filter, s sort, o older, c clear, r reload\n\nThe menu always previews destructive actions with --dry-run before\nasking to apply. --yes does not skip that confirmation. Passing\n--dry-run makes the whole session preview-only; --no-input is rejected."
     )]
     Tui,
     /// Integrity and consistency checks (`--fix` repairs what it can)
@@ -165,8 +165,8 @@ pub struct StatsArgs {
     after_help = "Examples:\n  opencode-dbtool doctor\n  opencode-dbtool doctor --fix --dry-run"
 )]
 pub struct DoctorArgs {
-    /// Repair what can be repaired: orphan blobs/jobs/events and dangling
-    /// parent/fork/workspace references
+    /// Repair what can be repaired: orphan blobs/jobs/automations/events/
+    /// search index entries and dangling parent/fork/workspace references
     #[arg(long)]
     pub fix: bool,
     /// Warn when the newest backup is missing or older than this age

@@ -1126,8 +1126,8 @@ const PREVIEW_TABLES: [(&str, PreviewKey); 10] = [
     ("session_inbox", PreviewKey::Session("session_id")),
     ("instruction_entry", PreviewKey::Session("session_id")),
     ("instruction_state", PreviewKey::Session("session_id")),
-    ("schedule", PreviewKey::Session("session_id")),
     ("blob_ref", PreviewKey::Session("session_id")),
+    ("session_search_document", PreviewKey::Session("session_id")),
     ("event", PreviewKey::Aggregate("aggregate_id")),
     ("event_sequence", PreviewKey::Aggregate("aggregate_id")),
     ("job", PreviewKey::Job),
@@ -1244,6 +1244,10 @@ fn execute_delete(con: &mut Connection, resolved: &[String]) -> Result<()> {
     output::progress("deleting sessions");
     con.execute_batch("PRAGMA foreign_keys = ON;")?;
     let has_jobs = crate::db::table_exists(con, "job")?;
+    let has_search_docs = crate::db::table_exists(con, "session_search_document")?;
+    let has_fts = has_search_docs && crate::db::table_exists(con, "session_search")?;
+    let has_doc_delete_trigger =
+        has_search_docs && crate::db::trigger_exists(con, "session_search_document_delete")?;
     let tx = con.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     for chunk in resolved.chunks(SQL_VAR_CHUNK) {
         let in_sql = placeholders(chunk.len());
@@ -1272,6 +1276,16 @@ fn execute_delete(con: &mut Connection, resolved: &[String]) -> Result<()> {
             &format!("DELETE FROM \"{SESSION_TABLE}\" WHERE id IN ({in_sql})"),
             rusqlite::params_from_iter(chunk),
         )?;
+        if has_search_docs {
+            let chunk_refs: Vec<&str> = chunk.iter().map(String::as_str).collect();
+            crate::repo::delete_search_documents_where(
+                &tx,
+                has_fts,
+                has_doc_delete_trigger,
+                &format!("session_id IN ({in_sql})"),
+                &chunk_refs,
+            )?;
+        }
     }
     tx.commit()?;
 

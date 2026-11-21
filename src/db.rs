@@ -4,7 +4,7 @@ use crate::error::{AppError, Result};
 use crate::sys;
 use rusqlite::{params, Connection};
 use serde::Serialize;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 /// Environment block prepended to single-result command outputs.
@@ -50,8 +50,9 @@ pub const SESSION_TABLE: &str = "session_v2";
 pub fn ensure_schema(con: &Connection) -> Result<()> {
     // Core tables every command needs. Cache/account tables (`kv`,
     // `account`, ...) are intentionally not required, and newer content
-    // tables (`session_part`, `blob`, `schedule`, `job`) are optional so a
-    // database opened by an older 2.x build still works.
+    // tables (`session_part`, `blob`, `automation`, `job`, `machine`,
+    // `session_search*`) are optional so a database opened by an older
+    // 2.x build still works.
     for t in [
         "project",
         "session_v2",
@@ -82,18 +83,47 @@ pub fn ensure_schema(con: &Connection) -> Result<()> {
     Ok(())
 }
 
-/// Whether a table exists in this database. Optional tables added by newer
-/// opencode releases are detected this way so the tool keeps working when
-/// the database has not run the newest migrations yet.
-pub fn table_exists(con: &Connection, table: &str) -> Result<bool> {
+fn sqlite_object_exists(con: &Connection, kind: &str, name: &str) -> Result<bool> {
     let n: i64 = con
         .query_row(
-            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
-            params![table],
+            "SELECT COUNT(*) FROM sqlite_master WHERE type=?1 AND name=?2",
+            params![kind, name],
             |r| r.get(0),
         )
         .map_err(|e| AppError::db(e.to_string()))?;
     Ok(n > 0)
+}
+
+/// Whether a table exists in this database. Optional tables added by newer
+/// opencode releases are detected this way so the tool keeps working when
+/// the database has not run the newest migrations yet.
+pub fn table_exists(con: &Connection, table: &str) -> Result<bool> {
+    sqlite_object_exists(con, "table", table)
+}
+
+/// Whether a trigger exists in this database.
+pub fn trigger_exists(con: &Connection, trigger: &str) -> Result<bool> {
+    sqlite_object_exists(con, "trigger", trigger)
+}
+
+/// Directory holding `db_path` (falls back to `.` for bare filenames).
+pub fn db_dir(db_path: &Path) -> &Path {
+    db_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."))
+}
+
+/// Path of a SQLite sidecar file next to `path` (`<path>-wal`, ...).
+pub fn sidecar_path(path: &Path, suffix: &str) -> PathBuf {
+    let mut os = path.as_os_str().to_os_string();
+    os.push(suffix);
+    PathBuf::from(os)
+}
+
+/// Path of the WAL file next to `db_path` (`<db_path>-wal`).
+pub fn wal_path(db_path: &Path) -> PathBuf {
+    sidecar_path(db_path, "-wal")
 }
 
 /// Open the database, read-only for passive commands, read-write otherwise.
@@ -111,10 +141,36 @@ pub fn open_conn(db_path: &Path, read_only: bool) -> Result<Connection> {
     Ok(con)
 }
 
-/// Run `PRAGMA quick_check`; returns "ok" or the first error text.
+/// Run a multi-row `PRAGMA` check (such as `quick_check` or
+/// `integrity_check`), returning `"ok"` when healthy or all diagnostic
+/// lines joined by `"; "` (or error text on failure).
+pub fn pragma_check(con: &Connection, pragma: &str) -> String {
+    let sql = format!("PRAGMA {pragma}");
+    let Ok(mut stmt) = con.prepare(&sql) else {
+        return format!("{pragma} failed to prepare");
+    };
+    let Ok(rows) = stmt.query_map([], |r| r.get::<_, String>(0)) else {
+        return format!("{pragma} query failed");
+    };
+    let mut messages: Vec<String> = Vec::new();
+    for row in rows {
+        match row {
+            Ok(msg) => messages.push(msg),
+            Err(e) => return e.to_string(),
+        }
+    }
+    if messages.len() == 1 && messages[0] == "ok" {
+        "ok".to_string()
+    } else if messages.is_empty() {
+        format!("{pragma} returned no rows")
+    } else {
+        messages.join("; ")
+    }
+}
+
+/// Run `PRAGMA quick_check`; returns `"ok"` or diagnostic error text.
 pub fn quick_check(con: &Connection) -> String {
-    con.query_row("PRAGMA quick_check", [], |r| r.get::<_, String>(0))
-        .unwrap_or_else(|e| e.to_string())
+    pragma_check(con, "quick_check")
 }
 
 /// File size on disk; 0 when the file is missing or unreadable.
@@ -183,6 +239,24 @@ mod tests {
                 "pid_error": "detection failed",
                 "db": "/x/opencode.db"
             })
+        );
+    }
+
+    #[test]
+    fn wal_path_and_db_dir_handle_bare_and_custom_extensions() {
+        assert_eq!(db_dir(Path::new("opencode.db")), Path::new("."));
+        assert_eq!(db_dir(Path::new("/tmp/a.sqlite")), Path::new("/tmp"));
+        assert_eq!(
+            wal_path(Path::new("opencode.db")),
+            PathBuf::from("opencode.db-wal")
+        );
+        assert_eq!(
+            wal_path(Path::new("/tmp/custom.sqlite")),
+            PathBuf::from("/tmp/custom.sqlite-wal")
+        );
+        assert_eq!(
+            wal_path(Path::new("/tmp/mydb")),
+            PathBuf::from("/tmp/mydb-wal")
         );
     }
 }

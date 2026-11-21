@@ -1,6 +1,6 @@
 //! `db`: path/pragma inspection, `PRAGMA optimize`, and read-only queries.
 
-use crate::db::{env_status, file_size, EnvStatus};
+use crate::db::{env_status, file_size, wal_path, EnvStatus};
 use crate::error::{AppError, Result};
 use crate::output;
 use rusqlite::types::ValueRef;
@@ -35,7 +35,7 @@ pub fn cmd_db_path(con: &Connection, db_path: &Path) -> Result<()> {
         auto_vacuum,
         busy_timeout,
         user_version,
-        wal_bytes: file_size(&db_path.with_extension("db-wal")),
+        wal_bytes: file_size(&wal_path(db_path)),
     })?)
 }
 

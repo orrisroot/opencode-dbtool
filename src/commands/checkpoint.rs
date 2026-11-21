@@ -6,7 +6,7 @@
 //! and report the lock state instead of failing. `--dry-run` reports the
 //! plan without running the pragma.
 
-use crate::db::{env_status, file_size, EnvStatus};
+use crate::db::{env_status, file_size, wal_path, EnvStatus};
 use crate::error::Result;
 use crate::output;
 use serde::Serialize;
@@ -38,7 +38,7 @@ pub fn checkpoint_value(
     truncate: bool,
     dry_run: bool,
 ) -> Result<serde_json::Value> {
-    let wal_path = db_path.with_extension("db-wal");
+    let wal_path = wal_path(db_path);
     let wal_before = file_size(&wal_path);
     let mode = if truncate { "truncate" } else { "passive" };
     if dry_run {
@@ -119,7 +119,7 @@ mod tests {
             .unwrap();
         testdb::insert_session(&con, "s1", "/a", None);
         // Keep the connection open so the WAL keeps its frames.
-        let wal = db_path.with_extension("db-wal");
+        let wal = wal_path(&db_path);
         let before = file_size(&wal);
 
         let v = checkpoint_value(&db_path, true, true).unwrap();

@@ -4,9 +4,10 @@
 //!
 //! V2-only (opencode 2.x): `session_v2`, `session_message`, `session_part`
 //! (newer builds), `session_inbox`, `instruction_*`, `worktree`, plus the
-//! newer `blob`, `schedule`, and `job` tables when present.
+//! newer `blob`, `automation`, `job`, `machine`, and optional
+//! `session_search*` tables when present.
 
-use crate::db::{table_exists, SESSION_TABLE};
+use crate::db::{table_exists, trigger_exists, SESSION_TABLE};
 use crate::error::{AppError, Result};
 use crate::models::{ProjectRow, SessionMeta, SessionRow};
 use rusqlite::{params, Connection};
@@ -954,11 +955,11 @@ pub fn job_orphans(con: &Connection) -> Result<Vec<String>> {
         return Ok(Vec::new());
     }
     let mut stmt = con.prepare(&format!(
-        "SELECT notification_id FROM job \
-         WHERE session_id NOT IN (SELECT id FROM \"{SESSION_TABLE}\") \
-            OR (child_session_id IS NOT NULL AND child_session_id != '' \
-                AND child_session_id NOT IN (SELECT id FROM \"{SESSION_TABLE}\")) \
-         ORDER BY notification_id"
+        "SELECT notification_id FROM job j \
+         WHERE NOT EXISTS (SELECT 1 FROM \"{SESSION_TABLE}\" s WHERE s.id = j.session_id) \
+            OR (j.child_session_id IS NOT NULL AND j.child_session_id != '' \
+                AND NOT EXISTS (SELECT 1 FROM \"{SESSION_TABLE}\" s WHERE s.id = j.child_session_id)) \
+         ORDER BY j.notification_id"
     ))?;
     let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
     Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
@@ -974,14 +975,179 @@ pub fn delete_orphan_jobs(con: &mut Connection) -> Result<usize> {
     let rows = tx.execute(
         &format!(
             "DELETE FROM job \
-             WHERE session_id NOT IN (SELECT id FROM \"{SESSION_TABLE}\") \
+             WHERE NOT EXISTS (SELECT 1 FROM \"{SESSION_TABLE}\" s WHERE s.id = job.session_id) \
                 OR (child_session_id IS NOT NULL AND child_session_id != '' \
-                    AND child_session_id NOT IN (SELECT id FROM \"{SESSION_TABLE}\"))"
+                    AND NOT EXISTS (SELECT 1 FROM \"{SESSION_TABLE}\" s WHERE s.id = job.child_session_id))"
         ),
         [],
     )?;
     tx.commit()?;
     Ok(rows)
+}
+
+/// `automation` rows whose `project_id` has no matching `project` row.
+/// `automation` carries no foreign keys (`session_id` intentionally stays
+/// unlinked so deleting a session preserves the automation, whereas a
+/// missing `project_id` has no owner).
+pub fn automation_orphans(con: &Connection) -> Result<Vec<String>> {
+    if !table_exists(con, "automation")? {
+        return Ok(Vec::new());
+    }
+    let mut stmt = con.prepare(
+        "SELECT id FROM automation a \
+         WHERE NOT EXISTS (SELECT 1 FROM project p WHERE p.id = a.project_id) \
+         ORDER BY id",
+    )?;
+    let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+    Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+}
+
+/// Delete orphan `automation` rows whose `project_id` has no `project`;
+/// returns rows removed.
+pub fn delete_orphan_automations(con: &mut Connection) -> Result<usize> {
+    if !table_exists(con, "automation")? {
+        return Ok(0);
+    }
+    con.execute_batch("PRAGMA foreign_keys = ON;")?;
+    let tx = con.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let rows = tx.execute(
+        "DELETE FROM automation \
+         WHERE NOT EXISTS (SELECT 1 FROM project p WHERE p.id = automation.project_id)",
+        [],
+    )?;
+    tx.commit()?;
+    Ok(rows)
+}
+
+fn search_doc_orphan_where(alias: &str) -> String {
+    format!(
+        "(NOT EXISTS (SELECT 1 FROM \"{SESSION_TABLE}\" s WHERE s.id = {alias}.session_id) \
+          OR ({alias}.source_id != {alias}.session_id \
+              AND NOT EXISTS (SELECT 1 FROM session_message m WHERE m.id = {alias}.source_id)))"
+    )
+}
+
+/// `session_search_document` `source_id` rows whose `session_id` (or
+/// indexed `session_message`) no longer exists.
+pub fn search_document_orphans(con: &Connection) -> Result<Vec<String>> {
+    if !table_exists(con, "session_search_document")? {
+        return Ok(Vec::new());
+    }
+    let sql = format!(
+        "SELECT d.source_id FROM session_search_document d \
+         WHERE {} ORDER BY d.id",
+        search_doc_orphan_where("d")
+    );
+    let mut stmt = con.prepare(&sql)?;
+    let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+    Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+}
+
+fn delete_search_docs_where(
+    tx: &rusqlite::Transaction<'_>,
+    has_fts: bool,
+    has_delete_trigger: bool,
+    where_sql: &str,
+    params: &[&str],
+) -> Result<usize> {
+    // Compact layout (`content=''`, `contentless_delete=1`) has no
+    // `AFTER DELETE` trigger on `session_search_document`, so remove FTS5
+    // entries before deleting the document rows. Text layout (`external
+    // content`) maintains `session_search` via `session_search_document_delete`.
+    if has_fts && !has_delete_trigger {
+        tx.execute(
+            &format!(
+                "DELETE FROM session_search WHERE rowid IN \
+                 (SELECT id FROM session_search_document WHERE {where_sql})"
+            ),
+            rusqlite::params_from_iter(params.iter().copied()),
+        )?;
+    }
+    let rows = tx.execute(
+        &format!("DELETE FROM session_search_document WHERE {where_sql}"),
+        rusqlite::params_from_iter(params.iter().copied()),
+    )?;
+    Ok(rows)
+}
+
+/// Delete `session_search_document` rows (and their `session_search` FTS5
+/// entries) matching a custom predicate inside an existing transaction.
+pub fn delete_search_documents_where(
+    tx: &rusqlite::Transaction<'_>,
+    has_fts: bool,
+    has_delete_trigger: bool,
+    where_sql: &str,
+    params: &[&str],
+) -> Result<usize> {
+    delete_search_docs_where(tx, has_fts, has_delete_trigger, where_sql, params)
+}
+
+/// Delete orphaned `session_search_document` rows (and their `session_search`
+/// FTS5 entries); returns document rows removed.
+pub fn delete_orphan_search_documents(con: &mut Connection) -> Result<usize> {
+    if !table_exists(con, "session_search_document")? {
+        return Ok(0);
+    }
+    let has_fts = table_exists(con, "session_search")?;
+    let has_delete_trigger = trigger_exists(con, "session_search_document_delete")?;
+    con.execute_batch("PRAGMA foreign_keys = ON;")?;
+    let tx = con.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let rows = delete_search_docs_where(
+        &tx,
+        has_fts,
+        has_delete_trigger,
+        &search_doc_orphan_where("session_search_document"),
+        &[],
+    )?;
+    tx.commit()?;
+    Ok(rows)
+}
+
+/// Per-table counts of session child rows whose `session_id` is missing
+/// from `session_v2`. Only tables with > 0 orphaned rows are returned.
+pub fn session_row_orphans(con: &Connection) -> Result<Vec<(String, i64)>> {
+    let mut out = Vec::new();
+    for (table, id_col) in [
+        ("session_message", "session_id"),
+        ("session_inbox", "session_id"),
+        ("instruction_entry", "session_id"),
+        ("instruction_state", "session_id"),
+        ("blob_ref", "session_id"),
+        // Legacy pre-automation table (kept optional for older 2.x DBs).
+        ("schedule", "session_id"),
+    ] {
+        if !table_exists(con, table)? {
+            continue;
+        }
+        let sql = format!(
+            "SELECT COUNT(*) FROM \"{table}\" t \
+             WHERE t.\"{id_col}\" IS NOT NULL AND t.\"{id_col}\" != '' \
+               AND NOT EXISTS (SELECT 1 FROM \"{SESSION_TABLE}\" s WHERE s.id = t.\"{id_col}\")"
+        );
+        let n: i64 = con.query_row(&sql, [], |r| r.get(0))?;
+        if n > 0 {
+            out.push((table.to_string(), n));
+        }
+    }
+    if table_exists(con, "session_part")? {
+        // session_part references both session_v2 and session_message.
+        let n: i64 = con.query_row(
+            &format!(
+                "SELECT COUNT(*) FROM session_part sp \
+                 WHERE (sp.session_id IS NOT NULL AND sp.session_id != '' \
+                        AND NOT EXISTS (SELECT 1 FROM \"{SESSION_TABLE}\" s WHERE s.id = sp.session_id)) \
+                    OR (sp.message_id IS NOT NULL AND sp.message_id != '' \
+                        AND NOT EXISTS (SELECT 1 FROM session_message m WHERE m.id = sp.message_id))"
+            ),
+            [],
+            |r| r.get(0),
+        )?;
+        if n > 0 {
+            out.push(("session_part".to_string(), n));
+        }
+    }
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(out)
 }
 
 /// Delete `event`/`event_sequence` rows whose aggregate is neither a
@@ -992,15 +1158,17 @@ pub fn delete_orphan_event_sequences(con: &mut Connection) -> Result<(usize, usi
     let tx = con.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     let events = tx.execute(
         &format!(
-            "DELETE FROM event WHERE aggregate_id NOT IN (SELECT id FROM \"{SESSION_TABLE}\") \
-             AND aggregate_id NOT IN (SELECT id FROM project)"
+            "DELETE FROM event WHERE \
+             NOT EXISTS (SELECT 1 FROM \"{SESSION_TABLE}\" s WHERE s.id = event.aggregate_id) \
+             AND NOT EXISTS (SELECT 1 FROM project p WHERE p.id = event.aggregate_id)"
         ),
         [],
     )?;
     let sequences = tx.execute(
         &format!(
-            "DELETE FROM event_sequence WHERE aggregate_id NOT IN (SELECT id FROM \"{SESSION_TABLE}\") \
-             AND aggregate_id NOT IN (SELECT id FROM project)"
+            "DELETE FROM event_sequence WHERE \
+             NOT EXISTS (SELECT 1 FROM \"{SESSION_TABLE}\" s WHERE s.id = event_sequence.aggregate_id) \
+             AND NOT EXISTS (SELECT 1 FROM project p WHERE p.id = event_sequence.aggregate_id)"
         ),
         [],
     )?;
@@ -1013,12 +1181,28 @@ pub fn delete_orphan_event_sequences(con: &mut Connection) -> Result<(usize, usi
 pub fn orphan_event_row_count(con: &Connection) -> Result<i64> {
     Ok(con.query_row(
         &format!(
-            "SELECT COUNT(*) FROM event WHERE aggregate_id NOT IN (SELECT id FROM \"{SESSION_TABLE}\") \
-             AND aggregate_id NOT IN (SELECT id FROM project)"
+            "SELECT COUNT(*) FROM event e WHERE \
+             NOT EXISTS (SELECT 1 FROM \"{SESSION_TABLE}\" s WHERE s.id = e.aggregate_id) \
+             AND NOT EXISTS (SELECT 1 FROM project p WHERE p.id = e.aggregate_id)"
         ),
         [],
         |r| r.get(0),
     )?)
+}
+
+/// Total number of `event_sequence` rows whose aggregate is neither a
+/// session nor a project.
+pub fn orphan_event_sequence_count(con: &Connection) -> Result<usize> {
+    let n: i64 = con.query_row(
+        &format!(
+            "SELECT COUNT(*) FROM event_sequence es WHERE \
+             NOT EXISTS (SELECT 1 FROM \"{SESSION_TABLE}\" s WHERE s.id = es.aggregate_id) \
+             AND NOT EXISTS (SELECT 1 FROM project p WHERE p.id = es.aggregate_id)"
+        ),
+        [],
+        |r| r.get(0),
+    )?;
+    Ok(n as usize)
 }
 
 /// Clear `parent_id` of sessions whose parent is missing (they become
@@ -1363,8 +1547,8 @@ pub fn project_impact(con: &Connection, project_id: &str) -> Result<Vec<(String,
         "session_inbox",
         "instruction_entry",
         "instruction_state",
-        "schedule",
         "blob_ref",
+        "session_search_document",
     ] {
         if table_exists(con, table)? {
             terms.push(format!(
@@ -1374,10 +1558,16 @@ pub fn project_impact(con: &Connection, project_id: &str) -> Result<Vec<(String,
             terms.push(format!("SELECT '{table}', 0"));
         }
     }
+    if table_exists(con, "schedule")? {
+        terms.push(format!(
+            "SELECT 'schedule', (SELECT COUNT(*) FROM \"schedule\" t JOIN \"{session}\" s ON t.session_id = s.id WHERE s.project_id = ?1)"
+        ));
+    }
     for (table, col) in [
         ("permission", "project_id"),
         ("project_directory", "project_id"),
         ("worktree", "project_id"),
+        ("automation", "project_id"),
     ] {
         if table_exists(con, table)? {
             terms.push(format!(
@@ -1390,7 +1580,9 @@ pub fn project_impact(con: &Connection, project_id: &str) -> Result<Vec<(String,
     for table in ["event", "event_sequence"] {
         if table_exists(con, table)? {
             terms.push(format!(
-                "SELECT '{table}', (SELECT COUNT(*) FROM \"{table}\" t WHERE t.aggregate_id IN (SELECT id FROM \"{session}\" WHERE project_id = ?1))"
+                "SELECT '{table}', (SELECT COUNT(*) FROM \"{table}\" t \
+                 WHERE t.aggregate_id = ?1 \
+                    OR t.aggregate_id IN (SELECT id FROM \"{session}\" WHERE project_id = ?1))"
             ));
         } else {
             terms.push(format!("SELECT '{table}', 0"));
@@ -1640,5 +1832,43 @@ mod tests {
         assert!(err.message.contains("multiple projects"), "got: {err}");
         let err = resolve_project(&con, "p").err().expect("ambiguous prefix");
         assert!(err.message.contains("ambiguous"), "got: {err}");
+    }
+
+    #[test]
+    fn automation_and_search_orphans_are_detected_and_deleted() {
+        let mut con = testdb::create();
+        testdb::insert_project(&con, "p1", "/a");
+        testdb::insert_project_session(&con, "s1", "/a", "p1", 0);
+        // Deleting s1 leaves automation pointing at deleted session_id,
+        // which opencode intentionally keeps as long as project_id exists.
+        con.execute(
+            "INSERT INTO automation (id, project_id, session_id, name) VALUES ('a_live', 'p1', 's_gone', 'keep')",
+            [],
+        )
+        .unwrap();
+        con.execute(
+            "INSERT INTO automation (id, project_id, session_id, name) VALUES ('a_orph', 'p_gone', NULL, 'drop')",
+            [],
+        )
+        .unwrap();
+        assert_eq!(automation_orphans(&con).unwrap(), vec!["a_orph"]);
+        assert_eq!(delete_orphan_automations(&mut con).unwrap(), 1);
+        assert!(automation_orphans(&con).unwrap().is_empty());
+
+        // Compact FTS5 layout (`content='', contentless_delete=1`).
+        con.execute_batch(
+            "CREATE TABLE session_search_document (id INTEGER PRIMARY KEY, source_id TEXT NOT NULL UNIQUE, session_id TEXT NOT NULL);
+             CREATE VIRTUAL TABLE session_search USING fts5(title, summary, user_text, assistant_text, content='', contentless_delete=1);
+             INSERT INTO session_search_document (id, source_id, session_id) VALUES (1, 's1', 's1'), (2, 's_gone', 's_gone');
+             INSERT INTO session_search (rowid, title, summary, user_text, assistant_text) VALUES (1, 'live', NULL, NULL, NULL), (2, 'dead', NULL, NULL, NULL);",
+        )
+        .unwrap();
+        assert_eq!(search_document_orphans(&con).unwrap(), vec!["s_gone"]);
+        assert_eq!(delete_orphan_search_documents(&mut con).unwrap(), 1);
+        assert!(search_document_orphans(&con).unwrap().is_empty());
+        let fts_rows: i64 = con
+            .query_row("SELECT COUNT(*) FROM session_search", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(fts_rows, 1);
     }
 }

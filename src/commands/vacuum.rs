@@ -1,7 +1,7 @@
 //! `vacuum` command: safe VACUUM with backup and journal mode handling.
 
 use crate::cli::{BackupDeleteArgs, BackupListArgs, BackupPruneArgs, BackupSort, VacuumArgs};
-use crate::db::{env_status, file_size, quick_check, EnvStatus};
+use crate::db::{db_dir, env_status, file_size, quick_check, sidecar_path, wal_path, EnvStatus};
 use crate::error::{AppError, Result};
 use crate::output;
 use crate::util::{file_mtime_ms, now_ms, parse_age_ms, parse_size_bytes, timestamp_utc};
@@ -286,7 +286,7 @@ pub fn cmd_vacuum(con: &Connection, db_path: &Path, opts: &VacuumOpts) -> Result
     });
     let mut result = VacuumResult {
         db_bytes: file_size(db_path),
-        wal_bytes: file_size(&db_path.with_extension("db-wal")),
+        wal_bytes: file_size(&wal_path(db_path)),
         free_pages: freelist,
         integrity,
         backup: backup_out,
@@ -369,17 +369,6 @@ fn is_backup_sidecar(name: &str) -> bool {
     name.ends_with("-wal") || name.ends_with("-shm") || name.ends_with("-journal")
 }
 
-/// Path of a sidecar file next to `path` (`<name>-wal`, ...).
-fn sidecar_path(path: &Path, suffix: &str) -> PathBuf {
-    let mut name = path
-        .file_name()
-        .unwrap_or_default()
-        .to_string_lossy()
-        .to_string();
-    name.push_str(suffix);
-    path.with_file_name(name)
-}
-
 /// One timestamped backup file.
 #[derive(Serialize)]
 pub struct BackupFileOut {
@@ -394,7 +383,7 @@ pub struct BackupFileOut {
 
 /// Timestamped backups of this database, newest first.
 pub fn list_backup_files(db_path: &Path, verify: bool) -> Result<Vec<BackupFileOut>> {
-    let dir = db_path.parent().unwrap_or(Path::new("."));
+    let dir = db_dir(db_path);
     let prefix = format!(
         "{}.backup-",
         db_path.file_name().unwrap_or_default().to_string_lossy()
@@ -493,7 +482,7 @@ pub fn resolve_backup_path(db_path: &Path, reference: &Path) -> PathBuf {
     if reference.is_absolute() || reference.components().count() > 1 {
         reference.to_path_buf()
     } else {
-        db_path.parent().unwrap_or(Path::new(".")).join(reference)
+        db_dir(db_path).join(reference)
     }
 }
 
@@ -519,7 +508,7 @@ struct BackupDeleteOut {
 /// Delete specific backup files. Only files matching this database's
 /// backup prefix in its directory are accepted.
 pub fn cmd_backup_delete(db_path: &Path, args: &BackupDeleteArgs, dry_run: bool) -> Result<()> {
-    let dir = db_path.parent().unwrap_or(Path::new("."));
+    let dir = db_dir(db_path);
     let prefix = format!(
         "{}.backup-",
         db_path.file_name().unwrap_or_default().to_string_lossy()
@@ -644,7 +633,7 @@ pub fn backup_prune_value(
         Some(age) => Some(now_ms()? - parse_age_ms(age)?),
         None => None,
     };
-    let dir = db_path.parent().unwrap_or(Path::new("."));
+    let dir = db_dir(db_path);
     let files = list_backup_files(db_path, false)?;
     let mut removed: Vec<PruneFile> = Vec::new();
     for (i, b) in files.iter().enumerate() {
@@ -813,7 +802,7 @@ pub fn cmd_restore(db_path: &Path, source: &Path, dry_run: bool) -> Result<()> {
 /// timestamp is zero-padded UTC, so lexicographic order is chronological).
 /// Best-effort: files that cannot be removed are skipped.
 fn prune_backups(db_path: &Path, keep: i64) -> Result<(usize, u64)> {
-    let dir = db_path.parent().unwrap_or(Path::new("."));
+    let dir = db_dir(db_path);
     let prefix = format!(
         "{}.backup-",
         db_path.file_name().unwrap_or_default().to_string_lossy()

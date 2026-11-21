@@ -1,6 +1,8 @@
 //! `doctor` command: integrity and consistency checks (V2-only).
 
-use crate::db::{env_status, file_size, quick_check, EnvStatus, SESSION_TABLE};
+use crate::db::{
+    db_dir, env_status, file_size, pragma_check, quick_check, wal_path, EnvStatus, SESSION_TABLE,
+};
 use crate::error::{AppError, Result};
 use crate::output;
 use rusqlite::Connection;
@@ -34,6 +36,12 @@ struct BlobOrphan {
     bytes: i64,
 }
 
+#[derive(Serialize)]
+struct TableOrphanCount {
+    table: String,
+    count: i64,
+}
+
 /// Backup presence/freshness (advisory; never affects `ok`).
 #[derive(Serialize)]
 struct BackupsCheck {
@@ -55,6 +63,9 @@ struct Orphans {
     orphan_instruction_blobs: Vec<BlobOrphan>,
     orphan_media_blobs: Vec<BlobOrphan>,
     orphaned_jobs: Vec<String>,
+    orphaned_automations: Vec<String>,
+    orphaned_search_documents: Vec<String>,
+    orphaned_session_rows: Vec<TableOrphanCount>,
 }
 
 #[derive(Serialize)]
@@ -81,6 +92,8 @@ struct FixReport {
     blobs_deleted: usize,
     media_blobs_deleted: usize,
     jobs_deleted: usize,
+    automations_deleted: usize,
+    search_documents_deleted: usize,
     event_rows_deleted: i64,
     event_sequences_deleted: usize,
     parents_cleared: usize,
@@ -107,8 +120,10 @@ pub fn cmd_doctor(
                 blobs_deleted: out.orphans.orphan_instruction_blobs.len(),
                 media_blobs_deleted: out.orphans.orphan_media_blobs.len(),
                 jobs_deleted: out.orphans.orphaned_jobs.len(),
+                automations_deleted: out.orphans.orphaned_automations.len(),
+                search_documents_deleted: out.orphans.orphaned_search_documents.len(),
                 event_rows_deleted: crate::repo::orphan_event_row_count(con)?,
-                event_sequences_deleted: out.orphans.orphaned_event_sequences.len(),
+                event_sequences_deleted: crate::repo::orphan_event_sequence_count(con)?,
                 parents_cleared: out.orphans.sessions_missing_parent.len(),
                 forks_cleared: out.orphans.sessions_dangling_fork.len(),
                 workspaces_cleared: out.orphans.sessions_missing_workspace.len(),
@@ -148,6 +163,8 @@ fn apply_fixes(con: &mut Connection) -> Result<FixReport> {
     );
     let (_blobs, _bytes) = crate::repo::delete_blob_orphans(con)?;
     let jobs = crate::repo::delete_orphan_jobs(con)?;
+    let automations = crate::repo::delete_orphan_automations(con)?;
+    let search_docs = crate::repo::delete_orphan_search_documents(con)?;
     let (event_rows, sequences) = crate::repo::delete_orphan_event_sequences(con)?;
     let parents = crate::repo::clear_missing_parents(con)?;
     let forks = crate::repo::clear_dangling_forks(con)?;
@@ -157,6 +174,8 @@ fn apply_fixes(con: &mut Connection) -> Result<FixReport> {
         blobs_deleted: kinds.0,
         media_blobs_deleted: kinds.1,
         jobs_deleted: jobs,
+        automations_deleted: automations,
+        search_documents_deleted: search_docs,
         event_rows_deleted: event_rows as i64,
         event_sequences_deleted: sequences,
         parents_cleared: parents,
@@ -178,9 +197,7 @@ fn doctor_out(
 ) -> Result<DoctorOut> {
     let env = env_status(db_path);
     let quick = quick_check(con);
-    let integrity: String = con
-        .query_row("PRAGMA integrity_check", [], |r| r.get(0))
-        .unwrap_or_else(|e| e.to_string());
+    let integrity = pragma_check(con, "integrity_check");
 
     let fk_violations: Vec<FkViolation> = {
         let mut stmt = con.prepare("PRAGMA foreign_key_check")?;
@@ -200,7 +217,7 @@ fn doctor_out(
         let sql = format!(
             "SELECT s.id, s.parent_id, COALESCE(s.title,'') FROM \"{SESSION_TABLE}\" s \
              WHERE s.parent_id IS NOT NULL AND s.parent_id != '' \
-               AND s.parent_id NOT IN (SELECT id FROM \"{SESSION_TABLE}\") ORDER BY s.id"
+               AND NOT EXISTS (SELECT 1 FROM \"{SESSION_TABLE}\" p WHERE p.id = s.parent_id) ORDER BY s.id"
         );
         let mut stmt = con.prepare(&sql)?;
         let rows = stmt.query_map([], |r| {
@@ -218,7 +235,7 @@ fn doctor_out(
         let sql = format!(
             "SELECT s.id, s.fork_session_id FROM \"{SESSION_TABLE}\" s \
              WHERE s.fork_session_id IS NOT NULL AND s.fork_session_id != '' \
-               AND s.fork_session_id NOT IN (SELECT id FROM \"{SESSION_TABLE}\") ORDER BY s.id"
+               AND NOT EXISTS (SELECT 1 FROM \"{SESSION_TABLE}\" f WHERE f.id = s.fork_session_id) ORDER BY s.id"
         );
         let mut stmt = con.prepare(&sql)?;
         let rows = stmt.query_map([], |r| {
@@ -234,7 +251,7 @@ fn doctor_out(
         let sql = format!(
             "SELECT s.id, s.workspace_id FROM \"{SESSION_TABLE}\" s \
              WHERE s.workspace_id IS NOT NULL AND s.workspace_id != '' \
-               AND s.workspace_id NOT IN (SELECT id FROM workspace) ORDER BY s.id"
+               AND NOT EXISTS (SELECT 1 FROM workspace w WHERE w.id = s.workspace_id) ORDER BY s.id"
         );
         let mut stmt = con.prepare(&sql)?;
         let rows = stmt.query_map([], |r| {
@@ -248,36 +265,20 @@ fn doctor_out(
     // Event aggregates are sessions or projects; anything else is orphaned.
     let orphaned_event_sequences: Vec<String> = {
         let sql = format!(
-            "SELECT DISTINCT aggregate_id FROM event_sequence \
-             WHERE aggregate_id NOT IN (SELECT id FROM \"{SESSION_TABLE}\") \
-               AND aggregate_id NOT IN (SELECT id FROM project) ORDER BY 1 LIMIT 1000"
+            "SELECT DISTINCT es.aggregate_id FROM event_sequence es \
+             WHERE NOT EXISTS (SELECT 1 FROM \"{SESSION_TABLE}\" s WHERE s.id = es.aggregate_id) \
+               AND NOT EXISTS (SELECT 1 FROM project p WHERE p.id = es.aggregate_id) ORDER BY 1 LIMIT 1000"
         );
         let mut stmt = con.prepare(&sql)?;
         let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
         rows.collect::<std::result::Result<Vec<_>, _>>()?
     };
     // V2 content rows whose session is gone. FK covers them, but explicit
-    // counts help when FKs were off. Newer tables are only checked when
-    // the database has them.
-    let mut v2_orphans: i64 = 0;
-    for (table, id_col) in [
-        ("session_message", "session_id"),
-        ("session_part", "session_id"),
-        ("session_inbox", "session_id"),
-        ("instruction_entry", "session_id"),
-        ("instruction_state", "session_id"),
-        ("schedule", "session_id"),
-        ("blob_ref", "session_id"),
-    ] {
-        if !crate::db::table_exists(con, table)? {
-            continue;
-        }
-        let sql = format!(
-            "SELECT COUNT(*) FROM \"{table}\" t WHERE t.\"{id_col}\" NOT IN (SELECT id FROM \"{SESSION_TABLE}\")"
-        );
-        let n: i64 = con.query_row(&sql, [], |r| r.get(0))?;
-        v2_orphans += n;
-    }
+    // counts surface rows left behind when FKs were off (or in unlinked tables).
+    let orphaned_session_rows: Vec<TableOrphanCount> = crate::repo::session_row_orphans(con)?
+        .into_iter()
+        .map(|(table, count)| TableOrphanCount { table, count })
+        .collect();
     let (instruction_blobs, media_blobs): (Vec<BlobOrphan>, Vec<BlobOrphan>) =
         crate::repo::blob_orphans(con)?.into_iter().fold(
             (Vec::new(), Vec::new()),
@@ -295,6 +296,8 @@ fn doctor_out(
             },
         );
     let orphaned_jobs = crate::repo::job_orphans(con)?;
+    let orphaned_automations = crate::repo::automation_orphans(con)?;
+    let orphaned_search_documents = crate::repo::search_document_orphans(con)?;
     let orphans = Orphans {
         sessions_missing_parent,
         sessions_dangling_fork,
@@ -303,6 +306,9 @@ fn doctor_out(
         orphan_instruction_blobs: instruction_blobs,
         orphan_media_blobs: media_blobs,
         orphaned_jobs,
+        orphaned_automations,
+        orphaned_search_documents,
+        orphaned_session_rows,
     };
 
     let ok = quick == "ok"
@@ -315,7 +321,9 @@ fn doctor_out(
         && orphans.orphan_instruction_blobs.is_empty()
         && orphans.orphan_media_blobs.is_empty()
         && orphans.orphaned_jobs.is_empty()
-        && v2_orphans == 0;
+        && orphans.orphaned_automations.is_empty()
+        && orphans.orphaned_search_documents.is_empty()
+        && orphans.orphaned_session_rows.is_empty();
 
     // Advisory backup freshness: a warning never changes `ok`.
     let backups = crate::commands::vacuum::list_backup_files(db_path, false)?;
@@ -323,7 +331,7 @@ fn doctor_out(
     let warning = max_backup_age_ms.and_then(|cutoff| match newest {
         None => Some("no backups found (run `opencode-dbtool backup --yes`)".to_string()),
         Some(b) => {
-            let mtime = crate::util::file_mtime_ms(&db_path.with_file_name(&b.file)).unwrap_or(0);
+            let mtime = crate::util::file_mtime_ms(&db_dir(db_path).join(&b.file)).unwrap_or(0);
             (mtime < cutoff).then(|| {
                 format!(
                     "newest backup {} is older than the configured age (run `opencode-dbtool backup --yes`)",
@@ -338,12 +346,12 @@ fn doctor_out(
         newest_created: newest.map(|b| b.created.clone()),
         warning,
     };
-    let free_bytes = fs2::available_space(db_path.parent().unwrap_or(Path::new("."))).unwrap_or(0);
+    let free_bytes = fs2::available_space(db_dir(db_path)).unwrap_or(0);
 
     Ok(DoctorOut {
         env,
         db_bytes: file_size(db_path),
-        wal_bytes: file_size(&db_path.with_extension("db-wal")),
+        wal_bytes: file_size(&wal_path(db_path)),
         quick_check: quick,
         integrity_check: integrity,
         foreign_key_violations: fk_violations,
@@ -359,19 +367,40 @@ fn doctor_out(
 mod tests {
     use super::*;
     use crate::testdb;
+    use std::path::PathBuf;
+
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new(stem: &str) -> Self {
+            TempDir(testdb::temp_data_dir(stem))
+        }
+
+        fn db(&self) -> PathBuf {
+            self.0.join("x.db")
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
 
     #[test]
     fn healthy_db_reports_ok() {
+        let dir = TempDir::new("doctor-healthy");
         let mut con = testdb::create();
         testdb::insert_session(&con, "s1", "/a", None);
-        cmd_doctor(&mut con, Path::new("/tmp/x.db"), false, None, false).unwrap();
+        cmd_doctor(&mut con, &dir.db(), false, None, false).unwrap();
     }
 
     #[test]
     fn doctor_output_contract() {
+        let dir = TempDir::new("doctor-contract");
         let con = testdb::create();
         testdb::insert_session(&con, "s1", "/a", None);
-        let mut out = doctor_out(&con, Path::new("/tmp/x.db"), None).unwrap();
+        let mut out = doctor_out(&con, &dir.db(), None).unwrap();
         out.env = crate::db::EnvStatus {
             opencode_running: Some(false),
             pids: Some(vec![]),
@@ -397,7 +426,10 @@ mod tests {
                 "orphaned_event_sequences": [],
                 "orphan_instruction_blobs": [],
                 "orphan_media_blobs": [],
-                "orphaned_jobs": []
+                "orphaned_jobs": [],
+                "orphaned_automations": [],
+                "orphaned_search_documents": [],
+                "orphaned_session_rows": []
             },
             "free_bytes": 0,
             "backups": { "count": 0 },
@@ -408,6 +440,7 @@ mod tests {
 
     #[test]
     fn project_aggregate_is_not_orphaned() {
+        let dir = TempDir::new("doctor-project-agg");
         let mut con = testdb::create();
         con.execute(
             "INSERT INTO project (id, worktree, name) VALUES ('p1','/a','p1')",
@@ -419,11 +452,12 @@ mod tests {
             [],
         )
         .unwrap();
-        cmd_doctor(&mut con, Path::new("/tmp/x.db"), false, None, false).unwrap();
+        cmd_doctor(&mut con, &dir.db(), false, None, false).unwrap();
     }
 
     #[test]
     fn dangling_fork_and_workspace_are_detected() {
+        let dir = TempDir::new("doctor-dangling");
         let mut con = testdb::create();
         con.execute(
             "INSERT INTO session_v2 (id, directory, title, fork_session_id, workspace_id, time_updated, cost) \
@@ -431,22 +465,32 @@ mod tests {
             [],
         )
         .unwrap();
-        assert!(cmd_doctor(&mut con, Path::new("/tmp/x.db"), false, None, false).is_err());
+        let err = cmd_doctor(&mut con, &dir.db(), false, None, false).unwrap_err();
+        assert!(
+            err.message.contains("integrity problems found"),
+            "got: {err}"
+        );
     }
 
     #[test]
     fn orphan_blobs_fail_doctor_until_cleaned() {
+        let dir = TempDir::new("doctor-blobs");
         let mut con = testdb::create();
         con.execute(
             "INSERT INTO instruction_blob (hash, value) VALUES ('zzz', 'orphan')",
             [],
         )
         .unwrap();
-        assert!(cmd_doctor(&mut con, Path::new("/tmp/x.db"), false, None, false).is_err());
+        let err = cmd_doctor(&mut con, &dir.db(), false, None, false).unwrap_err();
+        assert!(
+            err.message.contains("integrity problems found"),
+            "got: {err}"
+        );
     }
 
     #[test]
     fn fix_repairs_orphans_and_dangling_references() {
+        let dir = TempDir::new("doctor-fix-unit");
         let mut con = testdb::create();
         con.execute(
             "INSERT INTO instruction_blob (hash, value) VALUES ('zzz', 'orphan')",
@@ -471,13 +515,17 @@ mod tests {
         .unwrap();
 
         // Dry-run reports the plan but changes nothing.
-        assert!(cmd_doctor(&mut con, Path::new("/tmp/x.db"), true, None, true).is_err());
+        let err = cmd_doctor(&mut con, &dir.db(), true, None, true).unwrap_err();
+        assert!(
+            err.message.contains("integrity problems found"),
+            "got: {err}"
+        );
         let blobs: i64 = con
             .query_row("SELECT COUNT(*) FROM instruction_blob", [], |r| r.get(0))
             .unwrap();
         assert_eq!(blobs, 1, "dry-run keeps the blob");
 
-        cmd_doctor(&mut con, Path::new("/tmp/x.db"), true, None, false).unwrap();
+        cmd_doctor(&mut con, &dir.db(), true, None, false).unwrap();
         let blobs: i64 = con
             .query_row("SELECT COUNT(*) FROM instruction_blob", [], |r| r.get(0))
             .unwrap();
@@ -500,7 +548,7 @@ mod tests {
         assert_eq!(parent, None);
 
         // Now healthy without any fixes.
-        cmd_doctor(&mut con, Path::new("/tmp/x.db"), false, None, false).unwrap();
+        cmd_doctor(&mut con, &dir.db(), false, None, false).unwrap();
     }
 
     #[test]
@@ -524,5 +572,131 @@ mod tests {
 
         drop(con);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn automation_and_fts_layouts_work_with_doctor_and_fix() {
+        let dir = TempDir::new("doctor-latest-opencode");
+        let mut con = testdb::create();
+        testdb::insert_project(&con, "p1", "/a");
+        testdb::insert_project_session(&con, "s1", "/a", "p1", 0);
+        testdb::insert_session_message(&con, "m1", "s1", "user", r#"{"text":"hi"}"#);
+        con.execute(
+            "INSERT INTO machine (id, key, time_created) VALUES ('mc1', 'key1', 0)",
+            [],
+        )
+        .unwrap();
+        con.execute(
+            "INSERT INTO account (id, email, url) VALUES ('acc1', 'a@example.com', 'https://opencode.ai')",
+            [],
+        )
+        .unwrap();
+        con.execute(
+            "INSERT INTO account_state (id, active_account_id) VALUES (1, 'acc1')",
+            [],
+        )
+        .unwrap();
+        // Automation whose creating session was deleted is still healthy if project_id exists.
+        con.execute(
+            "INSERT INTO automation (id, project_id, session_id, name) VALUES ('a_keep', 'p1', 's_deleted', 'keep')",
+            [],
+        )
+        .unwrap();
+        // Compact FTS5 search index for live session + orphaned automation/doc.
+        con.execute_batch(
+            "CREATE TABLE session_search_document (id INTEGER PRIMARY KEY, source_id TEXT NOT NULL UNIQUE, session_id TEXT NOT NULL);
+             CREATE VIRTUAL TABLE session_search USING fts5(title, summary, user_text, assistant_text, content='', contentless_delete=1);
+             INSERT INTO session_search_document (id, source_id, session_id) VALUES (1, 's1', 's1'), (2, 'm1', 's1');
+             INSERT INTO session_search (rowid, title, summary, user_text, assistant_text) VALUES (1, 's1', NULL, NULL, NULL), (2, NULL, NULL, 'hi', NULL);",
+        )
+        .unwrap();
+
+        let out = doctor_out(&con, &dir.db(), None).unwrap();
+        assert!(
+            out.ok,
+            "automation with deleted session_id and live FTS5 index must stay healthy"
+        );
+
+        // Now introduce orphaned automation (missing project_id) and orphaned search doc.
+        con.execute(
+            "INSERT INTO automation (id, project_id, session_id, name) VALUES ('a_orph', 'p_missing', NULL, 'drop')",
+            [],
+        )
+        .unwrap();
+        con.execute(
+            "INSERT INTO session_search_document (id, source_id, session_id) VALUES (3, 's_gone', 's_gone')",
+            [],
+        )
+        .unwrap();
+        con.execute(
+            "INSERT INTO session_search (rowid, title, summary, user_text, assistant_text) VALUES (3, 'dead', NULL, NULL, NULL)",
+            [],
+        )
+        .unwrap();
+
+        let out = doctor_out(&con, &dir.db(), None).unwrap();
+        assert!(!out.ok);
+        assert_eq!(out.orphans.orphaned_automations, vec!["a_orph"]);
+        assert_eq!(out.orphans.orphaned_search_documents, vec!["s_gone"]);
+
+        cmd_doctor(&mut con, &dir.db(), true, None, false).unwrap();
+        let after = doctor_out(&con, &dir.db(), None).unwrap();
+        assert!(after.ok);
+        assert!(after.orphans.orphaned_automations.is_empty());
+        assert!(after.orphans.orphaned_search_documents.is_empty());
+
+        // External-content (`text`) FTS5 layout cleanup also triggers cleanly.
+        let mut text_con = testdb::create();
+        testdb::insert_session(&text_con, "s1", "/a", None);
+        text_con
+            .execute_batch(
+                "CREATE TABLE session_search_document (id INTEGER PRIMARY KEY, source_id TEXT NOT NULL UNIQUE, session_id TEXT NOT NULL, title TEXT, summary TEXT, user_text TEXT, assistant_text TEXT);
+                 CREATE VIRTUAL TABLE session_search USING fts5(title, summary, user_text, assistant_text, content='session_search_document', content_rowid='id');
+                 CREATE TRIGGER session_search_document_insert AFTER INSERT ON session_search_document BEGIN INSERT INTO session_search (rowid, title, summary, user_text, assistant_text) VALUES (NEW.id, NEW.title, NEW.summary, NEW.user_text, NEW.assistant_text); END;
+                 CREATE TRIGGER session_search_document_delete AFTER DELETE ON session_search_document BEGIN INSERT INTO session_search (session_search, rowid, title, summary, user_text, assistant_text) VALUES ('delete', OLD.id, OLD.title, OLD.summary, OLD.user_text, OLD.assistant_text); END;
+                 INSERT INTO session_search_document (id, source_id, session_id, title) VALUES (1, 's1', 's1', 'live'), (2, 'm_gone', 's_gone', 'dead');",
+            )
+            .unwrap();
+        cmd_doctor(&mut text_con, &dir.db(), true, None, false).unwrap();
+        let fts_count: i64 = text_con
+            .query_row("SELECT COUNT(*) FROM session_search", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(fts_count, 1);
+    }
+
+    #[test]
+    fn orphaned_session_rows_are_explicitly_reported() {
+        let dir = TempDir::new("doctor-session-rows");
+        let con = testdb::create();
+        testdb::insert_session(&con, "ses_live", "/a", None);
+        con.execute_batch(
+            "PRAGMA foreign_keys = OFF;
+             INSERT INTO session_message (id, session_id, type, data) VALUES ('m_orph', 'ses_gone', 'user', '{}');
+             INSERT INTO session_part (message_id, session_id, ordinal, type, data) VALUES ('m_missing', 'ses_live', 0, 'text', '{}');
+             PRAGMA foreign_keys = ON;",
+        )
+        .unwrap();
+        let out = doctor_out(&con, &dir.db(), None).unwrap();
+        assert!(!out.ok);
+        assert_eq!(out.orphans.orphaned_session_rows.len(), 2);
+        assert_eq!(
+            out.orphans.orphaned_session_rows[0].table,
+            "session_message"
+        );
+        assert_eq!(out.orphans.orphaned_session_rows[0].count, 1);
+        assert_eq!(out.orphans.orphaned_session_rows[1].table, "session_part");
+        assert_eq!(out.orphans.orphaned_session_rows[1].count, 1);
+    }
+
+    #[test]
+    fn custom_extension_wal_and_relative_db_dir_are_measured() {
+        let dir = TempDir::new("doctor-wal-path");
+        let db_path = dir.0.join("custom.sqlite");
+        let con = testdb::create_at(&db_path);
+        std::fs::write(dir.0.join("custom.sqlite-wal"), vec![0u8; 128]).unwrap();
+
+        let out = doctor_out(&con, &db_path, None).unwrap();
+        assert_eq!(out.wal_bytes, 128);
+        assert!(out.free_bytes > 0);
     }
 }

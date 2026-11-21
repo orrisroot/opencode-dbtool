@@ -150,7 +150,7 @@ pub fn report_value(
 
     let freelist: i64 = con.query_row("PRAGMA freelist_count", [], |r| r.get(0))?;
     let page_size: i64 = con.query_row("PRAGMA page_size", [], |r| r.get(0))?;
-    let wal_bytes = file_size(&db_path.with_extension("db-wal"));
+    let wal_bytes = file_size(&crate::db::wal_path(db_path));
     let reclaimable = freelist * page_size;
 
     // Old sessions (default 90 days), limited to the scope.

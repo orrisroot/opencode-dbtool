@@ -1,7 +1,7 @@
 //! `stats` command: table sizes and totals (V2-only), plus message/part
 //! type breakdowns. `--detail` adds creation activity and subagent shares.
 
-use crate::db::{env_status, file_size, EnvStatus};
+use crate::db::{env_status, file_size, wal_path, EnvStatus};
 use crate::error::Result;
 use crate::output;
 use crate::util::{
@@ -107,7 +107,13 @@ fn stats_out(con: &Connection, data_dir: &Path, db_path: &Path, detail: bool) ->
                 [],
                 |r| r.get(0),
             )?;
-            let bytes = content_bytes(con, &name)?;
+            // FTS5 `session_search` either stores nothing (`compact`) or mirrors
+            // `session_search_document` (`text`), so exclude it to avoid double counting.
+            let bytes = if name == "session_search" {
+                0
+            } else {
+                content_bytes(con, &name)?
+            };
             total += bytes;
             tables.insert(name.clone(), serde_json::json!(rows));
             table_sizes.push((name, bytes));
@@ -122,7 +128,7 @@ fn stats_out(con: &Connection, data_dir: &Path, db_path: &Path, detail: bool) ->
     Ok(StatsOut {
         env,
         db_bytes: file_size(db_path),
-        wal_bytes: file_size(&db_path.with_extension("db-wal")),
+        wal_bytes: file_size(&wal_path(db_path)),
         free_pages: freelist,
         reclaimable_bytes: freelist * page_size,
         tables,
@@ -159,23 +165,32 @@ fn content_columns(con: &Connection, table: &str) -> Result<Vec<String>> {
         "commands",
         "binding",
         "extra",
-        // job / schedule fields (newer builds)
+        // job / automation fields (newer builds)
         "output",
         "error",
         "recovery",
+        "trigger",
         "action",
         "state",
+        "last_output",
         "last_outcome",
+        "event_position",
     ];
+    const SEARCH_DOC_CANDIDATES: &[&str] = &["title", "summary", "user_text", "assistant_text"];
+    let extra: &[&str] = if table == "session_search_document" {
+        SEARCH_DOC_CANDIDATES
+    } else {
+        &[]
+    };
     let mut out = Vec::new();
-    for c in CANDIDATES {
+    for c in CANDIDATES.iter().chain(extra.iter()) {
         let n: i64 = con.query_row(
             "SELECT COUNT(*) FROM pragma_table_info(?1) WHERE name=?2",
             params![table, c],
             |r| r.get(0),
         )?;
         if n > 0 {
-            out.push(c.to_string());
+            out.push((*c).to_string());
         }
     }
     Ok(out)
@@ -442,5 +457,29 @@ mod tests {
         assert_eq!(days.len(), 2);
         assert_eq!(out["subagent"]["sessions"], 1);
         assert_eq!(out["subagent"]["total_sessions"], 3);
+    }
+
+    #[test]
+    fn stats_does_not_double_count_fts_text_layout() {
+        let con = testdb::create();
+        testdb::insert_session(&con, "s1", "/a", None);
+        con.execute_batch(
+            "CREATE TABLE session_search_document (id INTEGER PRIMARY KEY, source_id TEXT NOT NULL UNIQUE, session_id TEXT NOT NULL, title TEXT, summary TEXT, user_text TEXT, assistant_text TEXT);
+             CREATE VIRTUAL TABLE session_search USING fts5(title, summary, user_text, assistant_text, content='session_search_document', content_rowid='id');
+             CREATE TRIGGER session_search_document_insert AFTER INSERT ON session_search_document BEGIN INSERT INTO session_search (rowid, title, summary, user_text, assistant_text) VALUES (NEW.id, NEW.title, NEW.summary, NEW.user_text, NEW.assistant_text); END;
+             INSERT INTO session_search_document (id, source_id, session_id, title) VALUES (1, 's1', 's1', 'hello');",
+        )
+        .unwrap();
+
+        let out = stats_value(
+            &con,
+            std::path::Path::new("/tmp"),
+            std::path::Path::new("/tmp/x.db"),
+            false,
+        )
+        .unwrap();
+        assert_eq!(out["table_bytes"]["session_search_document"], 5);
+        assert_eq!(out["table_bytes"]["session_search"], 0);
+        assert_eq!(out["total_data_bytes"], 5);
     }
 }

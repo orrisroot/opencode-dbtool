@@ -40,7 +40,12 @@ fn create_db(db_path: &Path) {
          CREATE TABLE permission (project_id TEXT);
          CREATE TABLE project_directory (project_id TEXT, directory TEXT);
          CREATE TABLE worktree (project_id TEXT, directory TEXT);
-         CREATE TABLE schedule (id TEXT PRIMARY KEY, session_id TEXT, type TEXT, data TEXT);
+         CREATE TABLE automation (id TEXT PRIMARY KEY, project_id TEXT NOT NULL, session_id TEXT, directory TEXT NOT NULL DEFAULT '/work/a', name TEXT NOT NULL DEFAULT 'auto', trigger TEXT NOT NULL DEFAULT '{}', tz TEXT NOT NULL DEFAULT 'UTC', action TEXT NOT NULL DEFAULT '{}', status TEXT NOT NULL DEFAULT 'active', next_due_at INTEGER, expires_at INTEGER, run_count INTEGER NOT NULL DEFAULT 0, failures INTEGER NOT NULL DEFAULT 0, last_run_at INTEGER, last_message_id TEXT, last_outcome TEXT, last_output TEXT, retry_at INTEGER, state TEXT, event_position TEXT, time_created INTEGER NOT NULL DEFAULT 0, time_updated INTEGER NOT NULL DEFAULT 0);
+         CREATE TABLE machine (id TEXT PRIMARY KEY, key TEXT, time_created INTEGER NOT NULL DEFAULT 0);
+         CREATE TABLE account (id TEXT PRIMARY KEY, email TEXT NOT NULL, url TEXT NOT NULL, access_token TEXT NOT NULL DEFAULT '', refresh_token TEXT NOT NULL DEFAULT '', token_expiry INTEGER, time_created INTEGER NOT NULL DEFAULT 0, time_updated INTEGER NOT NULL DEFAULT 0);
+         CREATE TABLE account_state (id INTEGER PRIMARY KEY, active_account_id TEXT, active_org_id TEXT);
+         CREATE TABLE control_account (email TEXT NOT NULL, url TEXT NOT NULL, access_token TEXT NOT NULL DEFAULT '', refresh_token TEXT NOT NULL DEFAULT '', token_expiry INTEGER, active INTEGER NOT NULL DEFAULT 1, time_created INTEGER NOT NULL DEFAULT 0, time_updated INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (email, url));
+         CREATE TABLE credential (id TEXT PRIMARY KEY, integration_id TEXT, label TEXT NOT NULL, value TEXT NOT NULL, connector_id TEXT, method_id TEXT, active INTEGER, time_created INTEGER NOT NULL DEFAULT 0, time_updated INTEGER NOT NULL DEFAULT 0);
          CREATE TABLE job (notification_id TEXT PRIMARY KEY, id TEXT, session_id TEXT NOT NULL, child_session_id TEXT, kind TEXT, title TEXT, status TEXT, output TEXT, error TEXT, recovery TEXT NOT NULL DEFAULT '{}', time_created INTEGER NOT NULL DEFAULT 0, time_updated INTEGER NOT NULL DEFAULT 0);
          CREATE TABLE kv (key TEXT PRIMARY KEY, value TEXT NOT NULL, time_created INTEGER NOT NULL DEFAULT 0, time_updated INTEGER NOT NULL DEFAULT 0);
          CREATE TABLE workspace (id TEXT PRIMARY KEY, provider TEXT NOT NULL);",
@@ -2924,6 +2929,61 @@ fn color_flag_forces_or_disables_ansi_codes() {
     );
     assert!(out.status.success());
     assert!(!String::from_utf8_lossy(&out.stdout).contains("\u{1b}["));
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn doctor_reports_and_repairs_automations_search_docs_and_session_rows() {
+    let dir = temp_dir("doctor-latest");
+    let db = dir.join("opencode.db");
+    create_db(&db);
+    {
+        let con = Connection::open(&db).unwrap();
+        // Automation created by a deleted session stays valid because project p1 exists.
+        con.execute(
+            "INSERT INTO automation (id, project_id, session_id, name) VALUES ('a_keep', 'p1', 'ses_deleted', 'keep')",
+            [],
+        )
+        .unwrap();
+        // Automation whose project is gone is orphaned.
+        con.execute(
+            "INSERT INTO automation (id, project_id, session_id, name) VALUES ('a_orph', 'p_missing', NULL, 'drop')",
+            [],
+        )
+        .unwrap();
+        // FTS5 search index in compact layout + orphaned document + orphaned session_message row.
+        con.execute_batch(
+            "CREATE TABLE session_search_document (id INTEGER PRIMARY KEY, source_id TEXT NOT NULL UNIQUE, session_id TEXT NOT NULL);
+             CREATE VIRTUAL TABLE session_search USING fts5(title, summary, user_text, assistant_text, content='', contentless_delete=1);
+             INSERT INTO session_search_document (id, source_id, session_id) VALUES (1, 'ses_1', 'ses_1'), (2, 'ses_gone', 'ses_gone');
+             INSERT INTO session_search (rowid, title, summary, user_text, assistant_text) VALUES (1, 'hello', NULL, NULL, NULL), (2, 'dead', NULL, NULL, NULL);
+             INSERT INTO session_message (id, session_id, type, data) VALUES ('m_orph', 'ses_gone', 'user', '{}');",
+        )
+        .unwrap();
+    }
+
+    let out = run(&["doctor"], &dir);
+    assert_eq!(out.status.code(), Some(3));
+    let v = stdout_json(&out);
+    assert_eq!(
+        v["orphans"]["orphaned_automations"],
+        serde_json::json!(["a_orph"])
+    );
+    assert_eq!(
+        v["orphans"]["orphaned_search_documents"],
+        serde_json::json!(["ses_gone"])
+    );
+    assert_eq!(
+        v["orphans"]["orphaned_session_rows"],
+        serde_json::json!([{ "table": "session_message", "count": 1 }])
+    );
+
+    let out = run(&["doctor", "--fix", "--dry-run"], &dir);
+    assert_eq!(out.status.code(), Some(3));
+    let v = stdout_json(&out);
+    assert_eq!(v["fix"]["automations_deleted"], 1);
+    assert_eq!(v["fix"]["search_documents_deleted"], 1);
 
     std::fs::remove_dir_all(&dir).unwrap();
 }

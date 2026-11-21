@@ -271,11 +271,20 @@ fn delete_output(
     let project_ids: Vec<&str> = projects.iter().map(|p| p.id.as_str()).collect();
     con.execute_batch("PRAGMA foreign_keys = ON;")?;
     let has_jobs = crate::db::table_exists(con, "job")?;
+    let has_automations = crate::db::table_exists(con, "automation")?;
+    let has_search_docs = crate::db::table_exists(con, "session_search_document")?;
+    let has_fts = has_search_docs && crate::db::table_exists(con, "session_search")?;
+    let has_doc_delete_trigger =
+        has_search_docs && crate::db::trigger_exists(con, "session_search_document_delete")?;
+    let has_cascade_search_triggers = has_search_docs
+        && crate::db::trigger_exists(con, "session_search_session_delete")?
+        && crate::db::trigger_exists(con, "session_search_message_delete")?;
     let tx = con.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-    // event tables reference aggregates, not projects, so they must be
-    // deleted explicitly; job has no foreign keys either. Sessions and
-    // their rows follow via ON DELETE CASCADE on the project row. Media
-    // blobs are left for `fs clean-blob-orphans` (also run by `cleanup`).
+    // event tables reference session or project aggregates (e.g.
+    // Worktree.Event.Resolved), so delete both explicitly; job and
+    // automation carry no foreign keys either. Sessions and their rows
+    // follow via ON DELETE CASCADE on the project row. Media blobs are
+    // left for `fs clean-blob-orphans` (also run by `cleanup`).
     if has_jobs {
         tx.execute(
             &format!(
@@ -285,12 +294,36 @@ fn delete_output(
             rusqlite::params_from_iter(&project_ids),
         )?;
     }
+    if has_automations {
+        tx.execute(
+            &format!("DELETE FROM automation WHERE project_id IN ({plist})"),
+            rusqlite::params_from_iter(&project_ids),
+        )?;
+    }
+    // Clean search documents explicitly only when FTS cascade triggers are absent.
+    if has_search_docs && !has_cascade_search_triggers {
+        crate::repo::delete_search_documents_where(
+            &tx,
+            has_fts,
+            has_doc_delete_trigger,
+            &format!(
+                "session_id IN (SELECT id FROM \"{SESSION_TABLE}\" WHERE project_id IN ({plist}))"
+            ),
+            &project_ids,
+        )?;
+    }
     tx.execute(
-        &format!("DELETE FROM event WHERE aggregate_id IN (SELECT id FROM \"{SESSION_TABLE}\" WHERE project_id IN ({plist}))"),
+        &format!(
+            "DELETE FROM event WHERE aggregate_id IN ({plist}) \
+             OR aggregate_id IN (SELECT id FROM \"{SESSION_TABLE}\" WHERE project_id IN ({plist}))"
+        ),
         rusqlite::params_from_iter(&project_ids),
     )?;
     tx.execute(
-        &format!("DELETE FROM event_sequence WHERE aggregate_id IN (SELECT id FROM \"{SESSION_TABLE}\" WHERE project_id IN ({plist}))"),
+        &format!(
+            "DELETE FROM event_sequence WHERE aggregate_id IN ({plist}) \
+             OR aggregate_id IN (SELECT id FROM \"{SESSION_TABLE}\" WHERE project_id IN ({plist}))"
+        ),
         rusqlite::params_from_iter(&project_ids),
     )?;
     tx.execute(
@@ -311,7 +344,25 @@ fn delete_output(
         rusqlite::params_from_iter(&project_ids),
         |r| r.get(0),
     )?;
-    if remaining_projects > 0 || remaining_sessions > 0 {
+    let remaining_automations: i64 = if has_automations {
+        con.query_row(
+            &format!("SELECT COUNT(*) FROM automation WHERE project_id IN ({plist})"),
+            rusqlite::params_from_iter(&project_ids),
+            |r| r.get(0),
+        )?
+    } else {
+        0
+    };
+    let remaining_events: i64 = con.query_row(
+        &format!("SELECT COUNT(*) FROM event_sequence WHERE aggregate_id IN ({plist})"),
+        rusqlite::params_from_iter(&project_ids),
+        |r| r.get(0),
+    )?;
+    if remaining_projects > 0
+        || remaining_sessions > 0
+        || remaining_automations > 0
+        || remaining_events > 0
+    {
         return Err(AppError::usage(
             "some project data still exists after delete",
         ));
@@ -538,5 +589,54 @@ mod tests {
         args.limit = Some(0);
         let value = project_list_value(&con, &args).unwrap();
         assert_eq!(value.as_array().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn delete_removes_project_automations_and_project_events() {
+        let mut con = testdb::create();
+        testdb::insert_project(&con, "p1", "/a");
+        testdb::insert_project_session(&con, "s1", "/a", "p1", 0);
+        con.execute(
+            "INSERT INTO automation (id, project_id, session_id, name) VALUES ('a1', 'p1', 's1', 'auto')",
+            [],
+        )
+        .unwrap();
+        con.execute(
+            "INSERT INTO event_sequence (aggregate_id, seq) VALUES ('p1', 1)",
+            [],
+        )
+        .unwrap();
+        con.execute(
+            "INSERT INTO event (aggregate_id, type, data) VALUES ('p1', 'worktree.resolved', '{}')",
+            [],
+        )
+        .unwrap();
+
+        cmd_project_delete(&mut con, &["p1".to_string()], false, Path::new("/tmp/x.db")).unwrap();
+
+        assert_eq!(
+            con.query_row("SELECT COUNT(*) FROM automation", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            con.query_row(
+                "SELECT COUNT(*) FROM event_sequence WHERE aggregate_id = 'p1'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            con.query_row(
+                "SELECT COUNT(*) FROM event WHERE aggregate_id = 'p1'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
+        );
     }
 }
