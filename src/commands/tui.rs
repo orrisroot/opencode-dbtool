@@ -22,6 +22,7 @@ use crossterm::{
 };
 use serde_json::Value;
 use std::cell::Cell;
+use std::collections::HashMap;
 use std::fs;
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
@@ -51,7 +52,7 @@ enum InputKind {
     Count,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct InputSpec {
     prompt: &'static str,
     default: &'static str,
@@ -59,16 +60,32 @@ struct InputSpec {
     kind: InputKind,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DeleteKind {
+    Session,
+    Project,
+    Kv,
+    BackupDelete,
+    BackupPrune,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OutputKind {
+    Text,
+    DeleteReport(DeleteKind),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Action {
     label: &'static str,
     description: &'static str,
     args: &'static [&'static str],
     input: Option<InputSpec>,
     safety: Safety,
+    output: OutputKind,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CategoryKind {
     Actions(&'static [Action]),
     Sessions,
@@ -123,6 +140,24 @@ const fn action(
         args,
         input,
         safety,
+        output: OutputKind::Text,
+    }
+}
+
+const fn delete_action(
+    label: &'static str,
+    description: &'static str,
+    args: &'static [&'static str],
+    input: Option<InputSpec>,
+    kind: DeleteKind,
+) -> Action {
+    Action {
+        label,
+        description,
+        args,
+        input,
+        safety: Safety::Confirm,
+        output: OutputKind::DeleteReport(kind),
     }
 }
 
@@ -168,7 +203,7 @@ const CATEGORIES: &[Category] = &[
             ),
             action(
                 "Repair what doctor can fix",
-                "Remove orphan blobs/jobs/events and dangling parent/fork/workspace references.",
+                "Remove orphan blobs/jobs/automations/events/search index entries and dangling references.",
                 &["doctor", "--fix"],
                 None,
                 Safety::Confirm,
@@ -176,14 +211,14 @@ const CATEGORIES: &[Category] = &[
         ]),
     },
     Category {
-        name: "Sessions",
-        short: "Sessions",
-        kind: CategoryKind::Sessions,
-    },
-    Category {
         name: "Projects",
         short: "Projects",
         kind: CategoryKind::Projects,
+    },
+    Category {
+        name: "Sessions",
+        short: "Sessions",
+        kind: CategoryKind::Sessions,
     },
     Category {
         name: "KV cache",
@@ -330,21 +365,21 @@ const CATEGORIES: &[Category] = &[
                 age_input("30d"),
                 Safety::Confirm,
             ),
-            action(
+            delete_action(
                 "Purge sessions older than",
                 "Delete every session whose latest update is older than the cutoff.",
                 &["session", "purge", "--older-than"],
                 age_input("30d"),
-                Safety::Confirm,
+                DeleteKind::Session,
             ),
-            action(
+            delete_action(
                 "Purge old subagent sessions",
                 "Delete old sessions that were spawned by other sessions.",
                 &["session", "purge", "--subagents", "--older-than"],
                 age_input("30d"),
-                Safety::Confirm,
+                DeleteKind::Session,
             ),
-            action(
+            delete_action(
                 "Purge old, keep 5 per project",
                 "Delete old sessions but keep the newest five per project.",
                 &[
@@ -355,7 +390,7 @@ const CATEGORIES: &[Category] = &[
                     "--older-than",
                 ],
                 age_input("30d"),
-                Safety::Confirm,
+                DeleteKind::Session,
             ),
             action(
                 "Strip reasoning older than",
@@ -435,8 +470,10 @@ struct Tui<'a> {
     use_color: bool,
     tab: usize,
     selected: Vec<usize>,
-    sessions: ListBrowser,
+    sessions: SessionBrowser,
     projects: ListBrowser,
+    project_scope: Option<ProjectScope>,
+    project_sessions: SessionBrowser,
     kv: ListBrowser,
     backups: ListBrowser,
     view: View,
@@ -457,6 +494,7 @@ enum View {
 enum HelpTopic {
     Actions,
     Sessions,
+    ProjectSessions,
     Projects,
     Kv,
     Backups,
@@ -500,11 +538,42 @@ enum SearchControl {
     Prompt(&'static Action),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SessionTarget {
+    Global,
+    Project,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ProjectScope {
+    id: String,
+    label: String,
+    worktree: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SessionScope {
+    id: String,
+    label: String,
+    prev_selected: usize,
+    prev_filter: String,
+    prev_older_than: String,
+    prev_sort: usize,
+    prev_top_level_only: bool,
+}
+
+#[derive(Default)]
+struct SessionBrowser {
+    list: ListBrowser,
+    parents: Vec<SessionScope>,
+    top_level_only: bool,
+}
+
 #[derive(Clone, Copy)]
 enum PromptPurpose {
     Action(&'static Action),
-    SessionFilter,
-    SessionOlder,
+    SessionFilter(SessionTarget),
+    SessionOlder(SessionTarget),
     SessionPurge,
     SessionStrip,
     SessionSearch,
@@ -542,6 +611,7 @@ struct RunSpec {
     label: String,
     args: Vec<String>,
     safety: Safety,
+    output: OutputKind,
 }
 
 #[derive(Default)]
@@ -583,14 +653,47 @@ const PROJECT_LIST_LIMIT: usize = 500;
 const KV_LIST_LIMIT: usize = 500;
 const BACKUP_LIST_LIMIT: usize = 500;
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DeleteReportItem {
+    primary: String,
+    detail: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DeleteExportInfo {
+    dir: String,
+    sessions: usize,
+    bytes: u64,
+    dry_run: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DeleteReport {
+    kind: DeleteKind,
+    items: Vec<DeleteReportItem>,
+    total_rows: i64,
+    total_bytes: i64,
+    failed: u64,
+    summary_breakdown: String,
+    note: Option<String>,
+    exports: Option<DeleteExportInfo>,
+    extra_stderr: Option<String>,
+}
+
+enum OutputContent {
+    Plain(String),
+    Delete(DeleteReport),
+}
+
 struct OutputView {
     spec: RunSpec,
     command: String,
     status: String,
     ok: bool,
-    body: String,
+    content: OutputContent,
     scroll: Cell<usize>,
     can_apply: bool,
+    nothing_to_delete: bool,
     preview_only: bool,
     applied: bool,
 }
@@ -619,8 +722,10 @@ impl<'a> Tui<'a> {
             use_color,
             tab: 0,
             selected: vec![0; CATEGORIES.len()],
-            sessions: ListBrowser::default(),
+            sessions: SessionBrowser::default(),
             projects: ListBrowser::default(),
+            project_scope: None,
+            project_sessions: SessionBrowser::default(),
             kv: ListBrowser::default(),
             backups: ListBrowser::default(),
             view: View::Menu,
@@ -741,7 +846,7 @@ impl<'a> Tui<'a> {
                 }
             }
             View::Output(mut output) => {
-                let summary = format!("{}: {}", output.spec.label, output.status);
+                let summary = output.back_status();
                 let reload = output.applied && output.ok;
                 let control = handle_output_key(key, &mut output);
                 match control {
@@ -749,11 +854,8 @@ impl<'a> Tui<'a> {
                         self.status = Some(summary);
                         self.refresh(None);
                         if reload {
-                            self.sessions.loaded = false;
-                            self.projects.loaded = false;
-                            self.kv.loaded = false;
-                            self.backups.loaded = false;
-                            self.ensure_browser();
+                            self.invalidate_browsers();
+                            self.reload_active_browser(false);
                         }
                         Control::Continue
                     }
@@ -801,6 +903,7 @@ impl<'a> Tui<'a> {
         match CATEGORIES[self.tab].kind {
             CategoryKind::Actions(_) => HelpTopic::Actions,
             CategoryKind::Sessions => HelpTopic::Sessions,
+            CategoryKind::Projects if self.project_scope.is_some() => HelpTopic::ProjectSessions,
             CategoryKind::Projects => HelpTopic::Projects,
             CategoryKind::Kv => HelpTopic::Kv,
             CategoryKind::Backups => HelpTopic::Backups,
@@ -879,7 +982,17 @@ impl<'a> Tui<'a> {
 
     fn handle_menu_key(&mut self, key: KeyEvent) -> Control {
         match key.code {
-            KeyCode::Esc | KeyCode::Char('q') => return Control::Quit,
+            KeyCode::Esc | KeyCode::Char('q') => {
+                if self.is_drilled_down() {
+                    self.step_back();
+                    return Control::Continue;
+                }
+                return Control::Quit;
+            }
+            KeyCode::Backspace if self.is_drilled_down() => {
+                self.step_back();
+                return Control::Continue;
+            }
             KeyCode::Left | KeyCode::Char('h') | KeyCode::BackTab => {
                 self.switch_tab((self.tab + CATEGORIES.len() - 1) % CATEGORIES.len());
                 return Control::Continue;
@@ -903,7 +1016,10 @@ impl<'a> Tui<'a> {
         }
         match CATEGORIES[self.tab].kind {
             CategoryKind::Actions(actions) => self.handle_action_key(key, actions),
-            CategoryKind::Sessions => self.handle_sessions_key(key),
+            CategoryKind::Sessions => self.handle_session_browser_key(key, SessionTarget::Global),
+            CategoryKind::Projects if self.project_scope.is_some() => {
+                self.handle_session_browser_key(key, SessionTarget::Project)
+            }
             CategoryKind::Projects => self.handle_projects_key(key),
             CategoryKind::Kv => self.handle_kv_key(key),
             CategoryKind::Backups => self.handle_backups_key(key),
@@ -958,35 +1074,39 @@ impl<'a> Tui<'a> {
         Control::Continue
     }
 
-    fn handle_sessions_key(&mut self, key: KeyEvent) -> Control {
+    fn handle_session_browser_key(&mut self, key: KeyEvent, target: SessionTarget) -> Control {
         self.ensure_browser();
         self.status = None;
-        let count = self.sessions.rows.len();
+        let count = self.visible_session_count(target);
+        let at_root = self.session_browser(target).parents.is_empty();
         match key.code {
             KeyCode::Up | KeyCode::Char('k') => {
-                self.sessions.selected = self.sessions.selected.saturating_sub(1);
+                let selected = &mut self.session_browser_mut(target).list.selected;
+                *selected = selected.saturating_sub(1);
             }
             KeyCode::Down | KeyCode::Char('j') => {
-                if self.sessions.selected + 1 < count {
-                    self.sessions.selected += 1;
+                let selected = &mut self.session_browser_mut(target).list.selected;
+                if *selected + 1 < count {
+                    *selected += 1;
                 }
             }
             KeyCode::PageUp => {
-                self.sessions.selected = self.sessions.selected.saturating_sub(page_rows());
+                let selected = &mut self.session_browser_mut(target).list.selected;
+                *selected = selected.saturating_sub(page_rows());
             }
             KeyCode::PageDown => {
-                self.sessions.selected =
-                    (self.sessions.selected + page_rows()).min(count.saturating_sub(1));
+                let selected = &mut self.session_browser_mut(target).list.selected;
+                *selected = (*selected + page_rows()).min(count.saturating_sub(1));
             }
-            KeyCode::Home | KeyCode::Char('g') => self.sessions.selected = 0,
+            KeyCode::Home | KeyCode::Char('g') => {
+                self.session_browser_mut(target).list.selected = 0;
+            }
             KeyCode::End | KeyCode::Char('G') => {
-                self.sessions.selected = count.saturating_sub(1);
+                self.session_browser_mut(target).list.selected = count.saturating_sub(1);
             }
             KeyCode::Enter => {
                 if let Some(spec) = self
-                    .sessions
-                    .rows
-                    .get(self.sessions.selected)
+                    .selected_session_row(target)
                     .and_then(session_show_spec)
                 {
                     return Control::Run(spec);
@@ -994,18 +1114,28 @@ impl<'a> Tui<'a> {
             }
             KeyCode::Char('d') => {
                 if let Some(spec) = self
-                    .sessions
-                    .rows
-                    .get(self.sessions.selected)
+                    .selected_session_row(target)
                     .and_then(session_delete_spec)
                 {
                     return Control::Run(spec);
                 }
             }
+            KeyCode::Char('u') | KeyCode::Char('>') => self.drill_into_subagents(target),
+            KeyCode::Char('t') => self.toggle_top_level(target),
+            KeyCode::Char('v') if target == SessionTarget::Project => {
+                if let Some(scope) = &self.project_scope {
+                    return Control::Run(RunSpec {
+                        label: format!("Project {}", scope.label),
+                        args: vec!["project".into(), "show".into(), scope.id.clone()],
+                        safety: Safety::ReadOnly,
+                        output: OutputKind::Text,
+                    });
+                }
+            }
             KeyCode::Char('/') => {
-                let initial = self.sessions.filter.clone();
+                let initial = self.session_browser(target).list.filter.clone();
                 self.view = View::Prompt(Prompt::browser(
-                    PromptPurpose::SessionFilter,
+                    PromptPurpose::SessionFilter(target),
                     "Filter title or directory",
                     "",
                     InputKind::Text,
@@ -1014,9 +1144,9 @@ impl<'a> Tui<'a> {
                 ));
             }
             KeyCode::Char('o') => {
-                let initial = self.sessions.older_than.clone();
+                let initial = self.session_browser(target).list.older_than.clone();
                 self.view = View::Prompt(Prompt::browser(
-                    PromptPurpose::SessionOlder,
+                    PromptPurpose::SessionOlder(target),
                     "Only sessions older than",
                     "",
                     InputKind::Age,
@@ -1025,16 +1155,18 @@ impl<'a> Tui<'a> {
                 ));
             }
             KeyCode::Char('s') => {
-                self.sessions.sort = (self.sessions.sort + 1) % SESSION_SORTS.len();
-                self.load_sessions(true);
+                let sort = &mut self.session_browser_mut(target).list.sort;
+                *sort = (*sort + 1) % SESSION_SORTS.len();
+                self.load_session_browser(target, true);
             }
             KeyCode::Char('c') => {
-                self.sessions.filter.clear();
-                self.sessions.older_than.clear();
-                self.load_sessions(true);
+                let sb = self.session_browser_mut(target);
+                sb.list.filter.clear();
+                sb.list.older_than.clear();
+                self.load_session_browser(target, true);
             }
-            KeyCode::Char('r') => self.load_sessions(false),
-            KeyCode::Char('F') => {
+            KeyCode::Char('r') => self.load_session_browser(target, false),
+            KeyCode::Char('F') if target == SessionTarget::Global && at_root => {
                 self.view = View::Prompt(Prompt::browser(
                     PromptPurpose::SessionSearch,
                     "Search message content",
@@ -1044,7 +1176,7 @@ impl<'a> Tui<'a> {
                     "",
                 ));
             }
-            KeyCode::Char('P') => {
+            KeyCode::Char('P') if target == SessionTarget::Global && at_root => {
                 self.view = View::Prompt(Prompt::browser(
                     PromptPurpose::SessionPurge,
                     "Purge sessions older than",
@@ -1054,7 +1186,7 @@ impl<'a> Tui<'a> {
                     "",
                 ));
             }
-            KeyCode::Char('S') => {
+            KeyCode::Char('S') if target == SessionTarget::Global && at_root => {
                 self.view = View::Prompt(Prompt::browser(
                     PromptPurpose::SessionStrip,
                     "Strip reasoning older than",
@@ -1093,7 +1225,8 @@ impl<'a> Tui<'a> {
             KeyCode::End | KeyCode::Char('G') => {
                 self.projects.selected = count.saturating_sub(1);
             }
-            KeyCode::Enter => {
+            KeyCode::Enter => self.drill_into_project(),
+            KeyCode::Char('v') => {
                 if let Some(spec) = self.selected_project_row().and_then(project_show_spec) {
                     return Control::Run(spec);
                 }
@@ -1140,6 +1273,7 @@ impl<'a> Tui<'a> {
                     label: "Purge empty projects".to_string(),
                     args: vec!["project".into(), "purge".into(), "--empty".into()],
                     safety: Safety::Confirm,
+                    output: OutputKind::DeleteReport(DeleteKind::Project),
                 });
             }
             KeyCode::Char('P') => {
@@ -1324,6 +1458,7 @@ impl<'a> Tui<'a> {
                     label: "Create a backup".to_string(),
                     args: vec!["backup".into()],
                     safety: Safety::Confirm,
+                    output: OutputKind::Text,
                 });
             }
             KeyCode::Char('V') => {
@@ -1361,6 +1496,155 @@ impl<'a> Tui<'a> {
         Control::Continue
     }
 
+    fn active_session_target(&self) -> Option<SessionTarget> {
+        match CATEGORIES[self.tab].kind {
+            CategoryKind::Sessions => Some(SessionTarget::Global),
+            CategoryKind::Projects if self.project_scope.is_some() => Some(SessionTarget::Project),
+            _ => None,
+        }
+    }
+
+    fn is_drilled_down(&self) -> bool {
+        match CATEGORIES[self.tab].kind {
+            CategoryKind::Projects => self.project_scope.is_some(),
+            CategoryKind::Sessions => !self.sessions.parents.is_empty(),
+            _ => false,
+        }
+    }
+
+    fn session_browser(&self, target: SessionTarget) -> &SessionBrowser {
+        match target {
+            SessionTarget::Global => &self.sessions,
+            SessionTarget::Project => &self.project_sessions,
+        }
+    }
+
+    fn session_browser_mut(&mut self, target: SessionTarget) -> &mut SessionBrowser {
+        match target {
+            SessionTarget::Global => &mut self.sessions,
+            SessionTarget::Project => &mut self.project_sessions,
+        }
+    }
+
+    fn enter_project_scope(&mut self, scope: ProjectScope) {
+        self.project_scope = Some(scope);
+        self.project_sessions = SessionBrowser::default();
+    }
+
+    fn drill_into_project(&mut self) {
+        let Some(row) = self.selected_project_row() else {
+            return;
+        };
+        let id = row_str(row, "id");
+        if id.is_empty() {
+            return;
+        }
+        self.enter_project_scope(ProjectScope {
+            id,
+            label: project_label(row),
+            worktree: row_str(row, "worktree"),
+        });
+        self.load_session_browser(SessionTarget::Project, true);
+    }
+
+    fn push_subagent_scope(&mut self, target: SessionTarget) -> bool {
+        let Some(row) = self.selected_session_row(target).cloned() else {
+            return false;
+        };
+        let id = row_str(&row, "id");
+        if id.is_empty() {
+            return false;
+        }
+        let child_count = self.session_child_count(target, &id);
+        let sb = self.session_browser(target);
+        let exact_empty = child_count == 0
+            && sb.parents.is_empty()
+            && sb.list.filter.is_empty()
+            && sb.list.older_than.is_empty()
+            && sb.list.rows.len() < SESSION_LIST_LIMIT;
+        if exact_empty {
+            self.status = Some("selected session has no subagents".to_string());
+            return false;
+        }
+        let label = session_short_label(&row);
+        let sb = self.session_browser_mut(target);
+        let scope = SessionScope {
+            id,
+            label,
+            prev_selected: sb.list.selected,
+            prev_filter: std::mem::take(&mut sb.list.filter),
+            prev_older_than: std::mem::take(&mut sb.list.older_than),
+            prev_sort: sb.list.sort,
+            prev_top_level_only: sb.top_level_only,
+        };
+        sb.parents.push(scope);
+        sb.top_level_only = false;
+        true
+    }
+
+    fn drill_into_subagents(&mut self, target: SessionTarget) {
+        if self.push_subagent_scope(target) {
+            self.load_session_browser(target, true);
+        }
+    }
+
+    fn toggle_top_level(&mut self, target: SessionTarget) {
+        let sb = self.session_browser_mut(target);
+        if !sb.parents.is_empty() {
+            self.status =
+                Some("top-level filter only applies at root or project level".to_string());
+            return;
+        }
+        sb.top_level_only = !sb.top_level_only;
+        let enabled = sb.top_level_only;
+        let count = self.visible_session_count(target);
+        let selected = &mut self.session_browser_mut(target).list.selected;
+        *selected = (*selected).min(count.saturating_sub(1));
+        self.status = Some(if enabled {
+            "showing top-level sessions only".to_string()
+        } else {
+            "showing all sessions (including subagents)".to_string()
+        });
+    }
+
+    fn pop_subagent_scope(&mut self, target: SessionTarget) -> Option<SessionScope> {
+        let scope = self.session_browser_mut(target).parents.pop()?;
+        let sb = self.session_browser_mut(target);
+        sb.list.filter = scope.prev_filter.clone();
+        sb.list.older_than = scope.prev_older_than.clone();
+        sb.list.sort = scope.prev_sort;
+        sb.top_level_only = scope.prev_top_level_only;
+        Some(scope)
+    }
+
+    fn exit_project_scope(&mut self) -> bool {
+        if self.project_scope.is_some() {
+            self.project_scope = None;
+            self.project_sessions = SessionBrowser::default();
+            self.status = None;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn step_back(&mut self) {
+        let Some(target) = self.active_session_target() else {
+            return;
+        };
+        if let Some(scope) = self.pop_subagent_scope(target) {
+            self.load_session_browser(target, true);
+            let count = self.visible_session_count(target);
+            self.session_browser_mut(target).list.selected =
+                scope.prev_selected.min(count.saturating_sub(1));
+            self.status = None;
+            return;
+        }
+        if target == SessionTarget::Project && self.exit_project_scope() && !self.projects.loaded {
+            self.load_projects(false);
+        }
+    }
+
     fn switch_tab(&mut self, tab: usize) {
         self.tab = tab;
         self.status = None;
@@ -1375,10 +1659,14 @@ impl<'a> Tui<'a> {
                 *selected = (*selected).min(actions.len().saturating_sub(1));
             }
             CategoryKind::Sessions => {
-                self.sessions.selected = self
-                    .sessions
-                    .selected
-                    .min(self.sessions.rows.len().saturating_sub(1));
+                let count = self.visible_session_count(SessionTarget::Global);
+                let selected = &mut self.sessions.list.selected;
+                *selected = (*selected).min(count.saturating_sub(1));
+            }
+            CategoryKind::Projects if self.project_scope.is_some() => {
+                let count = self.visible_session_count(SessionTarget::Project);
+                let selected = &mut self.project_sessions.list.selected;
+                *selected = (*selected).min(count.saturating_sub(1));
             }
             CategoryKind::Projects => {
                 let count = self.visible_project_count();
@@ -1396,36 +1684,92 @@ impl<'a> Tui<'a> {
         }
     }
 
+    fn invalidate_browsers(&mut self) {
+        self.sessions.list.loaded = false;
+        self.projects.loaded = false;
+        self.project_sessions.list.loaded = false;
+        self.kv.loaded = false;
+        self.backups.loaded = false;
+    }
+
     fn ensure_browser(&mut self) {
         match CATEGORIES[self.tab].kind {
-            CategoryKind::Sessions if !self.sessions.loaded => self.load_sessions(true),
-            CategoryKind::Projects if !self.projects.loaded => self.load_projects(true),
-            CategoryKind::Kv if !self.kv.loaded => self.load_kv(true),
-            CategoryKind::Backups if !self.backups.loaded => self.load_backups(true),
+            CategoryKind::Sessions if !self.sessions.list.loaded => {
+                self.load_session_browser(SessionTarget::Global, false);
+            }
+            CategoryKind::Projects if self.project_scope.is_some() => {
+                if !self.project_sessions.list.loaded {
+                    self.load_session_browser(SessionTarget::Project, false);
+                }
+            }
+            CategoryKind::Projects if !self.projects.loaded => self.load_projects(false),
+            CategoryKind::Kv if !self.kv.loaded => self.load_kv(false),
+            CategoryKind::Backups if !self.backups.loaded => self.load_backups(false),
             _ => {}
         }
     }
 
-    fn load_sessions(&mut self, reset: bool) {
-        let args = session_list_args(&self.sessions);
+    fn reload_active_browser(&mut self, reset: bool) {
+        match CATEGORIES[self.tab].kind {
+            CategoryKind::Sessions => self.load_session_browser(SessionTarget::Global, reset),
+            CategoryKind::Projects if self.project_scope.is_some() => {
+                self.load_session_browser(SessionTarget::Project, reset);
+            }
+            CategoryKind::Projects => self.load_projects(reset),
+            CategoryKind::Kv => self.load_kv(reset),
+            CategoryKind::Backups => self.load_backups(reset),
+            CategoryKind::Actions(_) => {}
+        }
+    }
+
+    fn load_session_browser(&mut self, target: SessionTarget, reset: bool) {
+        let project_id = match target {
+            SessionTarget::Global => None,
+            SessionTarget::Project => self.project_scope.as_ref().map(|p| p.id.as_str()),
+        };
+        let parent_id = self
+            .session_browser(target)
+            .parents
+            .last()
+            .map(|p| p.id.as_str());
+        let args = session_list_args(&self.session_browser(target).list, project_id, parent_id);
         match self.run_json(&args) {
             Ok(rows) => {
-                self.sessions.rows = rows;
-                self.sessions.error = None;
+                let sb = self.session_browser_mut(target);
+                sb.list.rows = rows;
+                sb.list.error = None;
+                sb.list.loaded = true;
             }
             Err(error) => {
-                self.sessions.rows.clear();
-                self.sessions.error = Some(error);
+                if target == SessionTarget::Project
+                    && self.project_scope.is_some()
+                    && error.contains("project not found")
+                {
+                    self.project_scope = None;
+                    self.project_sessions = SessionBrowser::default();
+                    self.load_projects(false);
+                    self.status = Some("project no longer exists".to_string());
+                    return;
+                }
+                if !self.session_browser(target).parents.is_empty()
+                    && error.contains("session not found")
+                {
+                    self.step_back();
+                    self.status = Some("parent session no longer exists".to_string());
+                    return;
+                }
+                let sb = self.session_browser_mut(target);
+                sb.list.rows.clear();
+                sb.list.error = Some(error);
+                sb.list.loaded = true;
             }
         }
-        self.sessions.loaded = true;
-        if reset || self.sessions.error.is_some() {
-            self.sessions.selected = 0;
+        let count = self.visible_session_count(target);
+        let sb = self.session_browser_mut(target);
+        if reset || sb.list.error.is_some() {
+            sb.list.selected = 0;
         } else {
-            self.sessions.selected = self
-                .sessions
-                .selected
-                .min(self.sessions.rows.len().saturating_sub(1));
+            sb.list.selected = sb.list.selected.min(count.saturating_sub(1));
         }
     }
 
@@ -1499,13 +1843,13 @@ impl<'a> Tui<'a> {
             PromptPurpose::Action(action) => {
                 return Control::Run(action_spec(action, Some(&value)));
             }
-            PromptPurpose::SessionFilter => {
-                self.sessions.filter = value;
-                self.load_sessions(true);
+            PromptPurpose::SessionFilter(target) => {
+                self.session_browser_mut(target).list.filter = value;
+                self.load_session_browser(target, true);
             }
-            PromptPurpose::SessionOlder => {
-                self.sessions.older_than = value;
-                self.load_sessions(true);
+            PromptPurpose::SessionOlder(target) => {
+                self.session_browser_mut(target).list.older_than = value;
+                self.load_session_browser(target, true);
             }
             PromptPurpose::SessionPurge => {
                 return Control::Run(RunSpec {
@@ -1517,6 +1861,7 @@ impl<'a> Tui<'a> {
                         value,
                     ],
                     safety: Safety::Confirm,
+                    output: OutputKind::DeleteReport(DeleteKind::Session),
                 });
             }
             PromptPurpose::SessionStrip => {
@@ -1529,6 +1874,7 @@ impl<'a> Tui<'a> {
                         value,
                     ],
                     safety: Safety::Confirm,
+                    output: OutputKind::Text,
                 });
             }
             PromptPurpose::SessionSearch => {
@@ -1542,6 +1888,7 @@ impl<'a> Tui<'a> {
                         value,
                     ],
                     safety: Safety::ReadOnly,
+                    output: OutputKind::Text,
                 });
             }
             PromptPurpose::ProjectFilter => {
@@ -1562,6 +1909,7 @@ impl<'a> Tui<'a> {
                         value,
                     ],
                     safety: Safety::Confirm,
+                    output: OutputKind::DeleteReport(DeleteKind::Project),
                 });
             }
             PromptPurpose::KvFilter => {
@@ -1577,6 +1925,7 @@ impl<'a> Tui<'a> {
                     label: "Purge kv entries older than".to_string(),
                     args: vec!["kv".into(), "purge".into(), "--older-than".into(), value],
                     safety: Safety::Confirm,
+                    output: OutputKind::DeleteReport(DeleteKind::Kv),
                 });
             }
             PromptPurpose::KvPurgeLarger => {
@@ -1584,6 +1933,7 @@ impl<'a> Tui<'a> {
                     label: "Purge kv entries larger than".to_string(),
                     args: vec!["kv".into(), "purge".into(), "--larger-than".into(), value],
                     safety: Safety::Confirm,
+                    output: OutputKind::DeleteReport(DeleteKind::Kv),
                 });
             }
             PromptPurpose::BackupFilter => {
@@ -1599,6 +1949,7 @@ impl<'a> Tui<'a> {
                     label: format!("Keep the newest {value} backups"),
                     args: vec!["backup".into(), "prune".into(), "--keep".into(), value],
                     safety: Safety::Confirm,
+                    output: OutputKind::DeleteReport(DeleteKind::BackupPrune),
                 });
             }
             PromptPurpose::BackupPruneOlder => {
@@ -1611,10 +1962,30 @@ impl<'a> Tui<'a> {
                         value,
                     ],
                     safety: Safety::Confirm,
+                    output: OutputKind::DeleteReport(DeleteKind::BackupPrune),
                 });
             }
         }
         Control::Continue
+    }
+
+    fn visible_session_count(&self, target: SessionTarget) -> usize {
+        visible_session_list(self.session_browser(target)).len()
+    }
+
+    fn selected_session_row(&self, target: SessionTarget) -> Option<&Value> {
+        let rows = visible_session_list(self.session_browser(target));
+        let selected = self.session_browser(target).list.selected;
+        rows.get(selected).copied()
+    }
+
+    fn session_child_count(&self, target: SessionTarget, id: &str) -> usize {
+        self.session_browser(target)
+            .list
+            .rows
+            .iter()
+            .filter(|row| row_str(row, "parent_id") == id)
+            .count()
     }
 
     fn visible_project_count(&self) -> usize {
@@ -1681,8 +2052,9 @@ impl<'a> Tui<'a> {
 
     fn execute(&self, spec: &RunSpec, apply: bool) -> OutputView {
         let preview = !apply && (spec.safety == Safety::Confirm || self.preview_only);
+        let want_json = matches!(spec.output, OutputKind::DeleteReport(_));
         let mut args: Vec<String> = spec.args.clone();
-        args.extend(global_child_args(self.cli, false));
+        args.extend(global_child_args(self.cli, want_json));
         let mut shown_args = spec.args.clone();
         if apply {
             args.push("--yes".to_string());
@@ -1695,7 +2067,7 @@ impl<'a> Tui<'a> {
         let started = Instant::now();
         let result = self.run_child(&args);
         let elapsed = started.elapsed();
-        let (status, ok, body) = match result {
+        let (status, ok, content) = match result {
             Ok(result) => {
                 let ok = result.status.success();
                 let status = match result.status.code() {
@@ -1705,36 +2077,40 @@ impl<'a> Tui<'a> {
                     Some(code) => format!("exit {code} · {:.1} s", elapsed.as_secs_f64()),
                     None => "terminated by signal".to_string(),
                 };
-                let mut body = String::new();
                 let stdout = strip_ansi(&String::from_utf8_lossy(&result.stdout));
                 let stderr =
                     strip_apply_hint(&strip_ansi(&String::from_utf8_lossy(&result.stderr)));
-                if !stdout.trim().is_empty() {
-                    body.push_str(stdout.trim_end());
-                }
-                if !stderr.trim().is_empty() {
-                    if !body.is_empty() {
-                        body.push_str("\n\n");
+                let content = match spec.output {
+                    OutputKind::DeleteReport(kind) if ok => {
+                        if let Some(mut report) = parse_delete_report(kind, &stdout) {
+                            if !stderr.trim().is_empty() {
+                                report.extra_stderr = Some(stderr.trim().to_string());
+                            }
+                            OutputContent::Delete(report)
+                        } else {
+                            OutputContent::Plain(combine_plain_output(&stdout, &stderr))
+                        }
                     }
-                    body.push_str("stderr:\n");
-                    body.push_str(stderr.trim_end());
-                }
-                if body.is_empty() {
-                    body.push_str("(no output)");
-                }
-                (status, ok, body)
+                    _ => OutputContent::Plain(combine_plain_output(&stdout, &stderr)),
+                };
+                (status, ok, content)
             }
-            Err(message) => (message.clone(), false, message),
+            Err(message) => (message.clone(), false, OutputContent::Plain(message)),
         };
-        let can_apply = preview && ok && !self.preview_only;
+        let nothing_to_delete = preview
+            && !apply
+            && ok
+            && matches!(&content, OutputContent::Delete(report) if report.item_count() == 0);
+        let can_apply = preview && ok && !self.preview_only && !nothing_to_delete;
         OutputView {
             spec: spec.clone(),
             command,
             status,
             ok,
-            body,
+            content,
             scroll: Cell::new(0),
             can_apply,
+            nothing_to_delete,
             preview_only: self.preview_only,
             applied: apply,
         }
@@ -1945,7 +2321,12 @@ impl<'a> Tui<'a> {
         width: usize,
         height: usize,
     ) -> io::Result<()> {
-        let header_row = 4usize;
+        let crumb = self.browser_breadcrumb();
+        let header_row = if crumb.is_some() { 5usize } else { 4usize };
+        if let Some(crumb_line) = crumb {
+            clear_row(out, 4)?;
+            put_line(out, 4, 0, &crumb_line, width, self.use_color)?;
+        }
         let body_bottom = height.saturating_sub(2);
         let body_height = body_bottom.saturating_sub(header_row + 1);
         let show_detail = width >= 80;
@@ -1956,16 +2337,27 @@ impl<'a> Tui<'a> {
         };
         let detail_width = width.saturating_sub(left_width + 2);
         let kind = CATEGORIES[self.tab].kind;
-        let rows = self.browser_rows();
+        let session_target = self.active_session_target();
+        let (rows, child_counts, mark_subagent, session_sort) = if let Some(target) = session_target
+        {
+            let sb = self.session_browser(target);
+            let (rows, counts) = session_rows_and_children(sb);
+            (rows, counts, sb.parents.is_empty(), sb.list.sort)
+        } else {
+            (self.browser_rows(), HashMap::new(), false, 0)
+        };
         let selected = self.browser_selected();
 
         clear_row(out, header_row)?;
-        let header = match kind {
-            CategoryKind::Sessions => session_header_text(left_width, self.sessions.sort),
-            CategoryKind::Projects => project_header_text(left_width),
-            CategoryKind::Kv => kv_header_text(left_width, self.kv.sort),
-            CategoryKind::Backups => backup_header_text(left_width),
-            CategoryKind::Actions(_) => String::new(),
+        let header = if session_target.is_some() {
+            session_header_text(left_width, session_sort)
+        } else {
+            match kind {
+                CategoryKind::Projects => project_header_text(left_width),
+                CategoryKind::Kv => kv_header_text(left_width, self.kv.sort),
+                CategoryKind::Backups => backup_header_text(left_width),
+                CategoryKind::Sessions | CategoryKind::Actions(_) => String::new(),
+            }
         };
         put_line(
             out,
@@ -1989,12 +2381,18 @@ impl<'a> Tui<'a> {
 
         let details = rows
             .get(selected)
-            .map(|row| match kind {
-                CategoryKind::Sessions => session_detail_lines(row, detail_width),
-                CategoryKind::Projects => project_detail_lines(row, detail_width),
-                CategoryKind::Kv => kv_detail_lines(row, detail_width),
-                CategoryKind::Backups => backup_detail_lines(row, detail_width),
-                CategoryKind::Actions(_) => Vec::new(),
+            .map(|row| {
+                if session_target.is_some() {
+                    let count = child_counts.get(&row_str(row, "id")).copied().unwrap_or(0);
+                    session_detail_lines_with(row, detail_width, count)
+                } else {
+                    match kind {
+                        CategoryKind::Projects => project_detail_lines(row, detail_width),
+                        CategoryKind::Kv => kv_detail_lines(row, detail_width),
+                        CategoryKind::Backups => backup_detail_lines(row, detail_width),
+                        CategoryKind::Sessions | CategoryKind::Actions(_) => Vec::new(),
+                    }
+                }
             })
             .unwrap_or_else(|| vec![Line::from(vec![Span::new("No item selected.").dim()])]);
         let start = window_start(selected, rows.len(), body_height);
@@ -2002,14 +2400,16 @@ impl<'a> Tui<'a> {
             let row = header_row + 1 + offset;
             clear_row(out, row)?;
             if let Some(item) = rows.get(start + offset) {
-                let text = match kind {
-                    CategoryKind::Sessions => {
-                        session_row_text(item, left_width, self.sessions.sort)
+                let text = if session_target.is_some() {
+                    let count = child_counts.get(&row_str(item, "id")).copied().unwrap_or(0);
+                    session_row_text_with(item, left_width, session_sort, count, mark_subagent)
+                } else {
+                    match kind {
+                        CategoryKind::Projects => project_row_text(item, left_width),
+                        CategoryKind::Kv => kv_row_text(item, left_width, self.kv.sort),
+                        CategoryKind::Backups => backup_row_text(item, left_width),
+                        CategoryKind::Sessions | CategoryKind::Actions(_) => String::new(),
                     }
-                    CategoryKind::Projects => project_row_text(item, left_width),
-                    CategoryKind::Kv => kv_row_text(item, left_width, self.kv.sort),
-                    CategoryKind::Backups => backup_row_text(item, left_width),
-                    CategoryKind::Actions(_) => String::new(),
                 };
                 let span = if start + offset == selected {
                     Span::new(text).bold().reverse()
@@ -2048,43 +2448,94 @@ impl<'a> Tui<'a> {
         Ok(())
     }
 
-    fn browser_rows(&self) -> Vec<&Value> {
+    fn browser_breadcrumb(&self) -> Option<Line> {
+        let mut segments = Vec::new();
         match CATEGORIES[self.tab].kind {
-            CategoryKind::Sessions => self.sessions.rows.iter().collect(),
+            CategoryKind::Projects => {
+                let scope = self.project_scope.as_ref()?;
+                segments.push("Projects".to_string());
+                segments.push(scope.label.clone());
+                segments.extend(
+                    self.project_sessions
+                        .parents
+                        .iter()
+                        .map(|p| p.label.clone()),
+                );
+            }
+            CategoryKind::Sessions if !self.sessions.parents.is_empty() => {
+                segments.push("Sessions".to_string());
+                segments.extend(self.sessions.parents.iter().map(|p| p.label.clone()));
+            }
+            _ => return None,
+        }
+        let last = segments.len().saturating_sub(1);
+        let mut spans = Vec::new();
+        for (index, segment) in segments.into_iter().enumerate() {
+            if index > 0 {
+                spans.push(Span::new(" > ").dim());
+            }
+            let span = if index == 0 {
+                Span::new(segment).fg(Color::Cyan)
+            } else if index == last {
+                Span::new(segment).bold()
+            } else {
+                Span::new(segment)
+            };
+            spans.push(span);
+        }
+        spans.push(Span::new("   [Esc/Bksp back]").dim());
+        Some(Line::from(spans))
+    }
+
+    fn browser_rows(&self) -> Vec<&Value> {
+        if let Some(target) = self.active_session_target() {
+            return visible_session_list(self.session_browser(target));
+        }
+        match CATEGORIES[self.tab].kind {
             CategoryKind::Projects => self.visible_project_rows(),
             CategoryKind::Kv => self.kv.rows.iter().collect(),
             CategoryKind::Backups => self.backups.rows.iter().collect(),
-            CategoryKind::Actions(_) => Vec::new(),
+            CategoryKind::Sessions | CategoryKind::Actions(_) => Vec::new(),
         }
     }
 
     fn browser_selected(&self) -> usize {
+        if let Some(target) = self.active_session_target() {
+            return self.session_browser(target).list.selected;
+        }
         match CATEGORIES[self.tab].kind {
-            CategoryKind::Sessions => self.sessions.selected,
             CategoryKind::Projects => self.projects.selected,
             CategoryKind::Kv => self.kv.selected,
             CategoryKind::Backups => self.backups.selected,
-            CategoryKind::Actions(_) => 0,
+            CategoryKind::Sessions | CategoryKind::Actions(_) => 0,
         }
     }
 
     fn browser_error(&self) -> Option<&str> {
+        if let Some(target) = self.active_session_target() {
+            return self.session_browser(target).list.error.as_deref();
+        }
         match CATEGORIES[self.tab].kind {
-            CategoryKind::Sessions => self.sessions.error.as_deref(),
             CategoryKind::Projects => self.projects.error.as_deref(),
             CategoryKind::Kv => self.kv.error.as_deref(),
             CategoryKind::Backups => self.backups.error.as_deref(),
-            CategoryKind::Actions(_) => None,
+            CategoryKind::Sessions | CategoryKind::Actions(_) => None,
         }
     }
 
     fn empty_browser_message(&self) -> &'static str {
+        if let Some(target) = self.active_session_target() {
+            return if self.session_browser(target).parents.is_empty() {
+                "(no sessions match)"
+            } else {
+                "(no subagent sessions)"
+            };
+        }
         match CATEGORIES[self.tab].kind {
-            CategoryKind::Sessions => "(no sessions match)",
             CategoryKind::Projects => "(no projects match)",
             CategoryKind::Kv => "(no kv entries match)",
             CategoryKind::Backups => "(no backups match)",
-            CategoryKind::Actions(_) => "",
+            CategoryKind::Sessions | CategoryKind::Actions(_) => "",
         }
     }
 
@@ -2108,25 +2559,12 @@ impl<'a> Tui<'a> {
     }
 
     fn browser_summary(&self) -> String {
+        if let Some(target) = self.active_session_target() {
+            let sb = self.session_browser(target);
+            let total = self.visible_session_count(target);
+            return session_summary(sb, total);
+        }
         match CATEGORIES[self.tab].kind {
-            CategoryKind::Sessions => {
-                let browser = &self.sessions;
-                let total = browser.rows.len();
-                let selected = if total == 0 { 0 } else { browser.selected + 1 };
-                let mut parts = vec![format!("{total} sessions")];
-                if total == SESSION_LIST_LIMIT {
-                    parts.push(format!("first {SESSION_LIST_LIMIT}"));
-                }
-                if !browser.filter.is_empty() {
-                    parts.push(format!("filter \"{}\"", browser.filter));
-                }
-                if !browser.older_than.is_empty() {
-                    parts.push(format!("older than {}", browser.older_than));
-                }
-                parts.push(format!("sort {}", SESSION_SORTS[browser.sort].0));
-                parts.push(format!("{selected}/{total}"));
-                parts.join("  ·  ")
-            }
             CategoryKind::Projects => {
                 let browser = &self.projects;
                 let total = self.visible_project_count();
@@ -2186,7 +2624,7 @@ impl<'a> Tui<'a> {
                 parts.push(format!("{selected}/{total}"));
                 parts.join("  ·  ")
             }
-            CategoryKind::Actions(_) => String::new(),
+            CategoryKind::Sessions | CategoryKind::Actions(_) => String::new(),
         }
     }
 
@@ -2196,10 +2634,21 @@ impl<'a> Tui<'a> {
                 "? help   Enter run   / search   Up/Down move   Left/Right section   q quit"
             }
             CategoryKind::Sessions => {
-                "? help   Enter view   d delete   / filter   s sort   P purge   F search   q quit"
+                if self.sessions.parents.is_empty() {
+                    "? help   Enter show   d delete   u subagents   t top-level   F find   P purge   q quit"
+                } else {
+                    "? help   Enter show   d delete   u subagents   / filter   s sort   Esc/Bksp back"
+                }
+            }
+            CategoryKind::Projects if self.project_scope.is_some() => {
+                if self.project_sessions.parents.is_empty() {
+                    "? help   Enter show   d delete   u subagents   t top-level   v project   Esc/Bksp back"
+                } else {
+                    "? help   Enter show   d delete   u subagents   v project   Esc/Bksp back   q quit"
+                }
             }
             CategoryKind::Projects => {
-                "? help   Enter view   d delete   / filter   s sort   E empty   P purge   q quit"
+                "? help   Enter sessions   v summary   d delete   / filter   E empty   P purge   q quit"
             }
             CategoryKind::Kv => {
                 "? help   Enter view   d delete   / filter   s sort   P purge   L larger   q quit"
@@ -2252,19 +2701,14 @@ impl<'a> Tui<'a> {
         height: usize,
         output: &OutputView,
     ) -> io::Result<()> {
-        let title_text = if output.applied {
-            format!("{} · applied", output.spec.label)
-        } else if output.can_apply {
-            format!("{} · preview", output.spec.label)
-        } else if output.preview_only && output.spec.safety == Safety::Confirm {
-            format!("{} · preview only", output.spec.label)
-        } else {
-            output.spec.label.clone()
-        };
+        let (badge, badge_color) = output.status_badge();
         let status_color = if output.ok { Color::Green } else { Color::Red };
         let title = Line::from(vec![
-            Span::new(" ").reverse(),
-            Span::new(format!(" {title_text} ")).bold().reverse(),
+            Span::new(format!(" [{badge}] "))
+                .fg(badge_color)
+                .bold()
+                .reverse(),
+            Span::new(format!(" {} ", output.spec.label)).bold(),
             Span::new("  "),
             Span::new(output.status.clone()).fg(status_color),
         ]);
@@ -2292,21 +2736,14 @@ impl<'a> Tui<'a> {
         let body_top = 3usize;
         let body_bottom = height.saturating_sub(2);
         let body_height = body_bottom.saturating_sub(body_top);
-        let body = wrapped_body(&output.body, width);
+        let body = output.render_lines(width);
         let max_start = body.len().saturating_sub(body_height);
         let start = output.scroll.get().min(max_start);
         output.scroll.set(start);
         for (offset, row) in (body_top..body_bottom).enumerate() {
             clear_row(out, row)?;
             if let Some(line) = body.get(start + offset) {
-                put_line(
-                    out,
-                    row,
-                    0,
-                    &Line::from(vec![Span::new(line.clone())]),
-                    width,
-                    self.use_color,
-                )?;
+                put_line(out, row, 0, line, width, self.use_color)?;
             }
         }
 
@@ -2321,27 +2758,62 @@ impl<'a> Tui<'a> {
                 body.len()
             )
         };
+        let (cue, cue_color, cue_bold) = if output.can_apply {
+            (
+                "Preview only - press Enter or a to apply, Esc to cancel",
+                Some(Color::Yellow),
+                true,
+            )
+        } else if output.applied && output.ok {
+            (
+                "Done - press Enter or Esc to return",
+                Some(Color::Green),
+                true,
+            )
+        } else if !output.ok {
+            (
+                "Failed - press Enter or Esc to return, r to retry",
+                Some(Color::Red),
+                true,
+            )
+        } else if output.nothing_to_delete {
+            (
+                "Nothing to delete - press Enter or Esc to return",
+                Some(Color::Yellow),
+                false,
+            )
+        } else if output.preview_only && output.spec.safety == Safety::Confirm {
+            (
+                "Preview-only mode (--dry-run) - press Enter or Esc to return",
+                Some(Color::Yellow),
+                false,
+            )
+        } else {
+            ("Press Enter or Esc to return", None, false)
+        };
+        let mut cue_span = Span::new(cue);
+        if let Some(color) = cue_color {
+            cue_span = cue_span.fg(color);
+        } else {
+            cue_span = cue_span.dim();
+        }
+        if cue_bold {
+            cue_span = cue_span.bold();
+        }
         put_line(
             out,
             height.saturating_sub(2),
             0,
-            &Line::from(vec![
-                Span::new(position).dim(),
-                Span::new("   "),
-                Span::new(if output.can_apply {
-                    "Enter apply"
-                } else {
-                    "Esc back"
-                })
-                .dim(),
-            ]),
+            &Line::from(vec![Span::new(position).dim(), Span::new("   "), cue_span]),
             width,
             self.use_color,
         )?;
         let help = if output.can_apply {
-            "? help   Enter/a apply   r rerun   Up/Down scroll   PgUp/PgDn page   Esc back"
+            "? help   Enter/a apply   r rerun   Up/Down scroll   PgUp/PgDn page   Esc/q cancel"
+        } else if output.applied && output.ok {
+            "? help   Enter/Esc/q return   Up/Down scroll   PgUp/PgDn page   Home/End top/bottom"
         } else {
-            "? help   r rerun   Up/Down scroll   PgUp/PgDn page   Home/End top/bottom   Esc back"
+            "? help   Enter/Esc/q return   r rerun   Up/Down scroll   PgUp/PgDn page   Home/End"
         };
         put_line(
             out,
@@ -2628,6 +3100,10 @@ fn handle_prompt_key(key: KeyEvent, prompt: &mut Prompt) -> Control {
 fn handle_output_key(key: KeyEvent, output: &mut OutputView) -> Control {
     match key.code {
         KeyCode::Esc | KeyCode::Char('q') => return Control::OutputBack,
+        KeyCode::Enter if !output.can_apply => return Control::OutputBack,
+        KeyCode::Enter | KeyCode::Char('a') if output.can_apply => {
+            return Control::Apply(output.spec.clone());
+        }
         KeyCode::Up | KeyCode::Char('k') => {
             output.scroll.set(output.scroll.get().saturating_sub(1));
         }
@@ -2642,10 +3118,9 @@ fn handle_output_key(key: KeyEvent, output: &mut OutputView) -> Control {
             .set(output.scroll.get().saturating_add(page_rows())),
         KeyCode::Home | KeyCode::Char('g') => output.scroll.set(0),
         KeyCode::End | KeyCode::Char('G') => output.scroll.set(usize::MAX / 2),
-        KeyCode::Enter | KeyCode::Char('a') if output.can_apply => {
-            return Control::Apply(output.spec.clone());
+        KeyCode::Char('r') if !(output.applied && output.ok) => {
+            return Control::Run(output.spec.clone());
         }
-        KeyCode::Char('r') => return Control::Run(output.spec.clone()),
         _ => {}
     }
     Control::Continue
@@ -2905,13 +3380,25 @@ impl Prompt {
     }
 }
 
-fn session_list_args(browser: &ListBrowser) -> Vec<String> {
+fn session_list_args(
+    browser: &ListBrowser,
+    project_id: Option<&str>,
+    parent_id: Option<&str>,
+) -> Vec<String> {
     let mut args = vec![
         "session".to_string(),
         "list".to_string(),
         "--limit".to_string(),
         SESSION_LIST_LIMIT.to_string(),
     ];
+    if let Some(project) = project_id {
+        args.push("--project".to_string());
+        args.push(project.to_string());
+    }
+    if let Some(parent) = parent_id {
+        args.push("--parent".to_string());
+        args.push(parent.to_string());
+    }
     if let Some((_, Some(sort))) = SESSION_SORTS.get(browser.sort) {
         args.push("--sort".to_string());
         args.push((*sort).to_string());
@@ -3012,6 +3499,7 @@ fn session_show_spec(row: &Value) -> Option<RunSpec> {
             id,
         ],
         safety: Safety::ReadOnly,
+        output: OutputKind::Text,
     })
 }
 
@@ -3024,6 +3512,7 @@ fn session_delete_spec(row: &Value) -> Option<RunSpec> {
         label: format!("Delete session {}", short_id(&id)),
         args: vec!["session".into(), "delete".into(), id],
         safety: Safety::Confirm,
+        output: OutputKind::DeleteReport(DeleteKind::Session),
     })
 }
 
@@ -3036,6 +3525,7 @@ fn project_show_spec(row: &Value) -> Option<RunSpec> {
         label: format!("Project {}", project_label(row)),
         args: vec!["project".into(), "show".into(), id],
         safety: Safety::ReadOnly,
+        output: OutputKind::Text,
     })
 }
 
@@ -3048,6 +3538,7 @@ fn project_delete_spec(row: &Value) -> Option<RunSpec> {
         label: format!("Delete project {}", project_label(row)),
         args: vec!["project".into(), "delete".into(), id],
         safety: Safety::Confirm,
+        output: OutputKind::DeleteReport(DeleteKind::Project),
     })
 }
 
@@ -3060,6 +3551,7 @@ fn kv_show_spec(row: &Value) -> Option<RunSpec> {
         label: format!("KV {}", truncate_width(&key, 32).0),
         args: vec!["kv".into(), "show".into(), key],
         safety: Safety::ReadOnly,
+        output: OutputKind::Text,
     })
 }
 
@@ -3072,6 +3564,7 @@ fn kv_delete_spec(row: &Value) -> Option<RunSpec> {
         label: format!("Delete KV {}", truncate_width(&key, 32).0),
         args: vec!["kv".into(), "delete".into(), key],
         safety: Safety::Confirm,
+        output: OutputKind::DeleteReport(DeleteKind::Kv),
     })
 }
 
@@ -3085,9 +3578,10 @@ fn backup_restore_spec(row: &Value, db_path: &Path) -> Option<RunSpec> {
         args: vec![
             "backup".into(),
             "restore".into(),
-            db_path.with_file_name(&file).display().to_string(),
+            crate::db::db_dir(db_path).join(&file).display().to_string(),
         ],
         safety: Safety::Confirm,
+        output: OutputKind::Text,
     })
 }
 
@@ -3100,6 +3594,7 @@ fn backup_delete_spec(row: &Value) -> Option<RunSpec> {
         label: format!("Delete backup {}", truncate_width(&file, 40).0),
         args: vec!["backup".into(), "delete".into(), file],
         safety: Safety::Confirm,
+        output: OutputKind::DeleteReport(DeleteKind::BackupDelete),
     })
 }
 
@@ -3239,13 +3734,65 @@ fn session_header_text(width: usize, sort: usize) -> String {
     )
 }
 
-fn session_row_text(row: &Value, width: usize, sort: usize) -> String {
-    let fixed = 12 + 10 + 10 + 3;
-    let title_width = width.saturating_sub(fixed);
+fn session_short_label(row: &Value) -> String {
+    let title = row_str(row, "title");
+    let trimmed = title.trim();
+    if trimmed.is_empty() {
+        short_id(&row_str(row, "id"))
+    } else {
+        truncate_width(trimmed, 28).0
+    }
+}
+
+fn visible_session_list(sb: &SessionBrowser) -> Vec<&Value> {
+    sb.list
+        .rows
+        .iter()
+        .filter(|row| {
+            if sb.top_level_only && sb.parents.is_empty() {
+                row_str(row, "parent_id").is_empty()
+            } else {
+                true
+            }
+        })
+        .collect()
+}
+
+fn session_rows_and_children(sb: &SessionBrowser) -> (Vec<&Value>, HashMap<String, usize>) {
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    for row in &sb.list.rows {
+        let parent = row_str(row, "parent_id");
+        if !parent.is_empty() {
+            *counts.entry(parent).or_insert(0) += 1;
+        }
+    }
+    (visible_session_list(sb), counts)
+}
+
+fn session_display_title(row: &Value, child_count: usize, mark_subagent: bool) -> String {
     let mut title = row_str(row, "title");
     if title.trim().is_empty() {
         title = "(untitled)".to_string();
     }
+    let is_sub = mark_subagent && !row_str(row, "parent_id").is_empty();
+    match (is_sub, child_count) {
+        (true, n) if n > 0 => format!("[sub +{n}] {title}"),
+        (true, _) => format!("[sub] {title}"),
+        (false, n) if n > 0 => format!("[+{n} sub] {title}"),
+        (false, _) => title,
+    }
+}
+
+fn session_row_text_with(
+    row: &Value,
+    width: usize,
+    sort: usize,
+    child_count: usize,
+    mark_subagent: bool,
+) -> String {
+    let fixed = 12 + 10 + 10 + 3;
+    let title_width = width.saturating_sub(fixed);
+    let title = session_display_title(row, child_count, mark_subagent);
     format!(
         "{} {} {} {}",
         fit_cell(&short_id(&row_str(row, "id")), 12),
@@ -3253,6 +3800,32 @@ fn session_row_text(row: &Value, width: usize, sort: usize) -> String {
         fit_right(&row_age(row), 10),
         fit_right(&session_metric(row, sort), 10)
     )
+}
+
+fn session_summary(sb: &SessionBrowser, total: usize) -> String {
+    let selected = if total == 0 { 0 } else { sb.list.selected + 1 };
+    let loaded = sb.list.rows.len();
+    let noun = if sb.parents.is_empty() {
+        "sessions"
+    } else {
+        "subagents"
+    };
+    let mut parts = vec![format!("{total} {noun}")];
+    if sb.top_level_only && sb.parents.is_empty() {
+        parts.push(format!("top-level only ({loaded} total)"));
+    }
+    if loaded == SESSION_LIST_LIMIT {
+        parts.push(format!("first {SESSION_LIST_LIMIT}"));
+    }
+    if !sb.list.filter.is_empty() {
+        parts.push(format!("filter \"{}\"", sb.list.filter));
+    }
+    if !sb.list.older_than.is_empty() {
+        parts.push(format!("older than {}", sb.list.older_than));
+    }
+    parts.push(format!("sort {}", SESSION_SORTS[sb.list.sort].0));
+    parts.push(format!("{selected}/{total}"));
+    parts.join("  ·  ")
 }
 
 fn project_header_text(width: usize) -> String {
@@ -3351,7 +3924,7 @@ fn field_lines(label: &str, value: &str, width: usize) -> Vec<Line> {
         .collect()
 }
 
-fn session_detail_lines(row: &Value, width: usize) -> Vec<Line> {
+fn session_detail_lines_with(row: &Value, width: usize, child_count: usize) -> Vec<Line> {
     let mut lines = field_lines("Title", &row_str(row, "title"), width);
     lines.extend(field_lines("ID", &row_str(row, "id"), width));
     lines.extend(field_lines("Directory", &row_str(row, "directory"), width));
@@ -3392,6 +3965,12 @@ fn session_detail_lines(row: &Value, width: usize) -> Vec<Line> {
         if parent.is_empty() { "-" } else { &parent },
         width,
     ));
+    let subagents = if child_count > 0 {
+        format!("{child_count} loaded (press u to open)")
+    } else {
+        "-".to_string()
+    };
+    lines.extend(field_lines("Subagents", &subagents, width));
     lines.extend(field_lines(
         "Archived",
         if row_bool(row, "archived") {
@@ -3401,6 +3980,16 @@ fn session_detail_lines(row: &Value, width: usize) -> Vec<Line> {
         },
         width,
     ));
+    lines.push(Line::from(vec![]));
+    lines.push(Line::from(vec![
+        Span::new("Press "),
+        Span::new("Enter").bold(),
+        Span::new(" to view; "),
+        Span::new("u").bold(),
+        Span::new(" opens subagents; "),
+        Span::new("d").bold(),
+        Span::new(" deletes."),
+    ]));
     lines
 }
 
@@ -3447,6 +4036,16 @@ fn project_detail_lines(row: &Value, width: usize) -> Vec<Line> {
         &format!("{} ({})", row_age(row), row_str(row, "updated")),
         width,
     ));
+    lines.push(Line::from(vec![]));
+    lines.push(Line::from(vec![
+        Span::new("Press "),
+        Span::new("Enter").bold(),
+        Span::new(" to open sessions; "),
+        Span::new("v").bold(),
+        Span::new(" views summary; "),
+        Span::new("d").bold(),
+        Span::new(" deletes."),
+    ]));
     lines
 }
 
@@ -3509,7 +4108,7 @@ fn backup_detail_lines(row: &Value, width: usize) -> Vec<Line> {
 
 fn page_rows() -> usize {
     terminal::size()
-        .map(|(_, height)| (height as usize).saturating_sub(7).max(1))
+        .map(|(_, height)| (height as usize).saturating_sub(8).max(1))
         .unwrap_or(10)
 }
 
@@ -3557,11 +4156,77 @@ fn help_heading(topic: HelpTopic) -> (&'static str, &'static str) {
             "run a command, with a preview for destructive actions",
         ),
         HelpTopic::Sessions => ("Sessions", "browse, inspect, and clean up sessions"),
-        HelpTopic::Projects => ("Projects", "browse, inspect, and clean up projects"),
+        HelpTopic::ProjectSessions => (
+            "Project sessions",
+            "browse sessions and subagents in the selected project",
+        ),
+        HelpTopic::Projects => ("Projects", "open a project's sessions or clean up projects"),
         HelpTopic::Kv => ("KV cache", "browse, inspect, and purge global kv entries"),
         HelpTopic::Backups => ("Backups", "restore, verify, and prune backup files"),
-        HelpTopic::Output => ("Result view", "read output and apply a preview"),
+        HelpTopic::Output => ("Result view", "read output, apply previews, or return"),
     }
+}
+
+fn session_help_rows(project_scoped: bool) -> Vec<HelpRow> {
+    use HelpRow::{Heading, Item, Note};
+    let mut rows = vec![
+        Heading("Move around"),
+        Item("Up/Down, j/k", "move the session selection"),
+        Item("PgUp/PgDn", "jump one page"),
+        Item("Home/End, g/G", "jump to the first or last session"),
+        Item("Enter", "open the session detail and messages"),
+        Item("u / >", "open direct subagents of the selected session"),
+        Item(
+            "Esc / Bksp",
+            if project_scoped {
+                "step back to the parent session or project list"
+            } else {
+                "step back from subagents (or quit at top level)"
+            },
+        ),
+    ];
+    if project_scoped {
+        rows.push(Item("v", "show summary and impact for this project"));
+    }
+    rows.extend([
+        Heading("Filter and sort"),
+        Item("/", "filter by title or directory"),
+        Item(
+            "o",
+            "show only sessions older than an age (for example 30d)",
+        ),
+        Item("s", "cycle the sort key: updated, size, cost, messages"),
+        Item("t", "toggle top-level sessions only vs all sessions"),
+        Item("c", "clear the filter and age limit"),
+        Item("r", "reload the list"),
+        Item("R", "refresh database and service status"),
+    ]);
+    if !project_scoped {
+        rows.push(Item("F", "search message content"));
+    }
+    rows.extend([
+        Heading("Clean up"),
+        Item("d", "delete the selected session (preview first)"),
+    ]);
+    if !project_scoped {
+        rows.push(Item("P", "purge sessions older than an age"));
+        rows.push(Item("S", "strip reasoning older than an age"));
+    }
+    rows.extend([
+        Item("? / F1", "show this help"),
+        Item(
+            "q / Esc",
+            if project_scoped {
+                "step back one level (Ctrl+C quits)"
+            } else {
+                "step back from subagents or quit"
+            },
+        ),
+        Note(
+            "Destructive actions show a dry-run preview first; Enter or a in the result view applies it, and Esc leaves the database unchanged.",
+        ),
+    ]);
+    rows
 }
 
 fn help_rows(topic: HelpTopic) -> Vec<HelpRow> {
@@ -3585,36 +4250,15 @@ fn help_rows(topic: HelpTopic) -> Vec<HelpRow> {
                 "A dry-run preview is always shown first. Press Enter or a in the result view to apply it, r to preview again, or Esc to go back without changing anything.",
             ),
         ],
-        HelpTopic::Sessions => vec![
-            Heading("Move around"),
-            Item("Up/Down, j/k", "move the session selection"),
-            Item("PgUp/PgDn", "jump one page"),
-            Item("Home/End, g/G", "jump to the first or last session"),
-            Item("Enter", "open the session detail and messages"),
-            Heading("Filter and sort"),
-            Item("/", "filter by title or directory"),
-            Item("o", "show only sessions older than an age (for example 30d)"),
-            Item("s", "cycle the sort key: updated, size, cost, messages"),
-            Item("c", "clear the filter and age limit"),
-            Item("r", "reload the list"),
-            Item("R", "refresh database and service status"),
-            Item("F", "search message content"),
-            Heading("Clean up"),
-            Item("d", "delete the selected session (preview first)"),
-            Item("P", "purge sessions older than an age"),
-            Item("S", "strip reasoning older than an age"),
-            Item("? / F1", "show this help"),
-            Item("q / Esc", "quit the TUI"),
-            Note(
-                "Destructive actions show a dry-run preview first; Enter or a in the result view applies it, and Esc leaves the database unchanged.",
-            ),
-        ],
+        HelpTopic::Sessions => session_help_rows(false),
+        HelpTopic::ProjectSessions => session_help_rows(true),
         HelpTopic::Projects => vec![
             Heading("Move around"),
             Item("Up/Down, j/k", "move the project selection"),
             Item("PgUp/PgDn", "jump one page"),
             Item("Home/End, g/G", "jump to the first or last project"),
-            Item("Enter", "open the project detail"),
+            Item("Enter", "open sessions belonging to the selected project"),
+            Item("v", "open the project summary and storage impact"),
             Heading("Filter and sort"),
             Item("/", "filter by id, worktree, or name"),
             Item("o", "show only projects older than an age (for example 90d)"),
@@ -3686,12 +4330,13 @@ fn help_rows(topic: HelpTopic) -> Vec<HelpRow> {
             Item("PgUp/PgDn", "scroll one page"),
             Item("Home/End, g/G", "jump to the top or bottom"),
             Heading("Next steps"),
-            Item("Enter / a", "apply the preview, when one is available"),
-            Item("r", "run the preview again"),
+            Item("Enter", "apply a pending preview, or return once done"),
+            Item("a", "apply the preview, when one is available"),
+            Item("r", "run the preview again (disabled after applied)"),
             Item("? / F1", "show this help"),
             Item("Esc / q", "return to the menu"),
             Note(
-                "The command line and exit status are shown at the top. Applied commands refresh the session, project, kv, and backup lists automatically.",
+                "The command status badge is shown at the top. Applied commands refresh the session, project, kv, and backup lists automatically.",
             ),
         ],
     }
@@ -3745,6 +4390,7 @@ fn action_spec(action: &'static Action, input: Option<&str>) -> RunSpec {
         label: action.label.to_string(),
         args,
         safety: action.safety,
+        output: action.output,
     }
 }
 
@@ -4034,12 +4680,595 @@ fn take_prefix_width(text: &str, max: usize) -> &str {
     &text[..end]
 }
 
-fn wrapped_body(body: &str, width: usize) -> Vec<String> {
-    let mut out = Vec::new();
-    for line in body.split('\n') {
-        out.extend(wrap_line(line, width));
+fn combine_plain_output(stdout: &str, stderr: &str) -> String {
+    let stdout = stdout.trim_end_matches('\n');
+    let stderr = stderr.trim();
+    match (stdout.is_empty(), stderr.is_empty()) {
+        (true, true) => String::new(),
+        (false, true) => stdout.to_string(),
+        (true, false) => stderr.to_string(),
+        (false, false) => format!("{stdout}\n\n{stderr}"),
     }
-    out
+}
+
+fn row_nonneg_i64(row: &Value, key: &str) -> Option<i64> {
+    row.get(key).and_then(|v| {
+        v.as_i64()
+            .or_else(|| v.as_u64().map(|n| n.min(i64::MAX as u64) as i64))
+    })
+}
+
+fn merge_row_counts(totals: &mut Vec<(String, i64)>, map: &serde_json::Map<String, Value>) {
+    for (table, value) in map {
+        let count = value
+            .as_i64()
+            .or_else(|| value.as_u64().map(|n| n.min(i64::MAX as u64) as i64))
+            .unwrap_or(0);
+        if count <= 0 {
+            continue;
+        }
+        if let Some((_, existing)) = totals.iter_mut().find(|(name, _)| name == table) {
+            *existing += count;
+        } else {
+            totals.push((table.clone(), count));
+        }
+    }
+}
+
+fn format_non_zero_pairs(pairs: &[(String, i64)]) -> String {
+    pairs
+        .iter()
+        .filter(|(_, count)| *count > 0)
+        .map(|(table, count)| format!("{table} {count}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn non_zero_table_summary(map: &serde_json::Map<String, Value>) -> String {
+    let mut pairs = Vec::new();
+    merge_row_counts(&mut pairs, map);
+    format_non_zero_pairs(&pairs)
+}
+
+fn parse_delete_report(kind: DeleteKind, stdout: &str) -> Option<DeleteReport> {
+    let val: Value = serde_json::from_str(stdout.trim()).ok()?;
+    let note = val.get("note").and_then(Value::as_str).map(str::to_string);
+    match kind {
+        DeleteKind::Session => {
+            let total_rows = row_nonneg_i64(&val, "total_rows")?;
+            let sessions = val.get("sessions").and_then(Value::as_array)?;
+            let mut totals = Vec::new();
+            let mut items = Vec::with_capacity(sessions.len());
+            for session in sessions {
+                let id = row_str(session, "id");
+                let total = row_nonneg_i64(session, "total").unwrap_or(0);
+                let detail = if let Some(rows_map) = session.get("rows").and_then(Value::as_object)
+                {
+                    merge_row_counts(&mut totals, rows_map);
+                    let breakdown = non_zero_table_summary(rows_map);
+                    if breakdown.is_empty() {
+                        format!("{total} rows")
+                    } else {
+                        format!("{total} rows ({breakdown})")
+                    }
+                } else {
+                    format!("{total} rows")
+                };
+                items.push(DeleteReportItem {
+                    primary: id,
+                    detail,
+                });
+            }
+            let exports = val.get("exports").and_then(|exp| {
+                let dir = exp.get("dir").and_then(Value::as_str)?.to_string();
+                let sessions = exp.get("sessions").and_then(Value::as_u64)? as usize;
+                let bytes = exp.get("bytes").and_then(Value::as_u64)?;
+                let dry_run = exp.get("dry_run").and_then(Value::as_bool).unwrap_or(false);
+                Some(DeleteExportInfo {
+                    dir,
+                    sessions,
+                    bytes,
+                    dry_run,
+                })
+            });
+            Some(DeleteReport {
+                kind,
+                items,
+                total_rows,
+                total_bytes: 0,
+                failed: 0,
+                summary_breakdown: format_non_zero_pairs(&totals),
+                note,
+                exports,
+                extra_stderr: None,
+            })
+        }
+        DeleteKind::Project => {
+            let total_rows = row_nonneg_i64(&val, "total_rows")?;
+            let projects = val.get("projects").and_then(Value::as_array)?;
+            let summary_breakdown = val
+                .get("rows")
+                .and_then(Value::as_object)
+                .map(non_zero_table_summary)
+                .unwrap_or_default();
+            let items = projects
+                .iter()
+                .map(|project| {
+                    let id = row_str(project, "id");
+                    let worktree = row_str(project, "worktree");
+                    let (primary, detail) = if worktree.is_empty() {
+                        (id, String::new())
+                    } else {
+                        (worktree, format!("id {id}"))
+                    };
+                    DeleteReportItem { primary, detail }
+                })
+                .collect();
+            Some(DeleteReport {
+                kind,
+                items,
+                total_rows,
+                total_bytes: 0,
+                failed: 0,
+                summary_breakdown,
+                note,
+                exports: None,
+                extra_stderr: None,
+            })
+        }
+        DeleteKind::Kv => {
+            let total_bytes = row_nonneg_i64(&val, "total_bytes")?;
+            let keys = val.get("keys").and_then(Value::as_array)?;
+            let items = keys
+                .iter()
+                .map(|entry| DeleteReportItem {
+                    primary: row_str(entry, "key"),
+                    detail: output::human_bytes(row_nonneg_i64(entry, "bytes").unwrap_or(0)),
+                })
+                .collect();
+            Some(DeleteReport {
+                kind,
+                items,
+                total_rows: 0,
+                total_bytes,
+                failed: 0,
+                summary_breakdown: String::new(),
+                note,
+                exports: None,
+                extra_stderr: None,
+            })
+        }
+        DeleteKind::BackupDelete => {
+            let total_bytes = row_nonneg_i64(&val, "total_bytes")?;
+            let files = val.get("files").and_then(Value::as_array)?;
+            let failed = val.get("failed").and_then(Value::as_u64).unwrap_or(0);
+            let items = files
+                .iter()
+                .map(|entry| DeleteReportItem {
+                    primary: row_str(entry, "file"),
+                    detail: output::human_bytes(row_nonneg_i64(entry, "bytes").unwrap_or(0)),
+                })
+                .collect();
+            Some(DeleteReport {
+                kind,
+                items,
+                total_rows: 0,
+                total_bytes,
+                failed,
+                summary_breakdown: String::new(),
+                note,
+                exports: None,
+                extra_stderr: None,
+            })
+        }
+        DeleteKind::BackupPrune => {
+            let total_bytes = row_nonneg_i64(&val, "total_bytes")?;
+            let removed = val.get("removed").and_then(Value::as_array)?;
+            let failed = val.get("failed").and_then(Value::as_u64).unwrap_or(0);
+            let items = removed
+                .iter()
+                .map(|entry| {
+                    let bytes = output::human_bytes(row_nonneg_i64(entry, "bytes").unwrap_or(0));
+                    let created = row_str(entry, "created");
+                    let detail = if created.is_empty() {
+                        bytes
+                    } else {
+                        format!("{bytes}, {created}")
+                    };
+                    DeleteReportItem {
+                        primary: row_str(entry, "file"),
+                        detail,
+                    }
+                })
+                .collect();
+            Some(DeleteReport {
+                kind,
+                items,
+                total_rows: 0,
+                total_bytes,
+                failed,
+                summary_breakdown: String::new(),
+                note,
+                exports: None,
+                extra_stderr: None,
+            })
+        }
+    }
+}
+
+fn push_wrapped_span_lines(
+    lines: &mut Vec<Line>,
+    text: &str,
+    width: usize,
+    color: Option<Color>,
+    bold: bool,
+    dim: bool,
+) {
+    for chunk in wrap_words(text, width) {
+        let mut span = Span::new(chunk);
+        if let Some(c) = color {
+            span = span.fg(c);
+        }
+        if bold {
+            span = span.bold();
+        }
+        if dim {
+            span = span.dim();
+        }
+        lines.push(Line::from(vec![span]));
+    }
+}
+
+fn push_report_field(
+    lines: &mut Vec<Line>,
+    label: &str,
+    value: &str,
+    width: usize,
+    color: Option<Color>,
+    bold: bool,
+) {
+    let label_width = 14usize.min(width.saturating_sub(8)).max(4);
+    let prefix = format!("{:<w$} ", label, w = label_width);
+    let indent = display_width(&prefix);
+    let value_width = width.saturating_sub(indent).max(1);
+    let text = if value.is_empty() { "-" } else { value };
+    for (index, chunk) in wrap_words(text, value_width).into_iter().enumerate() {
+        let mut val_span = Span::new(chunk);
+        if let Some(c) = color {
+            val_span = val_span.fg(c);
+        }
+        if bold {
+            val_span = val_span.bold();
+        }
+        let head = if index == 0 {
+            Span::new(fit_cell(label, label_width) + " ").dim()
+        } else {
+            Span::new(" ".repeat(indent))
+        };
+        lines.push(Line::from(vec![head, val_span]));
+    }
+}
+
+impl DeleteReport {
+    fn item_count(&self) -> usize {
+        self.items.len()
+    }
+
+    fn noun(&self) -> (&'static str, &'static str) {
+        match self.kind {
+            DeleteKind::Session => ("session", "sessions"),
+            DeleteKind::Project => ("project", "projects"),
+            DeleteKind::Kv => ("KV entry", "KV entries"),
+            DeleteKind::BackupDelete | DeleteKind::BackupPrune => ("backup file", "backup files"),
+        }
+    }
+
+    fn headline(&self, applied: bool, nothing_to_delete: bool) -> (String, Color) {
+        if nothing_to_delete || self.items.is_empty() {
+            return ("Nothing matched to delete.".to_string(), Color::Yellow);
+        }
+        let (singular, plural) = self.noun();
+        let count = self.items.len();
+        let unit = if count == 1 { singular } else { plural };
+        if applied {
+            if self.failed > 0 {
+                let succeeded = count.saturating_sub(self.failed as usize);
+                let ok_unit = if succeeded == 1 { singular } else { plural };
+                (
+                    format!("Deleted {succeeded} {ok_unit}, {} failed.", self.failed),
+                    Color::Yellow,
+                )
+            } else if matches!(self.kind, DeleteKind::Session | DeleteKind::Project) {
+                (
+                    format!(
+                        "Deleted {count} {unit} ({} database rows removed).",
+                        self.total_rows
+                    ),
+                    Color::Green,
+                )
+            } else {
+                (
+                    format!(
+                        "Deleted {count} {unit} ({} freed).",
+                        output::human_bytes(self.total_bytes)
+                    ),
+                    Color::Green,
+                )
+            }
+        } else if matches!(self.kind, DeleteKind::Session | DeleteKind::Project) {
+            (
+                format!(
+                    "Preview only: {count} {unit} would be deleted ({} database rows). No changes made yet.",
+                    self.total_rows
+                ),
+                Color::Yellow,
+            )
+        } else {
+            (
+                format!(
+                    "Preview only: {count} {unit} would be deleted ({}). No changes made yet.",
+                    output::human_bytes(self.total_bytes)
+                ),
+                Color::Yellow,
+            )
+        }
+    }
+
+    fn render_lines(
+        &self,
+        width: usize,
+        applied: bool,
+        can_apply: bool,
+        nothing_to_delete: bool,
+    ) -> Vec<Line> {
+        let width = width.max(1);
+        let mut lines = Vec::new();
+        let (headline, headline_color) = self.headline(applied, nothing_to_delete);
+        push_wrapped_span_lines(
+            &mut lines,
+            &headline,
+            width,
+            Some(headline_color),
+            true,
+            false,
+        );
+
+        if applied && self.failed == 0 && !self.items.is_empty() {
+            push_wrapped_span_lines(
+                &mut lines,
+                "Complete. Press Enter or Esc to return to the updated list.",
+                width,
+                Some(Color::Green),
+                false,
+                false,
+            );
+        } else if applied && self.failed > 0 {
+            push_wrapped_span_lines(
+                &mut lines,
+                "Completed with warnings. Review the note or messages below, then press Enter or Esc to return.",
+                width,
+                Some(Color::Yellow),
+                false,
+                false,
+            );
+        } else if can_apply {
+            push_wrapped_span_lines(
+                &mut lines,
+                "Press Enter or a to confirm deletion, or Esc to cancel without changing anything.",
+                width,
+                None,
+                true,
+                false,
+            );
+        } else if nothing_to_delete || self.items.is_empty() {
+            push_wrapped_span_lines(
+                &mut lines,
+                "No matching items exist. Press Enter or Esc to return.",
+                width,
+                None,
+                false,
+                true,
+            );
+        }
+
+        let has_stats = self.total_rows > 0
+            || !self.summary_breakdown.is_empty()
+            || self.total_bytes > 0
+            || self.failed > 0
+            || self.exports.is_some();
+        if has_stats {
+            lines.push(Line::from(vec![]));
+            if self.total_rows > 0 {
+                push_report_field(
+                    &mut lines,
+                    "Database rows",
+                    &self.total_rows.to_string(),
+                    width,
+                    None,
+                    false,
+                );
+            }
+            if !self.summary_breakdown.is_empty() {
+                push_report_field(
+                    &mut lines,
+                    "Tables",
+                    &self.summary_breakdown,
+                    width,
+                    None,
+                    false,
+                );
+            }
+            if self.total_bytes > 0 {
+                let bytes_label = if applied {
+                    "Space freed"
+                } else {
+                    "Space to free"
+                };
+                push_report_field(
+                    &mut lines,
+                    bytes_label,
+                    &output::human_bytes(self.total_bytes),
+                    width,
+                    None,
+                    false,
+                );
+            }
+            if self.failed > 0 {
+                push_report_field(
+                    &mut lines,
+                    "Failed",
+                    &self.failed.to_string(),
+                    width,
+                    Some(Color::Red),
+                    true,
+                );
+            }
+            if let Some(exports) = &self.exports {
+                let label = if exports.dry_run {
+                    "Would export"
+                } else {
+                    "Exported"
+                };
+                push_report_field(
+                    &mut lines,
+                    label,
+                    &format!(
+                        "{} session(s) ({}) -> {}",
+                        exports.sessions,
+                        output::human_bytes(exports.bytes as i64),
+                        exports.dir
+                    ),
+                    width,
+                    None,
+                    false,
+                );
+            }
+        }
+
+        if let Some(note) = &self.note {
+            let trimmed = note.trim();
+            if !trimmed.is_empty() && (applied || !trimmed.contains("--yes")) {
+                if !has_stats {
+                    lines.push(Line::from(vec![]));
+                }
+                push_report_field(&mut lines, "Note", trimmed, width, None, false);
+            }
+        }
+
+        if !self.items.is_empty() {
+            lines.push(Line::from(vec![]));
+            let heading = if applied {
+                format!("Removed items ({})", self.items.len())
+            } else {
+                format!("Affected items ({})", self.items.len())
+            };
+            lines.push(Line::from(vec![Span::new(heading).fg(Color::Cyan).bold()]));
+            for item in &self.items {
+                let single_line = !item.detail.is_empty()
+                    && display_width(&item.primary) + 6 + display_width(&item.detail) <= width;
+                if single_line {
+                    lines.push(Line::from(vec![
+                        Span::new("  * ").dim(),
+                        Span::new(item.primary.clone()),
+                        Span::new("  "),
+                        Span::new(item.detail.clone()).dim(),
+                    ]));
+                } else {
+                    let body_width = width.saturating_sub(4).max(1);
+                    for (idx, chunk) in wrap_words(&item.primary, body_width)
+                        .into_iter()
+                        .enumerate()
+                    {
+                        let prefix = if idx == 0 { "  * " } else { "    " };
+                        lines.push(Line::from(vec![Span::new(prefix).dim(), Span::new(chunk)]));
+                    }
+                    if !item.detail.is_empty() {
+                        for chunk in wrap_words(&item.detail, body_width) {
+                            lines.push(Line::from(vec![Span::new("    "), Span::new(chunk).dim()]));
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Some(stderr) = &self.extra_stderr {
+            lines.push(Line::from(vec![]));
+            lines.push(Line::from(vec![Span::new("Messages")
+                .fg(Color::Yellow)
+                .bold()]));
+            for raw in stderr.lines() {
+                push_wrapped_span_lines(&mut lines, raw, width, None, false, true);
+            }
+        }
+        lines
+    }
+}
+
+impl OutputView {
+    fn status_badge(&self) -> (&'static str, Color) {
+        if !self.ok {
+            return ("FAILED", Color::Red);
+        }
+        if self.applied {
+            return match &self.content {
+                OutputContent::Delete(report) if report.item_count() == 0 => {
+                    ("NO CHANGES", Color::Yellow)
+                }
+                OutputContent::Delete(report) if report.failed > 0 => ("PARTIAL", Color::Yellow),
+                OutputContent::Delete(_) => ("DELETED", Color::Green),
+                OutputContent::Plain(_) => ("APPLIED", Color::Green),
+            };
+        }
+        if self.nothing_to_delete {
+            return ("NO CHANGES", Color::Yellow);
+        }
+        if self.can_apply {
+            return ("PREVIEW", Color::Yellow);
+        }
+        if self.preview_only && self.spec.safety == Safety::Confirm {
+            return ("PREVIEW ONLY", Color::Yellow);
+        }
+        ("OK", Color::Green)
+    }
+
+    fn back_status(&self) -> String {
+        if self.applied && self.ok {
+            match &self.content {
+                OutputContent::Delete(report) => report.headline(true, self.nothing_to_delete).0,
+                OutputContent::Plain(_) => format!("{} · applied", self.spec.label),
+            }
+        } else if self.applied {
+            format!("{} · apply failed", self.spec.label)
+        } else if !self.ok {
+            format!("{} · failed", self.spec.label)
+        } else if self.can_apply || (self.preview_only && self.spec.safety == Safety::Confirm) {
+            format!("{} · preview cancelled (no changes)", self.spec.label)
+        } else if self.nothing_to_delete {
+            format!("{} · nothing to delete", self.spec.label)
+        } else {
+            format!("{} · done", self.spec.label)
+        }
+    }
+
+    fn render_lines(&self, width: usize) -> Vec<Line> {
+        match &self.content {
+            OutputContent::Plain(body) => {
+                if body.trim().is_empty() {
+                    return vec![Line::from(vec![Span::new("(no output)").dim()])];
+                }
+                let mut lines = Vec::new();
+                for raw in body.split('\n') {
+                    for chunk in wrap_line(raw, width) {
+                        lines.push(Line::from(vec![Span::new(chunk)]));
+                    }
+                }
+                lines
+            }
+            OutputContent::Delete(report) => {
+                report.render_lines(width, self.applied, self.can_apply, self.nothing_to_delete)
+            }
+        }
+    }
 }
 
 /// Drop the CLI's "to apply:" hint from previews; the TUI already shows an
@@ -4121,8 +5350,12 @@ mod tests {
                 }
             }
         }
-        assert!(matches!(CATEGORIES[1].kind, CategoryKind::Sessions));
-        assert!(matches!(CATEGORIES[2].kind, CategoryKind::Projects));
+        assert!(matches!(CATEGORIES[1].kind, CategoryKind::Projects));
+        assert!(matches!(CATEGORIES[2].kind, CategoryKind::Sessions));
+        assert_eq!(
+            action_named("Purge sessions older than").output,
+            OutputKind::DeleteReport(DeleteKind::Session)
+        );
     }
 
     #[test]
@@ -4272,6 +5505,7 @@ mod tests {
         for topic in [
             HelpTopic::Actions,
             HelpTopic::Sessions,
+            HelpTopic::ProjectSessions,
             HelpTopic::Projects,
             HelpTopic::Kv,
             HelpTopic::Backups,
@@ -4295,12 +5529,31 @@ mod tests {
             ..ListBrowser::default()
         };
         assert_eq!(
-            session_list_args(&browser),
+            session_list_args(&browser, None, None),
             vec![
                 "session",
                 "list",
                 "--limit",
                 "500",
+                "--sort",
+                "size",
+                "--search",
+                "needle",
+                "--older-than",
+                "30d",
+            ]
+        );
+        assert_eq!(
+            session_list_args(&browser, Some("proj_1"), Some("ses_parent")),
+            vec![
+                "session",
+                "list",
+                "--limit",
+                "500",
+                "--project",
+                "proj_1",
+                "--parent",
+                "ses_parent",
                 "--sort",
                 "size",
                 "--search",
@@ -4503,7 +5756,7 @@ mod tests {
             "size_bytes": 2048,
             "updated": "2023-11-14T22:13:20Z"
         });
-        let text = session_row_text(&row, 60, 0);
+        let text = session_row_text_with(&row, 60, 0, 0, true);
         assert_eq!(text.chars().count(), 60);
         assert!(text.contains("ses_012345"));
         assert!(text.contains("2.0 KB"));
@@ -4517,9 +5770,28 @@ mod tests {
             "parts": 34,
             "updated": "2023-11-14T22:13:20Z"
         });
-        assert_eq!(display_width(&session_row_text(&row, 60, 0)), 60);
-        assert!(session_row_text(&row, 60, 2).contains("$0.1250"));
-        assert!(session_row_text(&row, 60, 3).contains("12 / 34"));
+        assert_eq!(
+            display_width(&session_row_text_with(&row, 60, 0, 0, true)),
+            60
+        );
+        assert!(session_row_text_with(&row, 60, 2, 0, true).contains("$0.1250"));
+        assert!(session_row_text_with(&row, 60, 3, 0, true).contains("12 / 34"));
+        assert!(session_row_text_with(&row, 60, 0, 2, true).contains("[+2 sub]"));
+        assert_eq!(
+            display_width(&session_row_text_with(&row, 60, 0, 2, true)),
+            60
+        );
+
+        let sub = serde_json::json!({
+            "id": "ses_sub",
+            "parent_id": "ses_parent",
+            "title": "worker",
+            "size_bytes": 1024,
+            "updated": "2023-11-14T22:13:20Z"
+        });
+        assert!(session_row_text_with(&sub, 60, 0, 0, true).contains("[sub] worker"));
+        assert!(session_row_text_with(&sub, 60, 0, 3, true).contains("[sub +3] worker"));
+        assert!(!session_row_text_with(&sub, 60, 0, 0, false).contains("[sub]"));
         assert!(session_header_text(60, 2).contains("COST"));
         assert!(session_header_text(60, 3).contains("MSGS"));
     }
@@ -4605,6 +5877,345 @@ mod tests {
         assert_eq!(
             strip_apply_hint("preview\n  to apply: cmd --yes\n"),
             "preview"
+        );
+    }
+
+    fn line_text(line: &Line) -> String {
+        line.0.iter().map(|span| span.text.as_str()).collect()
+    }
+
+    #[test]
+    fn parse_delete_report_handles_all_variants_and_invalid_json() {
+        assert!(parse_delete_report(DeleteKind::Session, "not json").is_none());
+
+        let session_json = r#"{
+            "opencode_running": false,
+            "dry_run": true,
+            "total_rows": 18,
+            "sessions": [
+                {"id": "ses_1", "total": 12, "rows": {"session_v2": 1, "session_message": 4, "session_part": 7, "session_event": 0}},
+                {"id": "ses_2", "total": 6, "rows": {"session_v2": 1, "session_part": 5}}
+            ],
+            "deleted": false,
+            "note": "dry run: nothing deleted; re-run with --yes to delete",
+            "exports": {"dir": "/tmp/exports", "sessions": 2, "bytes": 4096, "dry_run": true}
+        }"#;
+        let report = parse_delete_report(DeleteKind::Session, session_json).unwrap();
+        assert_eq!(report.item_count(), 2);
+        assert_eq!(report.total_rows, 18);
+        assert_eq!(
+            report.summary_breakdown,
+            "session_v2 2, session_message 4, session_part 12"
+        );
+        assert_eq!(report.items[0].primary, "ses_1");
+        assert_eq!(
+            report.items[0].detail,
+            "12 rows (session_v2 1, session_message 4, session_part 7)"
+        );
+        assert_eq!(report.exports.as_ref().unwrap().sessions, 2);
+
+        let project_json = r#"{
+            "dry_run": false,
+            "total_rows": 25,
+            "projects": [{"id": "proj_1", "worktree": "/work/app"}],
+            "rows": {"project": 1, "session_v2": 4, "workspace": 0},
+            "deleted": true
+        }"#;
+        let report = parse_delete_report(DeleteKind::Project, project_json).unwrap();
+        assert_eq!(report.items.len(), 1);
+        assert_eq!(report.items[0].primary, "/work/app");
+        assert_eq!(report.items[0].detail, "id proj_1");
+        assert_eq!(report.summary_breakdown, "project 1, session_v2 4");
+
+        let kv_json = r#"{
+            "dry_run": false,
+            "keys": [{"key": "theme", "bytes": 2048}],
+            "total_bytes": 2048,
+            "deleted": true
+        }"#;
+        let report = parse_delete_report(DeleteKind::Kv, kv_json).unwrap();
+        assert_eq!(report.items[0].primary, "theme");
+        assert_eq!(report.items[0].detail, "2.0 KB");
+        assert_eq!(report.total_bytes, 2048);
+
+        let backup_del_json = r#"{
+            "dry_run": false,
+            "files": [{"file": "b1.db", "bytes": 1024}, {"file": "b2.db", "bytes": 1024}],
+            "total_bytes": 2048,
+            "deleted": true,
+            "failed": 1,
+            "note": "1 file(s) could not be removed"
+        }"#;
+        let report = parse_delete_report(DeleteKind::BackupDelete, backup_del_json).unwrap();
+        assert_eq!(report.failed, 1);
+        assert_eq!(report.items.len(), 2);
+
+        let backup_prune_json = r#"{
+            "dry_run": false,
+            "removed": [{"file": "old.db", "bytes": 4096, "created": "2024-01-01T00:00:00Z"}],
+            "total_files": 1,
+            "total_bytes": 4096,
+            "failed": 0,
+            "deleted": true
+        }"#;
+        let report = parse_delete_report(DeleteKind::BackupPrune, backup_prune_json).unwrap();
+        assert_eq!(report.items[0].primary, "old.db");
+        assert_eq!(report.items[0].detail, "4.0 KB, 2024-01-01T00:00:00Z");
+    }
+
+    #[test]
+    fn delete_report_lines_render_preview_completion_empty_and_wide_text() {
+        let report = parse_delete_report(
+            DeleteKind::Session,
+            r#"{
+                "total_rows": 18,
+                "sessions": [{"id": "ses_日本語テスト", "total": 18, "rows": {"session_v2": 1, "session_message": 17, "session_event": 0}}],
+                "note": "dry run: nothing deleted; re-run with --yes to delete"
+            }"#,
+        )
+        .unwrap();
+
+        let preview_lines = report.render_lines(44, false, true, false);
+        let preview_text: Vec<String> = preview_lines.iter().map(line_text).collect();
+        assert!(preview_text.iter().any(|l| l.starts_with("Preview only:")));
+        assert!(preview_text.iter().any(|l| l.contains("Enter or a")));
+        assert!(!preview_text.iter().any(|l| l.contains("--yes")));
+        assert!(!preview_text.iter().any(|l| l.contains("session_event")));
+        for line in &preview_lines {
+            assert!(display_width(&line_text(line)) <= 44);
+        }
+
+        let applied_lines = report.render_lines(60, true, false, false);
+        let applied_text: Vec<String> = applied_lines.iter().map(line_text).collect();
+        assert!(applied_text
+            .iter()
+            .any(|l| l.contains("Deleted 1 session (18 database rows removed).")));
+        assert!(applied_text
+            .iter()
+            .any(|l| l.contains("Complete. Press Enter or Esc")));
+
+        let empty = parse_delete_report(
+            DeleteKind::Project,
+            r#"{"total_rows": 0, "projects": [], "rows": {}}"#,
+        )
+        .unwrap();
+        let empty_text: Vec<String> = empty
+            .render_lines(60, false, false, true)
+            .iter()
+            .map(line_text)
+            .collect();
+        assert!(empty_text.iter().any(|l| l == "Nothing matched to delete."));
+    }
+
+    #[test]
+    fn output_view_keys_and_badges_reflect_completion_state() {
+        let spec = RunSpec {
+            label: "Delete session ses_1".to_string(),
+            args: vec!["session".into(), "delete".into(), "ses_1".into()],
+            safety: Safety::Confirm,
+            output: OutputKind::DeleteReport(DeleteKind::Session),
+        };
+        let report = parse_delete_report(
+            DeleteKind::Session,
+            r#"{"total_rows": 5, "sessions": [{"id": "ses_1", "total": 5, "rows": {"session_v2": 1}}]}"#,
+        )
+        .unwrap();
+
+        let mut preview = OutputView {
+            spec: spec.clone(),
+            command: "opencode-dbtool session delete ses_1 --dry-run".to_string(),
+            status: "exit 0 · 2 ms".to_string(),
+            ok: true,
+            content: OutputContent::Delete(report.clone()),
+            scroll: Cell::new(0),
+            can_apply: true,
+            nothing_to_delete: false,
+            preview_only: false,
+            applied: false,
+        };
+        assert_eq!(preview.status_badge(), ("PREVIEW", Color::Yellow));
+        assert!(matches!(
+            handle_output_key(
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                &mut preview
+            ),
+            Control::Apply(_)
+        ));
+        assert!(matches!(
+            handle_output_key(
+                KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE),
+                &mut preview
+            ),
+            Control::Run(_)
+        ));
+        assert!(preview.back_status().contains("preview cancelled"));
+
+        let mut applied = OutputView {
+            spec: spec.clone(),
+            command: "opencode-dbtool session delete ses_1 --yes".to_string(),
+            status: "exit 0 · 3 ms".to_string(),
+            ok: true,
+            content: OutputContent::Delete(report.clone()),
+            scroll: Cell::new(0),
+            can_apply: false,
+            nothing_to_delete: false,
+            preview_only: false,
+            applied: true,
+        };
+        assert_eq!(applied.status_badge(), ("DELETED", Color::Green));
+        assert!(matches!(
+            handle_output_key(
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                &mut applied
+            ),
+            Control::OutputBack
+        ));
+        assert!(matches!(
+            handle_output_key(
+                KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE),
+                &mut applied
+            ),
+            Control::Continue
+        ));
+        assert_eq!(
+            applied.back_status(),
+            "Deleted 1 session (5 database rows removed)."
+        );
+
+        let mut failed = OutputView {
+            spec,
+            command: "opencode-dbtool session delete ses_1 --yes".to_string(),
+            status: "exit 1 · 3 ms".to_string(),
+            ok: false,
+            content: OutputContent::Plain("locked".to_string()),
+            scroll: Cell::new(0),
+            can_apply: false,
+            nothing_to_delete: false,
+            preview_only: false,
+            applied: true,
+        };
+        assert_eq!(failed.status_badge(), ("FAILED", Color::Red));
+        assert!(matches!(
+            handle_output_key(
+                KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE),
+                &mut failed
+            ),
+            Control::Run(_)
+        ));
+        assert!(matches!(
+            handle_output_key(
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                &mut failed
+            ),
+            Control::OutputBack
+        ));
+    }
+
+    #[test]
+    fn session_rows_and_children_filter_top_level_and_count_subagents() {
+        let mut sb = SessionBrowser {
+            list: ListBrowser {
+                rows: vec![
+                    serde_json::json!({"id": "ses_root_1", "title": "Root 1"}),
+                    serde_json::json!({"id": "ses_child_1", "parent_id": "ses_root_1", "title": "Child 1"}),
+                    serde_json::json!({"id": "ses_grand_1", "parent_id": "ses_child_1", "title": "Grand 1"}),
+                    serde_json::json!({"id": "ses_root_2", "title": "Root 2"}),
+                ],
+                loaded: true,
+                ..ListBrowser::default()
+            },
+            parents: Vec::new(),
+            top_level_only: true,
+        };
+
+        let (visible, counts) = session_rows_and_children(&sb);
+        assert_eq!(visible.len(), 2);
+        assert_eq!(row_str(visible[0], "id"), "ses_root_1");
+        assert_eq!(row_str(visible[1], "id"), "ses_root_2");
+        assert_eq!(counts.get("ses_root_1"), Some(&1));
+        assert_eq!(counts.get("ses_child_1"), Some(&1));
+
+        sb.parents.push(SessionScope {
+            id: "ses_root_1".to_string(),
+            label: "Root 1".to_string(),
+            prev_selected: 0,
+            prev_filter: String::new(),
+            prev_older_than: String::new(),
+            prev_sort: 0,
+            prev_top_level_only: true,
+        });
+        let (inside_parent, _) = session_rows_and_children(&sb);
+        assert_eq!(inside_parent.len(), 4);
+    }
+
+    #[test]
+    fn staged_project_and_subagent_navigation_restores_previous_state() {
+        let cli = cli(&["opencode-dbtool", "tui"]);
+        let mut app = Tui::new(&cli, Path::new("nonexistent.db"));
+        app.tab = 1;
+        assert!(matches!(CATEGORIES[app.tab].kind, CategoryKind::Projects));
+        assert_eq!(app.active_session_target(), None);
+        assert!(!app.is_drilled_down());
+
+        app.enter_project_scope(ProjectScope {
+            id: "proj_1".to_string(),
+            label: "my-project".to_string(),
+            worktree: "/work/my-project".to_string(),
+        });
+        assert_eq!(app.active_session_target(), Some(SessionTarget::Project));
+        assert!(app.is_drilled_down());
+        assert!(matches!(app.help_topic(), HelpTopic::ProjectSessions));
+
+        app.project_sessions.list.loaded = true;
+        app.project_sessions.list.rows = vec![
+            serde_json::json!({"id": "ses_top", "title": "Main Task"}),
+            serde_json::json!({"id": "ses_leaf", "title": "Leaf Task"}),
+            serde_json::json!({"id": "ses_sub", "parent_id": "ses_top", "title": "Worker"}),
+        ];
+        app.project_sessions.top_level_only = true;
+        app.project_sessions.list.filter = "Task".to_string();
+        app.project_sessions.list.sort = 2;
+        app.project_sessions.list.selected = 0;
+
+        assert!(app.push_subagent_scope(SessionTarget::Project));
+        assert_eq!(app.project_sessions.parents.len(), 1);
+        assert!(app.project_sessions.list.filter.is_empty());
+        assert!(!app.project_sessions.top_level_only);
+        let crumb: String = app
+            .browser_breadcrumb()
+            .unwrap()
+            .0
+            .iter()
+            .map(|s| s.text.as_str())
+            .collect();
+        assert!(crumb.starts_with("Projects > my-project > Main Task"));
+
+        let leaf_selected = {
+            app.project_sessions.list.selected = 1;
+            app.pop_subagent_scope(SessionTarget::Project).unwrap()
+        };
+        assert_eq!(leaf_selected.prev_selected, 0);
+        assert_eq!(app.project_sessions.list.filter, "Task");
+        assert_eq!(app.project_sessions.list.sort, 2);
+        assert!(app.project_sessions.top_level_only);
+
+        assert!(app.exit_project_scope());
+        assert!(!app.is_drilled_down());
+        assert_eq!(app.active_session_target(), None);
+
+        // Leaf without subagents refuses drill-down cleanly with a status message.
+        app.enter_project_scope(ProjectScope {
+            id: "proj_1".to_string(),
+            label: "my-project".to_string(),
+            worktree: "/work/my-project".to_string(),
+        });
+        app.project_sessions.list.loaded = true;
+        app.project_sessions.list.rows =
+            vec![serde_json::json!({"id": "ses_leaf", "title": "Leaf Task"})];
+        assert!(!app.push_subagent_scope(SessionTarget::Project));
+        assert_eq!(
+            app.status.as_deref(),
+            Some("selected session has no subagents")
         );
     }
 }
