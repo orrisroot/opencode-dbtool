@@ -80,7 +80,7 @@ jobs:
           dir="${BIN_NAME}-${{ matrix.target }}"
           mkdir -p "dist/${dir}"
           cp "target/${{ matrix.target }}/release/${BIN_NAME}${ext}" "dist/${dir}/"
-          cp README.md LICENSE "dist/${dir}/"
+          cp README.md COMMANDS.md CHANGELOG.md LICENSE "dist/${dir}/"
           if [[ "${{ matrix.target }}" == *pc-windows* ]]; then
             (cd dist && 7z a -tzip "../${dir}.zip" "${dir}") >/dev/null
           else

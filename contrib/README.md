@@ -24,8 +24,8 @@ launchctl load ~/Library/LaunchAgents/com.orrisroot.opencode-dbtool-cleanup.plis
 
 - `--restart-service` stops and restarts the registered opencode service
   around the run; without it the service keeps running and the final
-  VACUUM is skipped unless `--vacuum-online` is passed (see the README's
-  "Online maintenance" section).
+  VACUUM is skipped unless `--vacuum-online` is passed (see
+  [Online maintenance](../COMMANDS.md#online-maintenance-opencode-running)).
 - `--yes` is required for non-interactive runs.
 - Point `OPENCODE_DB` / `OPENCODE_DATA_DIR` at the right installation if
   you use non-default paths (environment variables must be set for the
