@@ -2,6 +2,29 @@
 
 All notable changes to `opencode-dbtool` are documented in this file.
 
+## [Unreleased]
+
+### Added
+
+- TUI: `Ctrl+P` command palette available from every section; it searches all actions and offers `Go to ...` section jumps (for example, typing `project` and pressing Enter opens Projects).
+- TUI: numbered section tabs make the `1`-`9` shortcuts visible.
+- TUI: adaptive footers keep whole key hints and prioritize help, quit/back, and the command palette on narrow terminals.
+- TUI: header shows WAL size alongside the database size and summarizes multiple opencode pids compactly.
+
+### Changed
+
+- TUI: `R` now refreshes the header and reloads every browser instead of leaving lists stale.
+- TUI: session and project detail panes omit empty optional fields so the important values fit on short terminals.
+- TUI: cancelling a prompt opened from the command palette returns to the palette with the query intact.
+- TUI: Enter and Esc now cancel a pending preview; `a` (or `y`) applies it, so a double Enter cannot trigger a destructive action.
+
+### Fixed
+
+- TUI: held `a`/`y` repeat events no longer apply a destructive preview on terminals that report key repeat; a fresh key press is required.
+- TUI: long database paths no longer hide the opencode running/stopped indicator on narrow terminals.
+- TUI: the tab bar now reserves space for its `...` markers, so the active section is not hidden at narrow widths.
+- TUI: `R` preserves more specific reload messages, such as a project that disappeared, instead of overwriting them.
+
 ## [0.5.0] - 2026-11-21
 
 ### Added

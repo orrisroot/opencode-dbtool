@@ -189,15 +189,21 @@ Destructive commands (`session`/`project delete` and `purge`,
 
 `opencode-dbtool tui` opens a full-screen menu for the same operations as
 the CLI. Use `Up`/`Down` (or `j`/`k`) to select an item, `Left`/`Right`
-(or `Tab`, or `1`-`9`) to switch sections, and `Enter` to open or run it.
-`PgUp`/`PgDn` jump a page in long lists. In command menus `/` searches
-every action by label or description; in the list browsers it filters the
-list. `?` or `F1` shows a context-sensitive help screen for the current
+(or `Tab`) to switch sections, and `Enter` to open or run it. Section tabs
+are numbered, so `1`-`9` jump directly to a section. `PgUp`/`PgDn` jump a
+page in long lists. In command menus `/` searches the actions in that
+menu. `Ctrl+P` opens the command palette from any section and searches
+every action plus `Go to ...` section jumps (for example, type `project`
+and press `Enter` to switch to Projects). In the list browsers `/` filters
+the list. `?` or `F1` shows a context-sensitive help screen for the current
 view. `q` or `Esc` steps back out of a nested list or leaves the menu
-(`Ctrl+C` always quits). The header shows the resolved database size,
-whether opencode is running, and the registered service pid. Layout uses
-terminal cell widths, so Japanese and other wide characters stay aligned
-in titles and columns.
+(`Ctrl+C` always quits). The header shows whether opencode is running,
+then the resolved database path, database and WAL size, and the registered
+service pid; the running-process line stays visible when a long path is
+truncated. Footer hints are fitted as whole keys, so help and quit remain
+visible on narrow terminals instead of being cut off. Layout uses terminal
+cell widths, so Japanese and other wide characters stay aligned in titles
+and columns.
 
 The sections cover overview/health, projects, sessions, kv cache, backups,
 storage cleanup, database tools, one-shot cleanup, and system commands
@@ -207,8 +213,10 @@ storage cleanup, database tools, one-shot cleanup, and system commands
 lists instead of command menus. Move with `Up`/`Down` (`j`/`k`) or
 `PgUp`/`PgDn`; the right pane previews the selected item. Common keys are
 `/` (filter), `o` (only items older than an age), `s` (cycle the sort key),
-`c` (clear filters), `r` (reload), and `d` (delete the selected item, preview
-first).
+`c` (clear filters), `r` (reload), `R` (refresh the header and reload every
+list), and `d` (delete the selected item, preview first). The detail pane
+omits empty optional fields, so the important values and the action hint
+fit on short terminals.
 
 - Projects (staged browsing): `Enter` opens the selected project's sessions,
   `v` opens the project summary (`project show`), `d` deletes the project,
@@ -249,11 +257,14 @@ Every action runs the real CLI as a child process with `--no-pager --no-input`
 (using structured JSON internally for list browsers and delete reports, and
 `--format table` for command views), so the menu cannot bypass the service
 guard, maintenance lock, or confirmation rules. Destructive actions are
-always previewed with `--dry-run` first; `Enter`/`a` then re-runs the same
-command with `--yes`, and `r` runs the preview again. In the result view,
-`Up`/`Down`, `PgUp`/`PgDn`, and `Home`/`End` scroll the captured output;
-`Enter` (when no preview confirmation is pending) or `Esc` returns to the
-menu. `R` refreshes the header status.
+always previewed with `--dry-run` first; press `a` (or `y`) to re-run the
+same command with `--yes`, and `r` runs the preview again. `Enter` and
+`Esc` always return without applying, so a double `Enter` cannot delete
+anything. Where the terminal reports key-repeat events, a held `a`/`y` is
+ignored while a preview is pending, so applying requires a fresh key
+press. In the result view, `Up`/`Down`, `PgUp`/`PgDn`, and `Home`/`End`
+scroll the captured output. `R` refreshes the header status and reloads
+every list.
 
 `tui --dry-run` makes the whole session preview-only, so no action can be
 applied. `--no-input` is rejected (the menu needs the terminal); all other

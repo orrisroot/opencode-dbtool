@@ -465,6 +465,7 @@ struct Tui<'a> {
     cli: &'a Cli,
     db_path: PathBuf,
     db_size: Option<u64>,
+    wal_size: Option<u64>,
     running: String,
     service: Option<String>,
     use_color: bool,
@@ -481,6 +482,9 @@ struct Tui<'a> {
     preview_only: bool,
     help: Option<HelpTopic>,
     help_scroll: Cell<usize>,
+    /// Palette state to return to when a prompt opened from search is
+    /// cancelled, so the query and cursor are not lost.
+    search_back: Option<ActionSearch>,
 }
 
 enum View {
@@ -507,11 +511,17 @@ struct ActionHit {
     action: &'static Action,
 }
 
+#[derive(Clone, Copy)]
+enum SearchHit {
+    Action(ActionHit),
+    Section(usize),
+}
+
 struct ActionSearch {
     text: Vec<char>,
     cursor: usize,
     selected: usize,
-    matches: Vec<ActionHit>,
+    matches: Vec<SearchHit>,
 }
 
 impl ActionSearch {
@@ -520,13 +530,13 @@ impl ActionSearch {
             text: Vec::new(),
             cursor: 0,
             selected: 0,
-            matches: action_hits(""),
+            matches: search_hits(""),
         }
     }
 
     fn refresh(&mut self) {
         let query: String = self.text.iter().collect();
-        self.matches = action_hits(&query);
+        self.matches = search_hits(&query);
         self.selected = 0;
     }
 }
@@ -536,6 +546,20 @@ enum SearchControl {
     Back,
     Run(RunSpec),
     Prompt(&'static Action),
+    GoTo(usize),
+}
+
+/// A single key hint in the context-sensitive footer. Hints are ordered by
+/// importance; [footer_line] drops whole hints from the end when the terminal
+/// is too narrow instead of cutting a hint in half.
+#[derive(Clone, Copy)]
+struct KeyHint {
+    key: &'static str,
+    label: &'static str,
+}
+
+const fn hint(key: &'static str, label: &'static str) -> KeyHint {
+    KeyHint { key, label }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -717,6 +741,7 @@ impl<'a> Tui<'a> {
             cli,
             db_path: db_path.to_path_buf(),
             db_size: None,
+            wal_size: None,
             running: "unknown".to_string(),
             service: None,
             use_color,
@@ -733,6 +758,7 @@ impl<'a> Tui<'a> {
             preview_only: cli.dry_run,
             help: None,
             help_scroll: Cell::new(0),
+            search_back: None,
         };
         app.refresh(None);
         app
@@ -740,15 +766,14 @@ impl<'a> Tui<'a> {
 
     fn refresh(&mut self, note: Option<&str>) {
         self.db_size = fs::metadata(&self.db_path).ok().map(|m| m.len());
+        self.wal_size = fs::metadata(crate::db::wal_path(&self.db_path))
+            .ok()
+            .map(|m| m.len())
+            .filter(|size| *size > 0);
         self.running = match sys::running_pids() {
             Ok(pids) if pids.is_empty() => "not running".to_string(),
-            Ok(pids) => format!(
-                "running (pid {})",
-                pids.iter()
-                    .map(|p| p.to_string())
-                    .collect::<Vec<_>>()
-                    .join(",")
-            ),
+            Ok(pids) if pids.len() == 1 => format!("running (pid {})", pids[0]),
+            Ok(pids) => format!("running (pid {} +{})", pids[0], pids.len() - 1),
             Err(e) => format!("unknown ({e})"),
         };
         self.service = crate::service::discover().map(|s| format!("pid {}", s.pid));
@@ -798,9 +823,28 @@ impl<'a> Tui<'a> {
         if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('c')) {
             return Control::Quit;
         }
+        // Ctrl+P opens the command palette from any menu section. Other views
+        // keep the key as a no-op rather than dropping their state.
+        if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('p')) {
+            if self.help.is_none() && matches!(&self.view, View::Menu) {
+                self.status = None;
+                self.search_back = None;
+                self.view = View::Search(ActionSearch::new());
+            }
+            return Control::Continue;
+        }
         if self.help.is_some() {
             self.handle_help_key(key);
             return Control::Continue;
+        }
+        // A held apply key must not confirm a destructive preview by key
+        // repeat; require a fresh key press for the apply step.
+        if key.kind == KeyEventKind::Repeat {
+            if let View::Output(output) = &self.view {
+                if output.can_apply && matches!(key.code, KeyCode::Char('a') | KeyCode::Char('y')) {
+                    return Control::Continue;
+                }
+            }
         }
         if key.code == KeyCode::F(1)
             || (key.code == KeyCode::Char('?')
@@ -826,7 +870,14 @@ impl<'a> Tui<'a> {
                 SearchControl::Run(spec) => Control::Run(spec),
                 SearchControl::Prompt(action) => {
                     self.status = None;
+                    self.search_back = Some(search);
                     self.view = View::Prompt(Prompt::for_action(action));
+                    Control::Continue
+                }
+                SearchControl::GoTo(tab) => {
+                    self.search_back = None;
+                    self.switch_tab(tab);
+                    self.status = Some(format!("switched to {}", CATEGORIES[tab].name));
                     Control::Continue
                 }
             },
@@ -834,10 +885,17 @@ impl<'a> Tui<'a> {
                 let control = handle_prompt_key(key, &mut prompt);
                 match control {
                     Control::PromptCancel => {
-                        self.status = Some("cancelled".to_string());
+                        if let Some(search) = self.search_back.take() {
+                            self.view = View::Search(search);
+                        } else {
+                            self.status = Some("cancelled".to_string());
+                        }
                         Control::Continue
                     }
-                    Control::Submitted(submission) => self.apply_submission(submission),
+                    Control::Submitted(submission) => {
+                        self.search_back = None;
+                        self.apply_submission(submission)
+                    }
                     Control::Run(_) | Control::Quit => control,
                     other => {
                         self.view = View::Prompt(prompt);
@@ -964,10 +1022,15 @@ impl<'a> Tui<'a> {
             }
             KeyCode::Enter => {
                 if let Some(hit) = search.matches.get(search.selected) {
-                    if hit.action.input.is_some() {
-                        return SearchControl::Prompt(hit.action);
+                    match hit {
+                        SearchHit::Action(hit) if hit.action.input.is_some() => {
+                            return SearchControl::Prompt(hit.action);
+                        }
+                        SearchHit::Action(hit) => {
+                            return SearchControl::Run(action_spec(hit.action, None));
+                        }
+                        SearchHit::Section(tab) => return SearchControl::GoTo(*tab),
                     }
-                    return SearchControl::Run(action_spec(hit.action, None));
                 }
             }
             KeyCode::Char(c) if !c.is_control() => {
@@ -1002,7 +1065,13 @@ impl<'a> Tui<'a> {
                 return Control::Continue;
             }
             KeyCode::Char('R') => {
-                self.refresh(Some("status refreshed"));
+                self.status = None;
+                self.refresh(None);
+                self.invalidate_browsers();
+                self.reload_active_browser(false);
+                if self.status.is_none() {
+                    self.status = Some("refreshed status and lists".to_string());
+                }
                 return Control::Continue;
             }
             KeyCode::Char(c) if c.is_ascii_digit() => {
@@ -2193,10 +2262,7 @@ impl<'a> Tui<'a> {
                 out,
                 height.saturating_sub(1),
                 0,
-                &Line::from(vec![Span::new(
-                    "Enter run   Esc cancel   Left/Right edit   Ctrl+U clear   Ctrl+W word",
-                )
-                .dim()]),
+                &footer_line(&prompt_hints(), width),
                 width,
                 self.use_color,
             )?;
@@ -2213,7 +2279,7 @@ impl<'a> Tui<'a> {
                 out,
                 height.saturating_sub(1),
                 0,
-                &Line::from(vec![Span::new(self.menu_footer()).dim()]),
+                &footer_line(&self.menu_hints(), width),
                 width,
                 self.use_color,
             )?;
@@ -2228,21 +2294,29 @@ impl<'a> Tui<'a> {
         ]);
         put_line(out, 0, 0, &title, width, self.use_color)?;
 
-        let size = self
-            .db_size
-            .map(|size| output::human_bytes(size.min(i64::MAX as u64) as i64))
-            .unwrap_or_else(|| "missing".to_string());
+        let size = match (self.db_size, self.wal_size) {
+            (Some(db), Some(wal)) => format!(
+                "{} + {} WAL",
+                output::human_bytes(db.min(i64::MAX as u64) as i64),
+                output::human_bytes(wal.min(i64::MAX as u64) as i64)
+            ),
+            (Some(db), None) => output::human_bytes(db.min(i64::MAX as u64) as i64),
+            (None, _) => "missing".to_string(),
+        };
         let status_color = match self.running.as_str() {
             "not running" => Color::Green,
             s if s.starts_with("running") => Color::Yellow,
             _ => Color::Red,
         };
+        // Put the opencode/service state first so a long database path can be
+        // truncated on narrow terminals without hiding the safety-relevant
+        // "is opencode running" indicator.
         let mut info = vec![
-            Span::new("DB: ").dim(),
+            Span::new("opencode: ").dim(),
+            Span::new(self.running.clone()).fg(status_color),
+            Span::new("   DB: ").dim(),
             Span::new(self.db_path.display().to_string()),
             Span::new(format!(" ({size})")).dim(),
-            Span::new("   opencode: ").dim(),
-            Span::new(self.running.clone()).fg(status_color),
         ];
         if let Some(service) = &self.service {
             info.push(Span::new(format!("   service: {service}")).dim());
@@ -2628,35 +2702,102 @@ impl<'a> Tui<'a> {
         }
     }
 
-    fn menu_footer(&self) -> &'static str {
+    fn menu_hints(&self) -> Vec<KeyHint> {
+        let mut hints = vec![hint("?", "help")];
+        let drilled = self.is_drilled_down();
+        if drilled {
+            hints.push(hint("Esc", "back"));
+        } else {
+            hints.push(hint("q", "quit"));
+        }
+        hints.push(hint("Ctrl+P", "commands"));
         match CATEGORIES[self.tab].kind {
             CategoryKind::Actions(_) => {
-                "? help   Enter run   / search   Up/Down move   Left/Right section   q quit"
+                hints.extend([
+                    hint("Enter", "run"),
+                    hint("/", "search actions"),
+                    hint("Up/Down", "move"),
+                    hint("Left/Right", "section"),
+                    hint("1-9", "jump"),
+                ]);
             }
             CategoryKind::Sessions => {
+                hints.extend([
+                    hint("Enter", "show"),
+                    hint("d", "delete"),
+                    hint("u", "subagents"),
+                ]);
                 if self.sessions.parents.is_empty() {
-                    "? help   Enter show   d delete   u subagents   t top-level   F find   P purge   q quit"
-                } else {
-                    "? help   Enter show   d delete   u subagents   / filter   s sort   Esc/Bksp back"
+                    hints.push(hint("t", "top-level"));
+                }
+                hints.extend([
+                    hint("/", "filter"),
+                    hint("s", "sort"),
+                    hint("R", "refresh"),
+                    hint("o", "age"),
+                ]);
+                if self.sessions.parents.is_empty() {
+                    hints.extend([hint("F", "find"), hint("P", "purge")]);
                 }
             }
             CategoryKind::Projects if self.project_scope.is_some() => {
+                hints.extend([
+                    hint("Enter", "show"),
+                    hint("d", "delete"),
+                    hint("u", "subagents"),
+                    hint("v", "project"),
+                ]);
                 if self.project_sessions.parents.is_empty() {
-                    "? help   Enter show   d delete   u subagents   t top-level   v project   Esc/Bksp back"
-                } else {
-                    "? help   Enter show   d delete   u subagents   v project   Esc/Bksp back   q quit"
+                    hints.push(hint("t", "top-level"));
                 }
+                hints.extend([
+                    hint("/", "filter"),
+                    hint("s", "sort"),
+                    hint("R", "refresh"),
+                    hint("o", "age"),
+                ]);
             }
             CategoryKind::Projects => {
-                "? help   Enter sessions   v summary   d delete   / filter   E empty   P purge   q quit"
+                hints.extend([
+                    hint("Enter", "sessions"),
+                    hint("v", "summary"),
+                    hint("d", "delete"),
+                    hint("/", "filter"),
+                    hint("s", "sort"),
+                    hint("R", "refresh"),
+                    hint("o", "age"),
+                    hint("E", "empty"),
+                    hint("P", "purge"),
+                ]);
             }
             CategoryKind::Kv => {
-                "? help   Enter view   d delete   / filter   s sort   P purge   L larger   q quit"
+                hints.extend([
+                    hint("Enter", "view"),
+                    hint("d", "delete"),
+                    hint("/", "filter"),
+                    hint("s", "sort"),
+                    hint("R", "refresh"),
+                    hint("o", "age"),
+                    hint("P", "purge"),
+                    hint("L", "larger"),
+                ]);
             }
             CategoryKind::Backups => {
-                "? help   Enter restore   d delete   / filter   s sort   b backup   V verify   q quit"
+                hints.extend([
+                    hint("Enter", "restore"),
+                    hint("b", "backup"),
+                    hint("d", "delete"),
+                    hint("V", "verify"),
+                    hint("/", "filter"),
+                    hint("s", "sort"),
+                    hint("R", "refresh"),
+                    hint("o", "age"),
+                    hint("K", "keep"),
+                    hint("P", "prune"),
+                ]);
             }
         }
+        hints
     }
 
     fn tab_line(&self, width: usize) -> Line {
@@ -2669,16 +2810,46 @@ impl<'a> Tui<'a> {
                 } else {
                     category.short
                 };
-                format!(" {name} ")
+                // Show the numeric shortcut directly in the tab bar so the
+                // 1-9 accelerator is discoverable without opening help.
+                format!(" {} {name} ", index + 1)
             })
             .collect();
-        let (start, end) = tab_window(&labels, self.tab, width);
+        // Reserve room for the leading/trailing "..." markers so they cannot
+        // push the active label out of the visible window. When even the
+        // active label is wider than the terminal, the markers are dropped
+        // and put_line truncates that unavoidable fallback.
+        let active_width = display_width(&labels[self.tab]);
+        let budget = width.saturating_sub(7).max(active_width);
+        let (start, end) = tab_window(&labels, self.tab, budget);
+        let labels_width = labels[start..end]
+            .iter()
+            .map(|label| display_width(label))
+            .sum::<usize>()
+            .saturating_add(end.saturating_sub(start).saturating_sub(1));
+        let mut show_leading = start > 0;
+        let mut show_trailing = end < labels.len();
+        loop {
+            let cost =
+                labels_width + if show_leading { 4 } else { 0 } + if show_trailing { 4 } else { 0 };
+            if cost <= width {
+                break;
+            }
+            if show_trailing {
+                show_trailing = false;
+            } else if show_leading {
+                show_leading = false;
+            } else {
+                break;
+            }
+        }
+
         let mut spans = Vec::new();
-        if start > 0 {
+        if show_leading {
             spans.push(Span::new("...").dim());
         }
         for (index, label) in labels.iter().enumerate().take(end).skip(start) {
-            if index > start || start > 0 {
+            if index > start || show_leading {
                 spans.push(Span::new(" "));
             }
             let span = Span::new(label.clone());
@@ -2688,7 +2859,7 @@ impl<'a> Tui<'a> {
                 spans.push(span.dim());
             }
         }
-        if end < labels.len() {
+        if show_trailing {
             spans.push(Span::new(" ...").dim());
         }
         Line::from(spans)
@@ -2760,7 +2931,7 @@ impl<'a> Tui<'a> {
         };
         let (cue, cue_color, cue_bold) = if output.can_apply {
             (
-                "Preview only - press Enter or a to apply, Esc to cancel",
+                "Preview only - press a (or y) to apply, Enter/Esc to cancel",
                 Some(Color::Yellow),
                 true,
             )
@@ -2808,18 +2979,11 @@ impl<'a> Tui<'a> {
             width,
             self.use_color,
         )?;
-        let help = if output.can_apply {
-            "? help   Enter/a apply   r rerun   Up/Down scroll   PgUp/PgDn page   Esc/q cancel"
-        } else if output.applied && output.ok {
-            "? help   Enter/Esc/q return   Up/Down scroll   PgUp/PgDn page   Home/End top/bottom"
-        } else {
-            "? help   Enter/Esc/q return   r rerun   Up/Down scroll   PgUp/PgDn page   Home/End"
-        };
         put_line(
             out,
             height.saturating_sub(1),
             0,
-            &Line::from(vec![Span::new(help).dim()]),
+            &footer_line(&output.footer_hints(), width),
             width,
             self.use_color,
         )?;
@@ -2851,7 +3015,7 @@ impl<'a> Tui<'a> {
         clear_row(out, header_row)?;
         let query: String = search.text.iter().collect();
         let header = if query.is_empty() {
-            format!("SEARCH ALL ACTIONS  ·  {total} actions")
+            format!("COMMAND PALETTE  ·  {total} actions  ·  type a section name to jump")
         } else {
             format!("SEARCH  ·  {total} matches for \"{query}\"")
         };
@@ -2879,7 +3043,7 @@ impl<'a> Tui<'a> {
             search
                 .matches
                 .get(selected)
-                .map(|hit| detail_lines(hit.action, detail_width))
+                .map(|hit| search_detail_lines(hit, detail_width))
                 .unwrap_or_default()
         } else {
             Vec::new()
@@ -2888,7 +3052,14 @@ impl<'a> Tui<'a> {
             let row = header_row + 1 + offset;
             clear_row(out, row)?;
             if let Some(hit) = search.matches.get(start + offset) {
-                let text = format!("{} {}", fit_cell(hit.category, 9), hit.action.label);
+                let text = match hit {
+                    SearchHit::Action(hit) => {
+                        format!("{} {}", fit_cell(hit.category, 9), hit.action.label)
+                    }
+                    SearchHit::Section(tab) => {
+                        format!("{} Go to {}", fit_cell("Section", 9), CATEGORIES[*tab].name)
+                    }
+                };
                 let span = if start + offset == selected {
                     Span::new(text).bold().reverse()
                 } else {
@@ -2904,9 +3075,9 @@ impl<'a> Tui<'a> {
                 )?;
             } else if offset == 0 {
                 let text = if query.is_empty() {
-                    "No actions are available.".to_string()
+                    "No commands are available.".to_string()
                 } else {
-                    format!("No action matches \"{query}\".")
+                    format!("No command matches \"{query}\".")
                 };
                 put_line(
                     out,
@@ -2929,7 +3100,7 @@ impl<'a> Tui<'a> {
             out,
             height.saturating_sub(2),
             0,
-            &input_line("Search actions", &search.text, search.cursor, "", width),
+            &input_line("Search commands", &search.text, search.cursor, "", width),
             width,
             self.use_color,
         )?;
@@ -2937,10 +3108,7 @@ impl<'a> Tui<'a> {
             out,
             height.saturating_sub(1),
             0,
-            &Line::from(vec![Span::new(
-                "Enter run   Esc back   Type to filter   Up/Down select   PgUp/PgDn page",
-            )
-            .dim()]),
+            &footer_line(&search_hints(), width),
             width,
             self.use_color,
         )?;
@@ -3003,10 +3171,7 @@ impl<'a> Tui<'a> {
             out,
             height.saturating_sub(1),
             0,
-            &Line::from(vec![Span::new(
-                "Esc/?/q close   Up/Down scroll   PgUp/PgDn page   Home/End top/bottom",
-            )
-            .dim()]),
+            &footer_line(&help_hints(), width),
             width,
             self.use_color,
         )?;
@@ -3099,9 +3264,11 @@ fn handle_prompt_key(key: KeyEvent, prompt: &mut Prompt) -> Control {
 
 fn handle_output_key(key: KeyEvent, output: &mut OutputView) -> Control {
     match key.code {
-        KeyCode::Esc | KeyCode::Char('q') => return Control::OutputBack,
-        KeyCode::Enter if !output.can_apply => return Control::OutputBack,
-        KeyCode::Enter | KeyCode::Char('a') if output.can_apply => {
+        // Enter is always a safe key in the result view: it returns to the
+        // list (cancelling a pending preview) so a double Enter cannot apply
+        // a destructive action by accident.
+        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter => return Control::OutputBack,
+        KeyCode::Char('a') | KeyCode::Char('y') if output.can_apply => {
             return Control::Apply(output.spec.clone());
         }
         KeyCode::Up | KeyCode::Char('k') => {
@@ -3944,52 +4111,53 @@ fn session_detail_lines_with(row: &Value, width: usize, child_count: usize) -> V
         ),
         width,
     ));
-    lines.extend(field_lines(
-        "Events",
-        &row_i64(row, "events").to_string(),
-        width,
-    ));
-    lines.extend(field_lines(
-        "Media",
-        &output::human_bytes(row_i64(row, "blob_bytes")),
-        width,
-    ));
-    lines.extend(field_lines(
-        "Cost",
-        &format!("${:.4}", row_f64(row, "cost")),
-        width,
-    ));
+    // Optional fields are omitted when empty so typical session details fit
+    // in a short terminal instead of pushing the action hint off-screen.
+    let events = row_i64(row, "events");
+    if events > 0 {
+        lines.extend(field_lines("Events", &events.to_string(), width));
+    }
+    let media = row_i64(row, "blob_bytes");
+    if media > 0 {
+        lines.extend(field_lines("Media", &output::human_bytes(media), width));
+    }
+    let cost = row_f64(row, "cost");
+    if cost > 0.0 {
+        lines.extend(field_lines("Cost", &format!("${cost:.4}"), width));
+    }
     let parent = row_str(row, "parent_id");
-    lines.extend(field_lines(
-        "Parent",
-        if parent.is_empty() { "-" } else { &parent },
-        width,
-    ));
-    let subagents = if child_count > 0 {
-        format!("{child_count} loaded (press u to open)")
-    } else {
-        "-".to_string()
-    };
-    lines.extend(field_lines("Subagents", &subagents, width));
-    lines.extend(field_lines(
-        "Archived",
-        if row_bool(row, "archived") {
-            "yes"
-        } else {
-            "no"
-        },
-        width,
-    ));
+    if !parent.is_empty() {
+        lines.extend(field_lines("Parent", &parent, width));
+    }
+    if child_count > 0 {
+        lines.extend(field_lines(
+            "Subagents",
+            &format!("{child_count} loaded"),
+            width,
+        ));
+    }
+    if row_bool(row, "archived") {
+        lines.extend(field_lines("Archived", "yes", width));
+    }
     lines.push(Line::from(vec![]));
-    lines.push(Line::from(vec![
+    let mut hint_spans = vec![
         Span::new("Press "),
         Span::new("Enter").bold(),
-        Span::new(" to view; "),
-        Span::new("u").bold(),
-        Span::new(" opens subagents; "),
+        Span::new(" to view"),
+    ];
+    if child_count > 0 {
+        hint_spans.extend([
+            Span::new("; "),
+            Span::new("u").bold(),
+            Span::new(" opens subagents"),
+        ]);
+    }
+    hint_spans.extend([
+        Span::new("; "),
         Span::new("d").bold(),
         Span::new(" deletes."),
-    ]));
+    ]);
+    lines.push(Line::from(hint_spans));
     lines
 }
 
@@ -4002,40 +4170,39 @@ fn project_detail_lines(row: &Value, width: usize) -> Vec<Line> {
         &row_i64(row, "sessions").to_string(),
         width,
     ));
-    lines.extend(field_lines(
-        "Messages",
-        &format!(
-            "{} messages / {} parts",
-            row_i64(row, "session_messages"),
-            row_i64(row, "session_parts")
-        ),
-        width,
-    ));
-    lines.extend(field_lines(
-        "Events",
-        &row_i64(row, "events").to_string(),
-        width,
-    ));
-    lines.extend(field_lines(
-        "Media",
-        &output::human_bytes(row_i64(row, "blob_bytes")),
-        width,
-    ));
-    lines.extend(field_lines(
-        "Size",
-        &output::human_bytes(row_i64(row, "size_bytes")),
-        width,
-    ));
-    lines.extend(field_lines(
-        "Cost",
-        &format!("${:.4}", row_f64(row, "cost")),
-        width,
-    ));
-    lines.extend(field_lines(
-        "Updated",
-        &format!("{} ({})", row_age(row), row_str(row, "updated")),
-        width,
-    ));
+    let messages = row_i64(row, "session_messages");
+    let parts = row_i64(row, "session_parts");
+    if messages > 0 || parts > 0 {
+        lines.extend(field_lines(
+            "Messages",
+            &format!("{messages} messages / {parts} parts"),
+            width,
+        ));
+    }
+    let events = row_i64(row, "events");
+    if events > 0 {
+        lines.extend(field_lines("Events", &events.to_string(), width));
+    }
+    let media = row_i64(row, "blob_bytes");
+    if media > 0 {
+        lines.extend(field_lines("Media", &output::human_bytes(media), width));
+    }
+    let size = row_i64(row, "size_bytes");
+    if size > 0 {
+        lines.extend(field_lines("Size", &output::human_bytes(size), width));
+    }
+    let cost = row_f64(row, "cost");
+    if cost > 0.0 {
+        lines.extend(field_lines("Cost", &format!("${cost:.4}"), width));
+    }
+    let updated = row_str(row, "updated");
+    if !updated.is_empty() && updated != "-" {
+        lines.extend(field_lines(
+            "Updated",
+            &format!("{} ({updated})", row_age(row)),
+            width,
+        ));
+    }
     lines.push(Line::from(vec![]));
     lines.push(Line::from(vec![
         Span::new("Press "),
@@ -4112,6 +4279,75 @@ fn page_rows() -> usize {
         .unwrap_or(10)
 }
 
+/// Fit key hints into one footer line. Whole hints are kept; anything that
+/// does not fit is replaced by an ellipsis, so narrow terminals still show
+/// the most important keys instead of a cut-off label.
+fn footer_line(hints: &[KeyHint], width: usize) -> Line {
+    if width == 0 || hints.is_empty() {
+        return Line::from(vec![]);
+    }
+    let mut spans = Vec::new();
+    let mut used = 0usize;
+    let mut shown = 0usize;
+    for (index, hint) in hints.iter().enumerate() {
+        let text_width = display_width(hint.key) + 1 + display_width(hint.label);
+        let extra = if shown == 0 {
+            text_width
+        } else {
+            3 + text_width
+        };
+        let reserve = if index + 1 < hints.len() { 2 } else { 0 };
+        if used + extra + reserve > width {
+            break;
+        }
+        if shown > 0 {
+            spans.push(Span::new("   "));
+            used += 3;
+        }
+        spans.push(Span::new(hint.key).bold());
+        spans.push(Span::new(format!(" {}", hint.label)).dim());
+        used += text_width;
+        shown += 1;
+    }
+    if shown == 0 {
+        let text = format!("{} {}", hints[0].key, hints[0].label);
+        spans.push(Span::new(truncate_width(&text, width).0).dim());
+    } else if shown < hints.len() {
+        spans.push(Span::new(" …").dim());
+    }
+    Line::from(spans)
+}
+
+fn prompt_hints() -> Vec<KeyHint> {
+    vec![
+        hint("Enter", "run"),
+        hint("Esc", "cancel"),
+        hint("Left/Right", "edit"),
+        hint("Ctrl+U", "clear"),
+        hint("Ctrl+W", "word"),
+        hint("Home/End", "jump"),
+    ]
+}
+
+fn search_hints() -> Vec<KeyHint> {
+    vec![
+        hint("Enter", "run"),
+        hint("Esc", "back"),
+        hint("Type", "filter"),
+        hint("Up/Down", "select"),
+        hint("PgUp/PgDn", "page"),
+    ]
+}
+
+fn help_hints() -> Vec<KeyHint> {
+    vec![
+        hint("Esc/?", "close"),
+        hint("Up/Down", "scroll"),
+        hint("PgUp/PgDn", "page"),
+        hint("Home/End", "top/bottom"),
+    ]
+}
+
 fn action_hits(query: &str) -> Vec<ActionHit> {
     let terms: Vec<String> = query.split_whitespace().map(str::to_lowercase).collect();
     let mut hits = Vec::new();
@@ -4143,6 +4379,35 @@ fn action_hits(query: &str) -> Vec<ActionHit> {
     hits
 }
 
+/// Palette entries: section jumps for non-empty queries that name or describe
+/// a section, followed by the matching actions. An empty query stays
+/// action-only so Enter still runs the first action.
+fn search_hits(query: &str) -> Vec<SearchHit> {
+    let terms: Vec<String> = query.split_whitespace().map(str::to_lowercase).collect();
+    let mut hits = Vec::new();
+    if !terms.is_empty() {
+        for (index, category) in CATEGORIES.iter().enumerate() {
+            let kind = match category.kind {
+                CategoryKind::Actions(actions) => format!("{} actions", actions.len()),
+                CategoryKind::Sessions => "browse sessions and subagents".to_string(),
+                CategoryKind::Projects => "browse projects and their sessions".to_string(),
+                CategoryKind::Kv => "browse the global kv cache".to_string(),
+                CategoryKind::Backups => "browse and restore database backups".to_string(),
+            };
+            let haystack = format!(
+                "{} {} go to section switch {}",
+                category.name, category.short, kind
+            )
+            .to_lowercase();
+            if terms.iter().all(|term| haystack.contains(term)) {
+                hits.push(SearchHit::Section(index));
+            }
+        }
+    }
+    hits.extend(action_hits(query).into_iter().map(SearchHit::Action));
+    hits
+}
+
 enum HelpRow {
     Heading(&'static str),
     Item(&'static str, &'static str),
@@ -4170,6 +4435,9 @@ fn help_heading(topic: HelpTopic) -> (&'static str, &'static str) {
 fn session_help_rows(project_scoped: bool) -> Vec<HelpRow> {
     use HelpRow::{Heading, Item, Note};
     let mut rows = vec![
+        Heading("Everywhere"),
+        Item("Tab, 1-9", "switch to another section"),
+        Item("Ctrl+P", "search every command and section"),
         Heading("Move around"),
         Item("Up/Down, j/k", "move the session selection"),
         Item("PgUp/PgDn", "jump one page"),
@@ -4199,7 +4467,7 @@ fn session_help_rows(project_scoped: bool) -> Vec<HelpRow> {
         Item("t", "toggle top-level sessions only vs all sessions"),
         Item("c", "clear the filter and age limit"),
         Item("r", "reload the list"),
-        Item("R", "refresh database and service status"),
+        Item("R", "refresh status and reload every list"),
     ]);
     if !project_scoped {
         rows.push(Item("F", "search message content"));
@@ -4223,7 +4491,7 @@ fn session_help_rows(project_scoped: bool) -> Vec<HelpRow> {
             },
         ),
         Note(
-            "Destructive actions show a dry-run preview first; Enter or a in the result view applies it, and Esc leaves the database unchanged.",
+            "Destructive actions show a dry-run preview first; press a (or y) in the result view to apply it, and Enter/Esc leaves the database unchanged.",
         ),
     ]);
     rows
@@ -4241,18 +4509,22 @@ fn help_rows(topic: HelpTopic) -> Vec<HelpRow> {
             Item("1-9", "switch directly to a section"),
             Heading("Run"),
             Item("Enter", "run the selected action"),
-            Item("/", "search actions in every command menu"),
-            Item("R", "refresh database and service status"),
+            Item("/", "search actions in this command menu"),
+            Item("Ctrl+P", "search every command and section"),
+            Item("R", "refresh status and reload every list"),
             Item("? / F1", "show this help"),
             Item("q / Esc", "quit the TUI"),
             Heading("Destructive actions"),
             Note(
-                "A dry-run preview is always shown first. Press Enter or a in the result view to apply it, r to preview again, or Esc to go back without changing anything.",
+                "A dry-run preview is always shown first. Press a (or y) in the result view to apply it, Enter/Esc to go back without changing anything, or r to preview again.",
             ),
         ],
         HelpTopic::Sessions => session_help_rows(false),
         HelpTopic::ProjectSessions => session_help_rows(true),
         HelpTopic::Projects => vec![
+            Heading("Everywhere"),
+            Item("Tab, 1-9", "switch to another section"),
+            Item("Ctrl+P", "search every command and section"),
             Heading("Move around"),
             Item("Up/Down, j/k", "move the project selection"),
             Item("PgUp/PgDn", "jump one page"),
@@ -4265,7 +4537,7 @@ fn help_rows(topic: HelpTopic) -> Vec<HelpRow> {
             Item("s", "cycle the sort key: worktree, size, updated, sessions"),
             Item("c", "clear the filter and age limit"),
             Item("r", "reload the list"),
-            Item("R", "refresh database and service status"),
+            Item("R", "refresh status and reload every list"),
             Heading("Clean up"),
             Item("d", "delete the selected project (preview first)"),
             Item("E", "purge projects that have no sessions"),
@@ -4273,10 +4545,13 @@ fn help_rows(topic: HelpTopic) -> Vec<HelpRow> {
             Item("? / F1", "show this help"),
             Item("q / Esc", "quit the TUI"),
             Note(
-                "Destructive actions show a dry-run preview first; Enter or a in the result view applies it, and Esc leaves the database unchanged.",
+                "Destructive actions show a dry-run preview first; press a (or y) in the result view to apply it, and Enter/Esc leaves the database unchanged.",
             ),
         ],
         HelpTopic::Kv => vec![
+            Heading("Everywhere"),
+            Item("Tab, 1-9", "switch to another section"),
+            Item("Ctrl+P", "search every command and section"),
             Heading("Move around"),
             Item("Up/Down, j/k", "move the kv selection"),
             Item("PgUp/PgDn", "jump one page"),
@@ -4288,7 +4563,7 @@ fn help_rows(topic: HelpTopic) -> Vec<HelpRow> {
             Item("s", "cycle the sort key: size, key, updated"),
             Item("c", "clear the filter and age limit"),
             Item("r", "reload the list"),
-            Item("R", "refresh database and service status"),
+            Item("R", "refresh status and reload every list"),
             Heading("Clean up"),
             Item("d", "delete the selected entry (preview first)"),
             Item("P", "purge entries older than an age"),
@@ -4296,10 +4571,13 @@ fn help_rows(topic: HelpTopic) -> Vec<HelpRow> {
             Item("? / F1", "show this help"),
             Item("q / Esc", "quit the TUI"),
             Note(
-                "Caches regenerate on demand. Destructive actions show a dry-run preview first; Enter or a applies it in the result view.",
+                "Caches regenerate on demand. Destructive actions show a dry-run preview first; press a (or y) in the result view to apply it, or Enter/Esc to cancel.",
             ),
         ],
         HelpTopic::Backups => vec![
+            Heading("Everywhere"),
+            Item("Tab, 1-9", "switch to another section"),
+            Item("Ctrl+P", "search every command and section"),
             Heading("Move around"),
             Item("Up/Down, j/k", "move the backup selection"),
             Item("PgUp/PgDn", "jump one page"),
@@ -4312,7 +4590,7 @@ fn help_rows(topic: HelpTopic) -> Vec<HelpRow> {
             Item("c", "clear the filter and age limit"),
             Item("r", "reload the list"),
             Item("V", "toggle integrity verification for the list"),
-            Item("R", "refresh database and service status"),
+            Item("R", "refresh status and reload every list"),
             Heading("Maintain"),
             Item("b", "create a new verified backup"),
             Item("d", "delete the selected backup (preview first)"),
@@ -4330,8 +4608,8 @@ fn help_rows(topic: HelpTopic) -> Vec<HelpRow> {
             Item("PgUp/PgDn", "scroll one page"),
             Item("Home/End, g/G", "jump to the top or bottom"),
             Heading("Next steps"),
-            Item("Enter", "apply a pending preview, or return once done"),
-            Item("a", "apply the preview, when one is available"),
+            Item("Enter", "return to the menu (cancels a pending preview)"),
+            Item("a / y", "apply the preview, when one is available"),
             Item("r", "run the preview again (disabled after applied)"),
             Item("? / F1", "show this help"),
             Item("Esc / q", "return to the menu"),
@@ -4493,6 +4771,46 @@ fn detail_lines(action: &Action, width: usize) -> Vec<Line> {
             .dim()]));
         }
     }
+    lines
+}
+
+fn search_detail_lines(hit: &SearchHit, width: usize) -> Vec<Line> {
+    match hit {
+        SearchHit::Action(hit) => detail_lines(hit.action, width),
+        SearchHit::Section(index) => section_detail_lines(*index, width),
+    }
+}
+
+fn section_detail_lines(index: usize, width: usize) -> Vec<Line> {
+    let category = &CATEGORIES[index];
+    let description = match category.kind {
+        CategoryKind::Actions(actions) => {
+            format!("Command menu with {} action(s).", actions.len())
+        }
+        CategoryKind::Sessions => {
+            "Browse sessions and subagents; inspect or delete them.".to_string()
+        }
+        CategoryKind::Projects => {
+            "Browse projects; open their sessions or clean them up.".to_string()
+        }
+        CategoryKind::Kv => "Browse, inspect, and purge global kv cache entries.".to_string(),
+        CategoryKind::Backups => "Browse, verify, restore, and prune database backups.".to_string(),
+    };
+    let mut lines = vec![
+        Line::from(vec![Span::new(format!("Go to {}", category.name)).bold()]),
+        Line::from(vec![]),
+    ];
+    for text in wrap_words(&description, width) {
+        lines.push(Line::from(vec![Span::new(text)]));
+    }
+    lines.push(Line::from(vec![]));
+    lines.push(Line::from(vec![
+        Span::new("Shortcut ").dim(),
+        Span::new(format!("{}", index + 1)).bold(),
+        Span::new("   "),
+        Span::new("Enter").bold(),
+        Span::new(" opens this section."),
+    ]));
     lines
 }
 
@@ -5054,7 +5372,7 @@ impl DeleteReport {
         } else if can_apply {
             push_wrapped_span_lines(
                 &mut lines,
-                "Press Enter or a to confirm deletion, or Esc to cancel without changing anything.",
+                "Press a (or y) to confirm deletion, or Enter/Esc to cancel without changing anything.",
                 width,
                 None,
                 true,
@@ -5248,6 +5566,25 @@ impl OutputView {
         } else {
             format!("{} · done", self.spec.label)
         }
+    }
+
+    fn footer_hints(&self) -> Vec<KeyHint> {
+        let mut hints = vec![];
+        if self.can_apply {
+            hints.push(hint("a/y", "apply"));
+            hints.push(hint("Enter/Esc", "cancel"));
+            hints.push(hint("r", "rerun"));
+        } else if self.applied && self.ok {
+            hints.push(hint("Enter/Esc", "return"));
+        } else {
+            hints.push(hint("Enter/Esc", "return"));
+            hints.push(hint("r", "rerun"));
+        }
+        hints.push(hint("?", "help"));
+        hints.push(hint("Up/Down", "scroll"));
+        hints.push(hint("PgUp/PgDn", "page"));
+        hints.push(hint("Home/End", "top/bottom"));
+        hints
     }
 
     fn render_lines(&self, width: usize) -> Vec<Line> {
@@ -5450,13 +5787,224 @@ mod tests {
         search.refresh();
         assert_eq!(search.selected, 0);
         assert!(!search.matches.is_empty());
-        assert!(search.matches.iter().all(|hit| hit
-            .action
-            .label
-            .to_lowercase()
-            .contains("vacuum")
-            || hit.action.description.to_lowercase().contains("vacuum")
-            || hit.category.to_lowercase().contains("vacuum")));
+        assert!(search.matches.iter().all(|hit| match hit {
+            SearchHit::Action(hit) =>
+                hit.action.label.to_lowercase().contains("vacuum")
+                    || hit.action.description.to_lowercase().contains("vacuum")
+                    || hit.category.to_lowercase().contains("vacuum"),
+            SearchHit::Section(_) => false,
+        }));
+    }
+
+    #[test]
+    fn command_palette_adds_section_jumps_for_matching_queries() {
+        let empty = search_hits("");
+        assert!(empty.iter().all(|hit| matches!(hit, SearchHit::Action(_))));
+
+        let projects = search_hits("project");
+        assert!(projects.iter().any(
+            |hit| matches!(hit, SearchHit::Section(index) if CATEGORIES[*index].name == "Projects")
+        ));
+
+        let go = search_hits("go to section");
+        assert_eq!(
+            go.iter()
+                .filter(|hit| matches!(hit, SearchHit::Section(_)))
+                .count(),
+            CATEGORIES.len()
+        );
+    }
+
+    #[test]
+    fn footer_keeps_essential_hints_on_narrow_terminals() {
+        let hints = vec![
+            hint("?", "help"),
+            hint("q", "quit"),
+            hint("Ctrl+P", "commands"),
+            hint("Enter", "show"),
+            hint("d", "delete"),
+        ];
+        let wide = footer_line(&hints, 120);
+        let wide_text: String = wide.0.iter().map(|span| span.text.as_str()).collect();
+        assert!(wide_text.contains("Enter show"));
+        assert!(display_width(&wide_text) <= 120);
+
+        let narrow = footer_line(&hints, 32);
+        let narrow_text: String = narrow.0.iter().map(|span| span.text.as_str()).collect();
+        assert!(narrow_text.contains("? help"));
+        assert!(narrow_text.contains("q quit"));
+        assert!(narrow_text.contains('…'));
+        assert!(display_width(&narrow_text) <= 32);
+    }
+
+    fn preview_output() -> OutputView {
+        OutputView {
+            spec: RunSpec {
+                label: "Delete session ses_1".to_string(),
+                args: vec!["session".into(), "delete".into(), "ses_1".into()],
+                safety: Safety::Confirm,
+                output: OutputKind::Text,
+            },
+            command: "opencode-dbtool session delete ses_1 --dry-run".to_string(),
+            status: "exit 0 · 1 ms".to_string(),
+            ok: true,
+            content: OutputContent::Plain("preview".to_string()),
+            scroll: Cell::new(0),
+            can_apply: true,
+            nothing_to_delete: false,
+            preview_only: false,
+            applied: false,
+        }
+    }
+
+    #[test]
+    fn ctrl_p_opens_the_palette_from_a_list_browser() {
+        let cli = cli(&["opencode-dbtool", "tui"]);
+        let mut app = Tui::new(&cli, Path::new("nonexistent.db"));
+        app.tab = 1;
+        let key = KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL);
+        assert!(matches!(app.handle_key(key), Control::Continue));
+        assert!(matches!(app.view, View::Search(_)));
+    }
+
+    #[test]
+    fn cancelling_a_palette_prompt_restores_the_query() {
+        let cli = cli(&["opencode-dbtool", "tui"]);
+        let mut app = Tui::new(&cli, Path::new("nonexistent.db"));
+        let mut search = ActionSearch::new();
+        search.text = "read-only".chars().collect();
+        search.refresh();
+        search.selected = search
+            .matches
+            .iter()
+            .position(|hit| matches!(hit, SearchHit::Action(hit) if hit.action.input.is_some()))
+            .expect("a matching action with input");
+        app.view = View::Search(search);
+
+        assert!(matches!(
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            Control::Continue
+        ));
+        assert!(matches!(app.view, View::Prompt(_)));
+
+        assert!(matches!(
+            app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            Control::Continue
+        ));
+        match &app.view {
+            View::Search(search) => {
+                assert_eq!(search.text.iter().collect::<String>(), "read-only");
+            }
+            _ => panic!("expected the command palette to be restored"),
+        }
+    }
+
+    #[test]
+    fn repeated_apply_key_does_not_apply_a_preview() {
+        let cli = cli(&["opencode-dbtool", "tui"]);
+        let mut app = Tui::new(&cli, Path::new("nonexistent.db"));
+        app.view = View::Output(preview_output());
+
+        let held =
+            KeyEvent::new_with_kind(KeyCode::Char('a'), KeyModifiers::NONE, KeyEventKind::Repeat);
+        assert!(matches!(app.handle_key(held), Control::Continue));
+        assert!(matches!(app.view, View::Output(_)));
+
+        let pressed = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE);
+        assert!(matches!(app.handle_key(pressed), Control::Apply(_)));
+    }
+
+    #[test]
+    fn tab_line_shows_numeric_shortcuts() {
+        let cli = cli(&["opencode-dbtool", "tui"]);
+        let app = Tui::new(&cli, Path::new("nonexistent.db"));
+        let text: String = app
+            .tab_line(120)
+            .0
+            .iter()
+            .map(|span| span.text.as_str())
+            .collect();
+        assert!(text.contains("1 Overview"), "{text}");
+        assert!(text.contains("3 Sessions"), "{text}");
+    }
+
+    #[test]
+    fn tab_line_fits_every_width_and_keeps_the_active_tab_visible() {
+        let cli = cli(&["opencode-dbtool", "tui"]);
+        let mut app = Tui::new(&cli, Path::new("nonexistent.db"));
+        for width in 10..=120 {
+            for (tab, _) in CATEGORIES.iter().enumerate() {
+                app.tab = tab;
+                let active = format!(" {} {} ", tab + 1, CATEGORIES[tab].name);
+                if display_width(&active) > width {
+                    continue;
+                }
+                let line = app.tab_line(width);
+                let text: String = line.0.iter().map(|span| span.text.as_str()).collect();
+                assert!(
+                    display_width(&text) <= width,
+                    "tab line overflows at width {width} for tab {tab}: {text:?}"
+                );
+                assert!(
+                    text.contains(CATEGORIES[tab].name),
+                    "active tab truncated at width {width} for tab {tab}: {text:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn session_detail_hides_empty_optional_fields() {
+        let row = serde_json::json!({
+            "id": "ses_1",
+            "title": "A session",
+            "directory": "/work/a",
+            "updated": "2026-11-26T17:37:18Z",
+            "size_bytes": 1024,
+            "session_messages": 3,
+            "parts": 4,
+            "events": 0,
+            "blob_bytes": 0,
+            "cost": 0.0,
+            "parent_id": null,
+            "archived": false
+        });
+        let text: Vec<String> = session_detail_lines_with(&row, 80, 0)
+            .iter()
+            .map(line_text)
+            .collect();
+        assert!(text.iter().any(|line| line.starts_with("Title")));
+        assert!(!text.iter().any(|line| line.starts_with("Events")));
+        assert!(!text.iter().any(|line| line.starts_with("Media")));
+        assert!(!text.iter().any(|line| line.starts_with("Cost")));
+        assert!(!text.iter().any(|line| line.starts_with("Parent")));
+        assert!(!text.iter().any(|line| line.starts_with("Subagents")));
+        assert!(!text.iter().any(|line| line.starts_with("Archived")));
+
+        let detailed = serde_json::json!({
+            "id": "ses_2",
+            "title": "A larger session",
+            "directory": "/work/b",
+            "updated": "2026-11-26T17:37:18Z",
+            "size_bytes": 2048,
+            "session_messages": 5,
+            "parts": 8,
+            "events": 2,
+            "blob_bytes": 4096,
+            "cost": 1.25,
+            "parent_id": "ses_parent",
+            "archived": true
+        });
+        let text: Vec<String> = session_detail_lines_with(&detailed, 80, 2)
+            .iter()
+            .map(line_text)
+            .collect();
+        assert!(text.iter().any(|line| line.starts_with("Events")));
+        assert!(text.iter().any(|line| line.starts_with("Media")));
+        assert!(text.iter().any(|line| line.starts_with("Cost")));
+        assert!(text.iter().any(|line| line.starts_with("Parent")));
+        assert!(text.iter().any(|line| line.starts_with("Subagents")));
+        assert!(text.iter().any(|line| line.starts_with("Archived")));
     }
 
     #[test]
@@ -5978,7 +6526,7 @@ mod tests {
         let preview_lines = report.render_lines(44, false, true, false);
         let preview_text: Vec<String> = preview_lines.iter().map(line_text).collect();
         assert!(preview_text.iter().any(|l| l.starts_with("Preview only:")));
-        assert!(preview_text.iter().any(|l| l.contains("Enter or a")));
+        assert!(preview_text.iter().any(|l| l.contains("Press a (or y)")));
         assert!(!preview_text.iter().any(|l| l.contains("--yes")));
         assert!(!preview_text.iter().any(|l| l.contains("session_event")));
         for line in &preview_lines {
@@ -6034,9 +6582,25 @@ mod tests {
             applied: false,
         };
         assert_eq!(preview.status_badge(), ("PREVIEW", Color::Yellow));
+        // Enter is always safe in the result view: it cancels a pending
+        // preview instead of applying it.
         assert!(matches!(
             handle_output_key(
                 KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                &mut preview
+            ),
+            Control::OutputBack
+        ));
+        assert!(matches!(
+            handle_output_key(
+                KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE),
+                &mut preview
+            ),
+            Control::Apply(_)
+        ));
+        assert!(matches!(
+            handle_output_key(
+                KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE),
                 &mut preview
             ),
             Control::Apply(_)
