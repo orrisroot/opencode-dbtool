@@ -2,28 +2,25 @@
 
 All notable changes to `opencode-dbtool` are documented in this file.
 
-## [Unreleased]
+## [0.5.1] - 2026-11-27
 
 ### Added
 
-- TUI: `Ctrl+P` command palette available from every section; it searches all actions and offers `Go to ...` section jumps (for example, typing `project` and pressing Enter opens Projects).
-- TUI: numbered section tabs make the `1`-`9` shortcuts visible.
-- TUI: adaptive footers keep whole key hints and prioritize help, quit/back, and the command palette on narrow terminals.
-- TUI: header shows WAL size alongside the database size and summarizes multiple opencode pids compactly.
+- TUI: `Ctrl+P` command palette with section jumps, numbered section tabs, and adaptive footer hints that stay readable on narrow terminals.
+- TUI: header shows database and WAL sizes and summarizes multiple opencode pids.
 
 ### Changed
 
-- TUI: `R` now refreshes the header and reloads every browser instead of leaving lists stale.
-- TUI: session and project detail panes omit empty optional fields so the important values fit on short terminals.
-- TUI: cancelling a prompt opened from the command palette returns to the palette with the query intact.
-- TUI: Enter and Esc now cancel a pending preview; `a` (or `y`) applies it, so a double Enter cannot trigger a destructive action.
+- TUI: `R` refreshes the header and reloads all browsers; session and project detail panes omit empty optional fields.
+- TUI: destructive previews require `a` or `y`; `Enter` and `Esc` cancel, so a double Enter cannot trigger a deletion.
+- TUI: cancelling a prompt opened from the command palette restores the query.
+- Updated direct dependencies to current releases (`rusqlite` 0.43, `sysinfo` 0.40, `ureq` 3.5, `toml` 1.2, `clap` 4.6.10, `clap_complete` 4.6.12, `self_update` 1.3.3) and refreshed `Cargo.lock`.
+- Refreshed the README and command reference for the current schema, CLI, and TUI behavior.
 
 ### Fixed
 
-- TUI: held `a`/`y` repeat events no longer apply a destructive preview on terminals that report key repeat; a fresh key press is required.
-- TUI: long database paths no longer hide the opencode running/stopped indicator on narrow terminals.
-- TUI: the tab bar now reserves space for its `...` markers, so the active section is not hidden at narrow widths.
-- TUI: `R` preserves more specific reload messages, such as a project that disappeared, instead of overwriting them.
+- TUI: narrow tab bars keep the active section visible, long database paths keep the opencode status visible, and held apply keys are ignored on terminals that report key repeat.
+- TUI: `R` preserves specific reload messages, such as a project that disappeared.
 
 ## [0.5.0] - 2026-11-21
 

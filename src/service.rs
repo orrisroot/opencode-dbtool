@@ -71,7 +71,9 @@ fn process_alive(pid: i32) -> bool {
         return false;
     }
     let pid = sysinfo::Pid::from_u32(pid as u32);
-    let mut sys = sysinfo::System::new();
+    let Ok(mut sys) = sysinfo::System::new() else {
+        return false;
+    };
     sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
     sys.process(pid).is_some()
 }
@@ -80,7 +82,7 @@ fn process_alive(pid: i32) -> bool {
 /// `service stop` / `service start` subcommands).
 fn process_exe(pid: i32) -> Option<PathBuf> {
     let pid = sysinfo::Pid::from_u32(pid as u32);
-    let mut sys = sysinfo::System::new();
+    let mut sys = sysinfo::System::new().ok()?;
     sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
     sys.process(pid)
         .and_then(|p| p.exe().map(Path::to_path_buf))
@@ -90,7 +92,9 @@ fn process_exe(pid: i32) -> Option<PathBuf> {
 /// the process.
 fn kill_process(pid: i32) -> bool {
     let pid = sysinfo::Pid::from_u32(pid as u32);
-    let mut sys = sysinfo::System::new();
+    let Ok(mut sys) = sysinfo::System::new() else {
+        return false;
+    };
     sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
     match sys.process(pid) {
         Some(process) => process.kill(),
@@ -228,7 +232,9 @@ fn wait_for_exit(pid: i32, steps: usize) {
         return;
     }
     let pid = sysinfo::Pid::from_u32(pid as u32);
-    let mut sys = sysinfo::System::new();
+    let Ok(mut sys) = sysinfo::System::new() else {
+        return;
+    };
     for _ in 0..steps {
         sys.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[pid]), true);
         if sys.process(pid).is_none() {

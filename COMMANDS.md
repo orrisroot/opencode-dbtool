@@ -38,7 +38,7 @@ Run `opencode-dbtool --help` for the command list and
 | command | description |
 | --- | --- |
 | `stats [--detail]` | DB overview: table sizes, totals, storage usage, reclaimable space (`--detail` adds activity/subagent analysis) |
-| `tui` | interactive full-screen menu for the common inspection, cleanup, backup, and maintenance actions, with list browsers for sessions, projects, kv, and backups (requires a TTY) |
+| `tui` | full-screen interface for inspection, cleanup, backup, and maintenance actions, with numbered sections, a `Ctrl+P` command palette, and list browsers for sessions, projects, kv, and backups (requires a TTY) |
 | `doctor [--fix] [--max-backup-age <age>]` | integrity + consistency checks; `--fix` repairs supported orphans |
 | `report [--costs] [--since <age>] [--project <ref>]` | read-only reclaim and cost suggestions |
 | `project list [--path <dir>...] [--sort worktree\|size\|updated\|sessions] [--search <text>] [--older-than <age>] [--min-size <size>] [--limit <n>]` | project overview (counts, sizes); list filters match the session/kv/backup conventions |
@@ -370,7 +370,7 @@ newest backup is missing or older than the age.
 | `orphans.orphaned_jobs` | `job` rows whose session or child session is gone (the table has no foreign keys) |
 | `orphans.orphaned_automations` | `automation` rows whose `project_id` has no `project` row (automations intentionally keep a missing `session_id`) |
 | `orphans.orphaned_search_documents` | `session_search_document` rows whose session or message is gone (the table has no foreign keys) |
-| `orphans.orphaned_session_rows` | per-table `{ table, count }` entries for session child tables (`session_message`, `session_part`, `session_inbox`, `instruction_*`, `blob_ref`, legacy `schedule`) whose session is gone |
+| `orphans.orphaned_session_rows` | per-table `{ table, count }` entries for session child tables (`session_message`, `session_part`, `session_inbox`, `instruction_*`, `blob_ref`, `schedule`) whose session is gone |
 
 `orphans` collects references that no FK constraint covers, plus explicit
 per-table counts for session child tables whose session is gone (folded
@@ -540,9 +540,9 @@ event+session_message+session_part+inbox+instructions+media blob bytes
 `updated`/`time` columns show relative ages (`15m ago`); `--absolute`
 prints ISO timestamps.
 
-`session show --messages` folds `session_part` rows (newer builds) into
-the message `content` preview, parts first and legacy inline content
-after them, matching how opencode reads a conversation.
+`session show --messages` combines `session_part` rows and inline
+`session_message` content into the message preview, with parts first,
+matching how opencode reads a conversation.
 
 `<ref>` may be the full id, a unique id prefix, or the id without its `ses_`
 prefix (`session show ses_effb2a71` and `session show effb2a71` both work
@@ -611,8 +611,8 @@ non-text parts to the Markdown. Batch export uses `--out-dir <dir>` and can
 select sessions with `--older-than <age>`, `--project <ref>`, and `--limit
 <n>` (0 = no limit); `--markdown` writes `.md` files instead of JSON, and
 `--include-tools` adds non-text parts to each Markdown file. Import uses the
-server API (`session import <file>`) and accepts both the current transfer
-payload and older `{"data": ...}` wrappers.
+server API (`session import <file>`) and accepts both the transfer payload
+and the `{"data": ...}` wrapper form.
 
 ```sh
 opencode-dbtool session export ses_123 --out session.json
@@ -705,9 +705,9 @@ Reasoning lives in three places, all of which are stripped:
 
 | location | handled how |
 | --- | --- |
-| durable `event` rows (`session.reasoning.started` / `.ended`, plus the legacy `session.next.reasoning.*`) | rows deleted (`.ended` holds the full text; `.delta` is live-only and never persisted) |
+| durable `event` rows (`session.reasoning.started` / `.ended` and `session.next.reasoning.*`) | rows deleted (`.ended` holds the full text; `.delta` is live-only and never persisted) |
 | `session_message` assistant `content[]` | `type: "reasoning"` elements removed from the JSON, rows rewritten only when changed |
-| `session_part` rows (newer builds) | `type = 'reasoning'` rows deleted |
+| `session_part` rows | `type = 'reasoning'` rows deleted |
 
 Deleting the events also prevents reasoning from being re-projected from
 the event log. Token and cost aggregates (`tokens.reasoning`, `cost`) are
@@ -1070,15 +1070,15 @@ environment when set, avoiding the unauthenticated GitHub API rate limit.
 ```json
 {
   "command": "self-update",
-  "current_version": "0.5.0",
-  "latest_version": "0.5.0",
+  "current_version": "0.5.1",
+  "latest_version": "0.5.1",
   "target": "x86_64-unknown-linux-musl",
-  "update_available": true,
+  "update_available": false,
   "updated": false,
   "dry_run": true,
-  "status": "update-available",
+  "status": "up-to-date",
   "path": "/home/user/.cargo/bin/opencode-dbtool",
-  "release_url": "https://github.com/orrisroot/opencode-dbtool/releases/tag/v0.5.0"
+  "release_url": "https://github.com/orrisroot/opencode-dbtool/releases/tag/v0.5.1"
 }
 ```
 

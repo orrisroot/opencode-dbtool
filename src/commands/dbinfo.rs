@@ -92,11 +92,7 @@ pub fn query_value(
     // Belt and braces: even a writable statement cannot change anything.
     con.execute_batch("PRAGMA query_only = ON;")?;
     let mut stmt = con.prepare(trimmed)?;
-    let columns: Vec<String> = stmt
-        .column_names()
-        .iter()
-        .map(|c| (*c).to_string())
-        .collect();
+    let columns: Vec<String> = stmt.column_names().map(str::to_string).collect();
     let cap = if limit == 0 { usize::MAX } else { limit };
     let mut rows: Vec<serde_json::Value> = Vec::new();
     let mut truncated = false;

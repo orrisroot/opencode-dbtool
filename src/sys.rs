@@ -68,7 +68,8 @@ pub fn running_pids() -> Result<Vec<i32>> {
             "process detection is not supported on this platform",
         ));
     }
-    let mut sys = System::new();
+    let mut sys = System::new()
+        .map_err(|e| AppError::db(format!("cannot initialize process detection: {e}")))?;
     sys.refresh_processes(ProcessesToUpdate::All, true);
     let mut pids = Vec::new();
     for (pid, process) in sys.processes() {

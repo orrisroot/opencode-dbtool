@@ -4,9 +4,11 @@ Maintenance tool for the [opencode](https://opencode.ai) 2.x SQLite database
 (`~/.local/share/opencode/opencode.db`): inspect sizes and integrity, clean up
 sessions/projects/kv caches, and manage backups.
 
+An interactive full-screen TUI is available with `opencode-dbtool tui`.
+
 Written in Rust. Output is a human-readable table on a terminal, JSON when
 piped, and CSV with `--format csv`. `--format table|json|csv` forces a format;
-`--fields` selects table/CSV columns. Destructive commands preview their
+`--fields` selects table/CSV columns. CLI destructive commands preview their
 impact and ask `Proceed? [y/N]` on a terminal; `--dry-run` and `--yes` keep
 them scriptable. Supports Linux, macOS, and Windows.
 
@@ -17,17 +19,15 @@ them scriptable. Supports Linux, macOS, and Windows.
 
 ## Compatibility
 
-Requires the opencode 2.x database schema (`session_v2`, `session_message`,
-`session_inbox`, `instruction_*`, `worktree`, `event`, ...). V1 databases
-are not supported and fail with exit code 3; open the DB once with
-opencode 2.x so its migrations run, then retry.
+The tool uses the opencode 2.x SQLite schema (`session_v2`, `session_message`,
+`session_inbox`, `instruction_*`, `worktree`, `event`, and related tables).
+It reads the account, credential, machine, automation, content, and media
+tables (`account*`, `credential`, `machine`, `automation`, `session_part`,
+`blob`/`blob_ref`, `job`) plus the optional `session_search*` full-text index.
+Session output reports `parts`; project output reports `session_parts`.
 
-Current releases track the latest opencode 2.x schema (`account*`,
-`credential`, `machine`, `automation`, `session_part`, `blob`/`blob_ref`,
-`job`, and optional `session_search*` full-text index tables). Databases
-opened by older 2.x builds that lack newer optional tables still work;
-their sizes report zero for the missing storage. Session output reports
-`parts`/`session_parts` for the newer content rows.
+The database must use the opencode 2.x schema. Unsupported schemas are
+rejected with exit code 3.
 
 ## Install
 
@@ -72,16 +72,29 @@ For a single guarded run that also removes orphaned blobs and old files, use
 opencode-dbtool cleanup --older-than 30d --subagents
 ```
 
+## Interactive TUI
+
+`opencode-dbtool tui` opens a full-screen interface for inspection, cleanup,
+backup, and maintenance actions on an interactive terminal. Section tabs are
+numbered, so `1`-`9` jump directly; `Left`/`Right` or `Tab` moves between
+them. `Ctrl+P` opens a command palette that searches every action and offers
+section jumps. In the list browsers, `/` filters, `o` limits by age, `s`
+cycles the sort key, `c` clears filters, `r` reloads, and `R` refreshes the
+header and all lists. Destructive actions show a `--dry-run` preview; press
+`a` or `y` to apply it, or `Enter`/`Esc` to cancel. `?` or `F1` opens
+context-sensitive help. Pass `tui --dry-run` to make the whole session
+preview-only. See [TUI](COMMANDS.md#tui) for the full key map.
+
 ## Command overview
 
 | area | commands |
 | --- | --- |
 | Inspect | `stats`, `doctor`, `report`, `service status`, `db path` |
-| Browse | `project list`/`project show`, `session list`/`session show`/`session search`, `kv list`/`kv show`, `backup list` |
+| Browse | `project list`/`project show`, `session list`/`session show`/`session search`/`session export`, `kv list`/`kv show`, `backup list` |
 | Clean | `project delete`/`purge`, `session delete`/`purge`, `session strip-reasoning`, `kv delete`/`purge`, `fs clean-*` |
-| Maintain | `backup`, `backup restore`/`backup prune`, `vacuum`, `db checkpoint`/`db optimize`/`db query`, `cleanup` |
+| Maintain | `session import`, `backup`, `backup restore`/`backup delete`/`backup prune`, `vacuum`, `db checkpoint`/`db optimize`/`db query`, `cleanup` |
 | Configure | `config show`/`config path`, `completions`, `self-update` |
-| Interactive | `tui` |
+| Interactive | `tui` — full-screen browsers plus a `Ctrl+P` command palette |
 
 All commands accept the [global flags](COMMANDS.md#global-flags). Run
 `opencode-dbtool <command> --help` for built-in help. Full syntax, filters,
